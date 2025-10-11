@@ -5,6 +5,7 @@ mod dispatcher;
 mod analyzers;
 mod storage;
 mod utils;
+pub mod pcapfile;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -37,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(pcap_path) = opts.pcap.as_deref() {
         tracing::info!("Чтение pcap-файла: {}", pcap_path.display());
-        let src = match capture::pcapfile::PcapFileSource::new(PathBuf::from(pcap_path)) {
+        let src = match pcapfile::PcapFileSource::new(PathBuf::from(pcap_path)) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Не удалось открыть pcap: {}", e);

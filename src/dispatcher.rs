@@ -1,5 +1,4 @@
 use crate::capture::PacketSource;
-use crate::storage::json_writer::JsonWriter;
 use anyhow::Result;
 
 pub trait Analyzer: Send + Sync {

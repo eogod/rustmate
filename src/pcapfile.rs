@@ -1,4 +1,4 @@
-use super::PacketSource;
+use crate::capture::PacketSource;
 use std::path::PathBuf;
 use pcap::{Capture, Offline};
 

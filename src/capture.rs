@@ -1,5 +1,3 @@
-pub mod pcapfile;
-
 use async_trait::async_trait;
 
 #[async_trait]
