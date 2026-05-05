@@ -14,6 +14,7 @@ pub trait Analyzer: Send {
 
     fn analyze_stream(
         &mut self,
+        _packet: &DecodedPacket<'_>,
         _flow: &FlowObservation<'_>,
         _chunk: &StreamChunk<'_>,
         _events: &mut Vec<Event>,

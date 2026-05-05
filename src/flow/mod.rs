@@ -18,7 +18,13 @@ pub struct FlowKey {
     pub b: Endpoint,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlowRoute {
+    pub key: FlowKey,
+    pub direction: FlowDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlowDirection {
     AToB,
     BToA,
@@ -251,6 +257,15 @@ impl FlowTable {
     }
 
     pub fn observe<'a>(&mut self, packet: &DecodedPacket<'a>) -> Option<FlowObservation<'a>> {
+        let route = FlowRoute::from_packet(packet)?;
+        self.observe_with_route(packet, route)
+    }
+
+    pub fn observe_with_route<'a>(
+        &mut self,
+        packet: &DecodedPacket<'a>,
+        route: FlowRoute,
+    ) -> Option<FlowObservation<'a>> {
         self.observed_packets = self.observed_packets.saturating_add(1);
 
         let now_us = timestamp_us(packet.timestamp);
@@ -258,10 +273,11 @@ impl FlowTable {
             self.evict_idle(now_us);
         }
 
-        let (key, direction) = FlowKey::from_packet(packet)?;
         let transport = packet.transport_payload()?;
         let bytes = packet.raw.len() as u64;
         let payload_bytes = transport.bytes.len() as u64;
+        let key = route.key;
+        let direction = route.direction;
 
         if self.entries.contains_key(&key) {
             let entry = self.entries.get_mut(&key).expect("entry exists");
@@ -757,6 +773,34 @@ fn stream_chunk_bytes(chunks: &[StreamChunk<'_>]) -> u64 {
 
 impl FlowKey {
     pub fn from_packet(packet: &DecodedPacket<'_>) -> Option<(Self, FlowDirection)> {
+        FlowRoute::from_packet(packet).map(|route| (route.key, route.direction))
+    }
+}
+
+impl FlowRoute {
+    pub fn new(protocol: TransportProtocol, source: Endpoint, destination: Endpoint) -> Self {
+        if endpoint_sort_key(source) <= endpoint_sort_key(destination) {
+            Self {
+                key: FlowKey {
+                    protocol,
+                    a: source,
+                    b: destination,
+                },
+                direction: FlowDirection::AToB,
+            }
+        } else {
+            Self {
+                key: FlowKey {
+                    protocol,
+                    a: destination,
+                    b: source,
+                },
+                direction: FlowDirection::BToA,
+            }
+        }
+    }
+
+    pub fn from_packet(packet: &DecodedPacket<'_>) -> Option<Self> {
         let transport = packet.transport_payload()?;
         let source_port = transport.source_port?;
         let destination_port = transport.destination_port?;
@@ -770,25 +814,7 @@ impl FlowKey {
             port: destination_port,
         };
 
-        if endpoint_sort_key(source) <= endpoint_sort_key(destination) {
-            Some((
-                Self {
-                    protocol: transport.protocol,
-                    a: source,
-                    b: destination,
-                },
-                FlowDirection::AToB,
-            ))
-        } else {
-            Some((
-                Self {
-                    protocol: transport.protocol,
-                    a: destination,
-                    b: source,
-                },
-                FlowDirection::BToA,
-            ))
-        }
+        Some(Self::new(transport.protocol, source, destination))
     }
 }
 

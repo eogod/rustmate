@@ -23,6 +23,7 @@ pub enum LinkLayer {
     Ethernet,
     LinuxSll,
     RawIp,
+    BsdLoopback,
     Unsupported,
 }
 
@@ -32,6 +33,7 @@ impl LinkLayer {
             Linktype::ETHERNET => Self::Ethernet,
             Linktype::LINUX_SLL => Self::LinuxSll,
             Linktype::RAW | Linktype::IPV4 | Linktype::IPV6 => Self::RawIp,
+            Linktype::NULL | Linktype::LOOP => Self::BsdLoopback,
             _ => Self::Unsupported,
         }
     }
@@ -41,6 +43,7 @@ impl LinkLayer {
             LinkLayer::Ethernet => "ethernet",
             LinkLayer::LinuxSll => "linux_sll",
             LinkLayer::RawIp => "raw_ip",
+            LinkLayer::BsdLoopback => "bsd_loopback",
             LinkLayer::Unsupported => "unsupported",
         }
     }
@@ -121,6 +124,7 @@ impl<'a> DecodedPacket<'a> {
             LinkLayer::Ethernet => decode(SlicedPacket::from_ethernet(&packet.data)),
             LinkLayer::LinuxSll => decode(SlicedPacket::from_linux_sll(&packet.data)),
             LinkLayer::RawIp => decode(SlicedPacket::from_ip(&packet.data)),
+            LinkLayer::BsdLoopback => decode_bsd_loopback(&packet.data),
             LinkLayer::Unsupported => (None, Some(PacketDecodeError::UnsupportedLinkLayer)),
         };
 
@@ -213,6 +217,19 @@ impl<'a> DecodedPacket<'a> {
     }
 }
 
+fn decode_bsd_loopback(data: &[u8]) -> (Option<SlicedPacket<'_>>, Option<PacketDecodeError>) {
+    let Some(payload) = data.get(4..) else {
+        return (
+            None,
+            Some(PacketDecodeError::DecodeError(
+                "bsd loopback frame too short".to_owned(),
+            )),
+        );
+    };
+    // BSD/macOS loopback sticks a 4-byte address family header before the IP packet.
+    decode(SlicedPacket::from_ip(payload))
+}
+
 fn decode(
     result: Result<SlicedPacket<'_>, etherparse::err::packet::SliceError>,
 ) -> (Option<SlicedPacket<'_>>, Option<PacketDecodeError>) {
@@ -241,6 +258,34 @@ mod tests {
             timestamp: PacketTimestamp { sec: 1, usec: 2 },
             link_layer: LinkLayer::Ethernet,
             linktype: Linktype::ETHERNET.0,
+            data,
+        };
+
+        let decoded = DecodedPacket::from_raw(&raw);
+        let transport = decoded.transport_payload().unwrap();
+
+        assert_eq!(TransportProtocol::Tcp, transport.protocol);
+        assert_eq!(Some(31337), transport.source_port);
+        assert_eq!(Some(80), transport.destination_port);
+        assert_eq!(payload, transport.bytes);
+        assert!(decoded.decode_error().is_none());
+    }
+
+    #[test]
+    fn decodes_tcp_payload_from_bsd_loopback_frame() {
+        let payload = b"GET /loop HTTP/1.1\r\n\r\n";
+        let builder = PacketBuilder::ethernet2([1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12])
+            .ipv4([127, 0, 0, 1], [127, 0, 0, 1], 20)
+            .tcp(31337, 80, 1, 1024);
+        let mut ethernet = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut ethernet, payload).unwrap();
+        let mut data = vec![0, 0, 0, 2];
+        data.extend_from_slice(&ethernet[14..]);
+
+        let raw = RawPacket {
+            timestamp: PacketTimestamp { sec: 1, usec: 2 },
+            link_layer: LinkLayer::BsdLoopback,
+            linktype: Linktype::NULL.0,
             data,
         };
 
