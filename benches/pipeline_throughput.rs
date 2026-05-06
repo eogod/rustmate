@@ -12,6 +12,7 @@ use rustmate::{
     packet::{LinkLayer, PacketTimestamp, RawPacket},
     pipeline::{Pipeline, PipelineConfig, PipelineStats},
     sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig},
+    stream_inventory::StreamInventoryConfig,
 };
 use tokio::runtime::Builder;
 
@@ -93,6 +94,14 @@ fn pipeline_config(batch_size: usize) -> PipelineConfig {
         flow_idle_timeout_ms: 120_000,
         max_tcp_buffered_bytes_per_flow: 1 << 20,
         max_tcp_out_of_order_segments_per_direction: 128,
+        stream_inventory: StreamInventoryConfig {
+            enabled: true,
+            max_streams: 131_072,
+            idle_timeout_ms: 120_000,
+            preview_bytes_per_direction: 256,
+            update_packet_interval: 64,
+            update_byte_interval: 64 * 1024,
+        },
     }
 }
 

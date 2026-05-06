@@ -19,6 +19,7 @@ use crate::{
     output::EventSink,
     packet::{DecodedPacket, LinkLayer, RawPacket, TransportProtocol},
     pipeline::{PipelineConfig, PipelineStats},
+    stream_inventory::{StreamInventory, StreamInventoryStats},
 };
 
 type AnalyzerFactory = Arc<dyn Fn() -> Box<dyn Analyzer> + Send + Sync + 'static>;
@@ -57,6 +58,7 @@ struct WorkerStats {
     id: usize,
     decode_errors: u64,
     flow_stats: FlowTableStats,
+    stream_inventory_stats: StreamInventoryStats,
 }
 
 struct WorkerHandle {
@@ -346,6 +348,7 @@ impl WorkerPool {
                         .decode_errors
                         .saturating_add(worker_stats.decode_errors);
                     stats.add_flow_table_stats(worker_stats.flow_stats);
+                    stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
                     received_stats += 1;
                     tracing::debug!(
                         worker = worker_stats.id,
@@ -401,6 +404,7 @@ fn run_worker(
     output_tx: Sender<WorkerMessage>,
 ) -> Result<()> {
     let mut flow_table = FlowTable::new(flow_config);
+    let mut stream_inventory = StreamInventory::new(config.stream_inventory);
     let mut analyzers = analyzer_factories
         .iter()
         .map(|factory| factory())
@@ -419,6 +423,7 @@ fn run_worker(
                     &packet,
                     config.mode,
                     &mut flow_table,
+                    &mut stream_inventory,
                     &mut analyzers,
                     &mut events,
                     &mut stats,
@@ -434,6 +439,7 @@ fn run_worker(
 
     flush_worker_events(&output_tx, &mut events)?;
     stats.flow_stats = flow_table.stats();
+    stats.stream_inventory_stats = stream_inventory.stats();
     output_tx
         .send(WorkerMessage::Stats(stats))
         .map_err(|_| anyhow!("coordinator stopped before worker shard {id} sent stats"))?;
@@ -444,6 +450,7 @@ fn process_worker_packet(
     routed: &RoutedPacket,
     mode: RunMode,
     flow_table: &mut FlowTable,
+    stream_inventory: &mut StreamInventory,
     analyzers: &mut [Box<dyn Analyzer>],
     events: &mut Vec<Event>,
     stats: &mut WorkerStats,
@@ -460,7 +467,11 @@ fn process_worker_packet(
 
             let flow = routed
                 .flow_route
-                .and_then(|route| flow_table.observe_with_route(&packet, route));
+                .map(|route| flow_table.observe_with_route(&packet, route))
+                .unwrap_or_else(|| flow_table.observe(&packet));
+            if let Some(flow) = flow.as_ref() {
+                stream_inventory.observe_flow(&packet, flow, events);
+            }
             if let Some((flow, tcp)) = flow
                 .as_ref()
                 .and_then(|flow| flow.tcp.as_ref().map(|tcp| (flow, tcp)))
@@ -503,6 +514,7 @@ fn write_worker_message(
                 .decode_errors
                 .saturating_add(worker_stats.decode_errors);
             stats.add_flow_table_stats(worker_stats.flow_stats);
+            stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
             Ok(())
         }
     }
@@ -787,6 +799,7 @@ mod tests {
         ingest::{PacketBatch, PacketSource},
         output::EventSink,
         packet::{LinkLayer, PacketTimestamp},
+        stream_inventory::StreamInventoryConfig,
     };
 
     use super::*;
@@ -819,11 +832,16 @@ mod tests {
         let events = events.lock().unwrap();
         assert_eq!(4, stats.workers);
         assert_eq!(3, stats.tcp_stream_chunks);
-        assert_eq!(1, stats.events);
-        assert_eq!(1, events.len());
-        assert_eq!("http_request", events[0]["event_type"]);
-        assert_eq!("/flagxx", events[0]["fields"]["target"]);
-        assert_eq!("shard.local", events[0]["fields"]["headers"]["host"]);
+        assert_eq!(2, stats.events);
+        assert_eq!(1, stats.inventory_created_streams);
+        assert_eq!(1, stats.inventory_events);
+        assert_eq!(2, events.len());
+        let http = events
+            .iter()
+            .find(|event| event["event_type"] == "http_request")
+            .unwrap();
+        assert_eq!("/flagxx", http["fields"]["target"]);
+        assert_eq!("shard.local", http["fields"]["headers"]["host"]);
     }
 
     #[tokio::test]
@@ -860,12 +878,14 @@ mod tests {
         let events = events.lock().unwrap();
         let mut targets = events
             .iter()
+            .filter(|event| event["event_type"] == "http_request")
             .map(|event| event["fields"]["target"].as_str().unwrap().to_owned())
             .collect::<Vec<_>>();
         targets.sort();
 
         assert_eq!(2, stats.created_flows);
-        assert_eq!(2, stats.events);
+        assert_eq!(4, stats.events);
+        assert_eq!(2, stats.inventory_created_streams);
         assert_eq!(vec!["/a".to_owned(), "/b".to_owned()], targets);
     }
 
@@ -959,8 +979,12 @@ mod tests {
 
         let events = events.lock().unwrap();
         assert_eq!(1, stats.packets);
-        assert_eq!(1, stats.events);
-        assert_eq!("/idle-shard", events[0]["fields"]["target"]);
+        assert_eq!(2, stats.events);
+        let http = events
+            .iter()
+            .find(|event| event["event_type"] == "http_request")
+            .unwrap();
+        assert_eq!("/idle-shard", http["fields"]["target"]);
     }
 
     #[tokio::test]
@@ -975,6 +999,7 @@ mod tests {
                 flow_idle_timeout_ms: 120_000,
                 max_tcp_buffered_bytes_per_flow: 64 * 1024,
                 max_tcp_out_of_order_segments_per_direction: 16,
+                stream_inventory: test_stream_inventory_config(),
             },
             worker_count: 2,
             worker_queue_depth: 1,
@@ -1007,8 +1032,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(64, stats.packets);
-        assert_eq!(64, stats.events);
-        assert_eq!(64, events.lock().unwrap().len());
+        assert_eq!(128, stats.events);
+        assert_eq!(64, stats.inventory_created_streams);
+        assert_eq!(64, stats.inventory_events);
+        assert_eq!(128, events.lock().unwrap().len());
     }
 
     struct CollectSink {
@@ -1099,11 +1126,23 @@ mod tests {
                 flow_idle_timeout_ms: 120_000,
                 max_tcp_buffered_bytes_per_flow: 64 * 1024,
                 max_tcp_out_of_order_segments_per_direction: 16,
+                stream_inventory: test_stream_inventory_config(),
             },
             worker_count,
             worker_queue_depth: 8,
             event_queue_depth: 8,
         })
+    }
+
+    fn test_stream_inventory_config() -> StreamInventoryConfig {
+        StreamInventoryConfig {
+            enabled: true,
+            max_streams: 1024,
+            idle_timeout_ms: 120_000,
+            preview_bytes_per_direction: 128,
+            update_packet_interval: 64,
+            update_byte_interval: 64 * 1024,
+        }
     }
 
     fn tcp_packet(

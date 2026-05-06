@@ -9,6 +9,7 @@ use crate::{
     ingest::{PacketBatch, PacketSource, PacketSourceStats},
     output::EventSink,
     packet::{DecodedPacket, RawPacket},
+    stream_inventory::{StreamInventory, StreamInventoryConfig, StreamInventoryStats},
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -35,6 +36,12 @@ pub struct PipelineStats {
     pub tcp_out_of_order_buffered: u64,
     pub tcp_out_of_order_dropped: u64,
     pub tcp_resets: u64,
+    pub inventory_active_streams: usize,
+    pub inventory_created_streams: u64,
+    pub inventory_evicted_streams: u64,
+    pub inventory_dropped_new_streams: u64,
+    pub inventory_closed_streams: u64,
+    pub inventory_events: u64,
 }
 
 impl PipelineStats {
@@ -85,6 +92,36 @@ impl PipelineStats {
         self.source_dropped_packets = source_stats.dropped;
         self.source_interface_dropped_packets = source_stats.interface_dropped;
     }
+
+    pub(crate) fn set_stream_inventory_stats(&mut self, inventory_stats: StreamInventoryStats) {
+        self.inventory_active_streams = inventory_stats.active_streams;
+        self.inventory_created_streams = inventory_stats.created_streams;
+        self.inventory_evicted_streams = inventory_stats.evicted_streams;
+        self.inventory_dropped_new_streams = inventory_stats.dropped_new_streams;
+        self.inventory_closed_streams = inventory_stats.closed_streams;
+        self.inventory_events = inventory_stats.stream_events;
+    }
+
+    pub(crate) fn add_stream_inventory_stats(&mut self, inventory_stats: StreamInventoryStats) {
+        self.inventory_active_streams = self
+            .inventory_active_streams
+            .saturating_add(inventory_stats.active_streams);
+        self.inventory_created_streams = self
+            .inventory_created_streams
+            .saturating_add(inventory_stats.created_streams);
+        self.inventory_evicted_streams = self
+            .inventory_evicted_streams
+            .saturating_add(inventory_stats.evicted_streams);
+        self.inventory_dropped_new_streams = self
+            .inventory_dropped_new_streams
+            .saturating_add(inventory_stats.dropped_new_streams);
+        self.inventory_closed_streams = self
+            .inventory_closed_streams
+            .saturating_add(inventory_stats.closed_streams);
+        self.inventory_events = self
+            .inventory_events
+            .saturating_add(inventory_stats.stream_events);
+    }
 }
 
 pub struct Pipeline {
@@ -93,6 +130,7 @@ pub struct Pipeline {
     analyzers: Vec<Box<dyn Analyzer>>,
     sinks: Vec<Box<dyn EventSink>>,
     flow_table: FlowTable,
+    stream_inventory: StreamInventory,
     events: Vec<Event>,
 }
 
@@ -105,6 +143,7 @@ pub struct PipelineConfig {
     pub flow_idle_timeout_ms: u64,
     pub max_tcp_buffered_bytes_per_flow: usize,
     pub max_tcp_out_of_order_segments_per_direction: usize,
+    pub stream_inventory: StreamInventoryConfig,
 }
 
 impl Pipeline {
@@ -120,6 +159,7 @@ impl Pipeline {
                 config.max_tcp_buffered_bytes_per_flow,
                 config.max_tcp_out_of_order_segments_per_direction,
             )),
+            stream_inventory: StreamInventory::new(config.stream_inventory),
             events: Vec::with_capacity(config.batch_size),
         }
     }
@@ -189,6 +229,7 @@ impl Pipeline {
         }
 
         stats.set_flow_table_stats(self.flow_table.stats());
+        stats.set_stream_inventory_stats(self.stream_inventory.stats());
     }
 
     fn process_packet(&mut self, raw: &RawPacket, stats: &mut PipelineStats) {
@@ -202,6 +243,10 @@ impl Pipeline {
                 }
 
                 let flow = self.flow_table.observe(&packet);
+                if let Some(flow) = flow.as_ref() {
+                    self.stream_inventory
+                        .observe_flow(&packet, flow, &mut self.events);
+                }
                 if let Some(flow) = flow
                     .as_ref()
                     .and_then(|flow| flow.tcp.as_ref().map(|tcp| (flow, tcp)))
@@ -252,6 +297,7 @@ mod tests {
             flow_idle_timeout_ms: 120_000,
             max_tcp_buffered_bytes_per_flow: 64 * 1024,
             max_tcp_out_of_order_segments_per_direction: 16,
+            stream_inventory: test_stream_inventory_config(),
         });
         pipeline.register_analyzer(Box::new(StreamCollector {
             chunks: Arc::clone(&chunks),
@@ -287,13 +333,18 @@ mod tests {
             tcp_packet(105, b"flagxx"),
         ]);
 
-        pipeline.run_with_source(source).await.unwrap();
+        let stats = pipeline.run_with_source(source).await.unwrap();
 
         let events = events.lock().unwrap();
-        assert_eq!(1, events.len());
-        assert_eq!("http_request", events[0]["event_type"]);
-        assert_eq!("/flagxx", events[0]["fields"]["target"]);
-        assert_eq!("ctf.local", events[0]["fields"]["headers"]["host"]);
+        let http = events
+            .iter()
+            .find(|event| event["event_type"] == "http_request")
+            .unwrap();
+        assert_eq!(2, events.len());
+        assert_eq!(1, stats.inventory_created_streams);
+        assert_eq!(1, stats.inventory_events);
+        assert_eq!("/flagxx", http["fields"]["target"]);
+        assert_eq!("ctf.local", http["fields"]["headers"]["host"]);
     }
 
     #[tokio::test]
@@ -314,8 +365,12 @@ mod tests {
 
         let events = events.lock().unwrap();
         assert_eq!(1, stats.packets);
-        assert_eq!(1, stats.events);
-        assert_eq!("/idle", events[0]["fields"]["target"]);
+        assert_eq!(2, stats.events);
+        let http = events
+            .iter()
+            .find(|event| event["event_type"] == "http_request")
+            .unwrap();
+        assert_eq!("/idle", http["fields"]["target"]);
     }
 
     struct StreamCollector {
@@ -416,7 +471,19 @@ mod tests {
             flow_idle_timeout_ms: 120_000,
             max_tcp_buffered_bytes_per_flow: 64 * 1024,
             max_tcp_out_of_order_segments_per_direction: 16,
+            stream_inventory: test_stream_inventory_config(),
         })
+    }
+
+    fn test_stream_inventory_config() -> StreamInventoryConfig {
+        StreamInventoryConfig {
+            enabled: true,
+            max_streams: 1024,
+            idle_timeout_ms: 120_000,
+            preview_bytes_per_direction: 128,
+            update_packet_interval: 64,
+            update_byte_interval: 64 * 1024,
+        }
     }
 
     #[async_trait::async_trait]

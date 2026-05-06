@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use crate::config::{
     DEFAULT_BATCH_SIZE, DEFAULT_CAPTURE_BUFFER_SIZE, DEFAULT_CAPTURE_READ_TIMEOUT_MS,
     DEFAULT_CAPTURE_SNAPLEN, DEFAULT_EVENT_QUEUE_DEPTH, DEFAULT_FLOW_IDLE_TIMEOUT_MS,
-    DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS, DEFAULT_MAX_TCP_BUFFERED_BYTES_PER_FLOW,
-    DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION, DEFAULT_WORKER_QUEUE_DEPTH,
-    DEFAULT_WORKERS, RunMode,
+    DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS, DEFAULT_MAX_STREAMS,
+    DEFAULT_MAX_TCP_BUFFERED_BYTES_PER_FLOW, DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION,
+    DEFAULT_STREAM_PREVIEW_BYTES, DEFAULT_STREAM_UPDATE_BYTES, DEFAULT_STREAM_UPDATE_PACKETS,
+    DEFAULT_WORKER_QUEUE_DEPTH, DEFAULT_WORKERS, RunMode,
 };
 
 /// CLI opts, kept flat so the tool stays script-friendly.
@@ -64,6 +65,26 @@ pub struct Opts {
     /// Bounded event batch queue depth from workers to output
     #[arg(long, default_value_t = DEFAULT_EVENT_QUEUE_DEPTH)]
     pub event_queue_depth: usize,
+
+    /// Disable stream inventory events and counters
+    #[arg(long)]
+    pub disable_stream_inventory: bool,
+
+    /// Max stream inventory records kept in memory
+    #[arg(long, default_value_t = DEFAULT_MAX_STREAMS)]
+    pub max_streams: usize,
+
+    /// Preview bytes kept per stream direction
+    #[arg(long, default_value_t = DEFAULT_STREAM_PREVIEW_BYTES)]
+    pub stream_preview_bytes: usize,
+
+    /// Emit stream update after N packets in a stream; 0 disables this trigger
+    #[arg(long, default_value_t = DEFAULT_STREAM_UPDATE_PACKETS)]
+    pub stream_update_packets: u64,
+
+    /// Emit stream update after N reassembled bytes in a stream; 0 disables this trigger
+    #[arg(long, default_value_t = DEFAULT_STREAM_UPDATE_BYTES)]
+    pub stream_update_bytes: u64,
 
     /// Health log interval in milliseconds; 0 disables it
     #[arg(long, default_value_t = DEFAULT_HEALTH_INTERVAL_MS)]

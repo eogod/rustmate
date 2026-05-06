@@ -18,6 +18,7 @@ use rustmate::{
     output::jsonl::JsonlWriter,
     pipeline::{Pipeline, PipelineConfig},
     sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, resolve_worker_count},
+    stream_inventory::StreamInventoryConfig,
 };
 
 #[tokio::main]
@@ -47,6 +48,14 @@ async fn main() -> anyhow::Result<()> {
         max_tcp_buffered_bytes_per_flow: opts.max_tcp_buffered_bytes_per_flow,
         max_tcp_out_of_order_segments_per_direction: opts
             .max_tcp_out_of_order_segments_per_direction,
+        stream_inventory: StreamInventoryConfig {
+            enabled: !opts.disable_stream_inventory,
+            max_streams: opts.max_streams.max(1),
+            idle_timeout_ms: opts.flow_idle_timeout_ms,
+            preview_bytes_per_direction: opts.stream_preview_bytes,
+            update_packet_interval: opts.stream_update_packets,
+            update_byte_interval: opts.stream_update_bytes,
+        },
     };
     let worker_count = resolve_worker_count(opts.workers);
 
@@ -207,6 +216,12 @@ fn log_completed(message: &str, stats: &rustmate::pipeline::PipelineStats, out_p
         tcp_out_of_order_buffered = stats.tcp_out_of_order_buffered,
         tcp_out_of_order_dropped = stats.tcp_out_of_order_dropped,
         tcp_resets = stats.tcp_resets,
+        inventory_active_streams = stats.inventory_active_streams,
+        inventory_created_streams = stats.inventory_created_streams,
+        inventory_evicted_streams = stats.inventory_evicted_streams,
+        inventory_dropped_new_streams = stats.inventory_dropped_new_streams,
+        inventory_closed_streams = stats.inventory_closed_streams,
+        inventory_events = stats.inventory_events,
         output = %out_path.display(),
         "{message}"
     );
