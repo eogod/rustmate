@@ -1,5 +1,3 @@
-use std::net::IpAddr;
-
 use ahash::AHashMap;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -291,7 +289,7 @@ impl StreamInventory {
 impl StreamRecord {
     fn new(key: FlowKey, now_us: u64) -> Self {
         Self {
-            id: stable_stream_id(&key),
+            id: key.stable_id(),
             key,
             service: infer_service(key),
             first_seen_us: now_us,
@@ -619,60 +617,6 @@ fn timestamp_us(timestamp: PacketTimestamp) -> u64 {
         .saturating_add(timestamp.usec as u64)
 }
 
-fn stable_stream_id(key: &FlowKey) -> u64 {
-    let mut hash = Fnv64::new();
-    hash.write_u8(match key.protocol {
-        TransportProtocol::Tcp => 1,
-        TransportProtocol::Udp => 2,
-        TransportProtocol::Icmpv4 => 3,
-        TransportProtocol::Icmpv6 => 4,
-    });
-    hash.write_endpoint(key.a);
-    hash.write_endpoint(key.b);
-    hash.finish()
-}
-
-struct Fnv64(u64);
-
-impl Fnv64 {
-    fn new() -> Self {
-        Self(0xcbf29ce484222325)
-    }
-
-    fn write_u8(&mut self, byte: u8) {
-        self.0 ^= byte as u64;
-        self.0 = self.0.wrapping_mul(0x100000001b3);
-    }
-
-    fn write_bytes(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.write_u8(*byte);
-        }
-    }
-
-    fn write_u16(&mut self, value: u16) {
-        self.write_bytes(&value.to_be_bytes());
-    }
-
-    fn write_endpoint(&mut self, endpoint: Endpoint) {
-        match endpoint.addr {
-            IpAddr::V4(addr) => {
-                self.write_u8(4);
-                self.write_bytes(&addr.octets());
-            }
-            IpAddr::V6(addr) => {
-                self.write_u8(6);
-                self.write_bytes(&addr.octets());
-            }
-        }
-        self.write_u16(endpoint.port);
-    }
-
-    fn finish(self) -> u64 {
-        self.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use etherparse::PacketBuilder;
@@ -777,7 +721,7 @@ mod tests {
         let forward = FlowRoute::new(TransportProtocol::Tcp, a, b).key;
         let reverse = FlowRoute::new(TransportProtocol::Tcp, b, a).key;
 
-        assert_eq!(stable_stream_id(&forward), stable_stream_id(&reverse));
+        assert_eq!(forward.stable_id(), reverse.stable_id());
     }
 
     #[test]

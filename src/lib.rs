@@ -9,4 +9,5 @@ pub mod output;
 pub mod packet;
 pub mod pipeline;
 pub mod sharded_pipeline;
+pub mod stream_content;
 pub mod stream_inventory;

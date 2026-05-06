@@ -775,6 +775,19 @@ impl FlowKey {
     pub fn from_packet(packet: &DecodedPacket<'_>) -> Option<(Self, FlowDirection)> {
         FlowRoute::from_packet(packet).map(|route| (route.key, route.direction))
     }
+
+    pub fn stable_id(&self) -> u64 {
+        let mut hash = Fnv64::new();
+        hash.write_u8(match self.protocol {
+            TransportProtocol::Tcp => 1,
+            TransportProtocol::Udp => 2,
+            TransportProtocol::Icmpv4 => 3,
+            TransportProtocol::Icmpv6 => 4,
+        });
+        hash.write_endpoint(self.a);
+        hash.write_endpoint(self.b);
+        hash.finish()
+    }
 }
 
 impl FlowRoute {
@@ -826,6 +839,47 @@ fn endpoint_sort_key(endpoint: Endpoint) -> (u8, [u8; 16], u16) {
             (4, bytes, endpoint.port)
         }
         IpAddr::V6(addr) => (6, addr.octets(), endpoint.port),
+    }
+}
+
+struct Fnv64(u64);
+
+impl Fnv64 {
+    fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+
+    fn write_u8(&mut self, byte: u8) {
+        self.0 ^= byte as u64;
+        self.0 = self.0.wrapping_mul(0x100000001b3);
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u8(*byte);
+        }
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.write_bytes(&value.to_be_bytes());
+    }
+
+    fn write_endpoint(&mut self, endpoint: Endpoint) {
+        match endpoint.addr {
+            IpAddr::V4(addr) => {
+                self.write_u8(4);
+                self.write_bytes(&addr.octets());
+            }
+            IpAddr::V6(addr) => {
+                self.write_u8(6);
+                self.write_bytes(&addr.octets());
+            }
+        }
+        self.write_u16(endpoint.port);
+    }
+
+    fn finish(self) -> u64 {
+        self.0
     }
 }
 

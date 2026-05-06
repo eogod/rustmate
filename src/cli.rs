@@ -4,10 +4,12 @@ use std::path::PathBuf;
 use crate::config::{
     DEFAULT_BATCH_SIZE, DEFAULT_CAPTURE_BUFFER_SIZE, DEFAULT_CAPTURE_READ_TIMEOUT_MS,
     DEFAULT_CAPTURE_SNAPLEN, DEFAULT_EVENT_QUEUE_DEPTH, DEFAULT_FLOW_IDLE_TIMEOUT_MS,
-    DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS, DEFAULT_MAX_STREAMS,
+    DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS, DEFAULT_MAX_STREAM_CONTENT_BYTES,
+    DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM, DEFAULT_MAX_STREAMS,
     DEFAULT_MAX_TCP_BUFFERED_BYTES_PER_FLOW, DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION,
-    DEFAULT_STREAM_PREVIEW_BYTES, DEFAULT_STREAM_UPDATE_BYTES, DEFAULT_STREAM_UPDATE_PACKETS,
-    DEFAULT_WORKER_QUEUE_DEPTH, DEFAULT_WORKERS, RunMode,
+    DEFAULT_STREAM_CONTENT_SEGMENT_BYTES, DEFAULT_STREAM_PREVIEW_BYTES,
+    DEFAULT_STREAM_UPDATE_BYTES, DEFAULT_STREAM_UPDATE_PACKETS, DEFAULT_WORKER_QUEUE_DEPTH,
+    DEFAULT_WORKERS, RunMode,
 };
 
 /// CLI opts, kept flat so the tool stays script-friendly.
@@ -85,6 +87,22 @@ pub struct Opts {
     /// Emit stream update after N reassembled bytes in a stream; 0 disables this trigger
     #[arg(long, default_value_t = DEFAULT_STREAM_UPDATE_BYTES)]
     pub stream_update_bytes: u64,
+
+    /// Disable bounded stream content storage
+    #[arg(long)]
+    pub disable_stream_content: bool,
+
+    /// Max stored stream content bytes across all streams
+    #[arg(long, default_value_t = DEFAULT_MAX_STREAM_CONTENT_BYTES)]
+    pub max_stream_content_bytes: usize,
+
+    /// Max stored stream content bytes per stream
+    #[arg(long, default_value_t = DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM)]
+    pub max_stream_content_bytes_per_stream: usize,
+
+    /// Max bytes per stored stream content segment
+    #[arg(long, default_value_t = DEFAULT_STREAM_CONTENT_SEGMENT_BYTES)]
+    pub stream_content_segment_bytes: usize,
 
     /// Health log interval in milliseconds; 0 disables it
     #[arg(long, default_value_t = DEFAULT_HEALTH_INTERVAL_MS)]

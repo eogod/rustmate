@@ -27,10 +27,14 @@ PacketSource -> PacketBatch -> Flow-sharded workers -> Analyzer events -> Output
   records, stable `stream_id`s, service guesses, text/binary classification,
   per-direction counters, small previews, lifecycle status, and throttled
   `stream_open` / `stream_update` JSONL events.
+- Stream Content Layer for bounded reassembled payload storage. It keeps
+  direction-aware content ranges, merges adjacent TCP chunks, trims old bytes
+  under per-stream pressure, evicts old content under global pressure, and does
+  not dump stored payload into JSONL by default.
 - Flow-sharded worker pool for multi-threaded analysis. Each shard owns its
-  `FlowTable`, stream inventory, and analyzer state; bounded queues provide
-  backpressure, and the coordinator writes output batches without sink-level
-  locking.
+  `FlowTable`, stream inventory, stream content store, and analyzer state;
+  bounded queues provide backpressure, and the coordinator writes output batches
+  without sink-level locking.
 - Bounded worker input queues and bounded worker-to-output event queues; sharded
   packet routing moves captured packet buffers into workers without cloning.
 - Route-only dispatcher parsing for sharded mode, so the worker is the only
@@ -57,6 +61,9 @@ cargo run -- --pcap sample.pcap --workers 8 --event-queue-depth 8192
 cargo run -- --pcap sample.pcap --max-streams 2000000 --stream-preview-bytes 512
 cargo run -- --pcap sample.pcap --stream-update-packets 128 --stream-update-bytes 131072
 cargo run -- --pcap sample.pcap --disable-stream-inventory
+cargo run -- --pcap sample.pcap --max-stream-content-bytes 536870912
+cargo run -- --pcap sample.pcap --max-stream-content-bytes-per-stream 16777216
+cargo run -- --pcap sample.pcap --disable-stream-content
 cargo run -- --list-interfaces
 cargo run -- --iface en0 --output live.jsonl --workers 0
 cargo run -- --iface en0 --capture-filter "tcp or udp" --capture-buffer-size 67108864
@@ -74,22 +81,29 @@ payload bodies, so it can power stream lists and filters without becoming the
 payload store. `stream_id` is deterministic for a canonical flow key, which keeps
 single-threaded and flow-sharded output easy to correlate.
 
+Stream content storage is also enabled by default, but bounded separately from
+inventory. It is the in-memory base for pattern matching, highlighting,
+copy/export, and decode layers; JSONL stays metadata-oriented unless a later sink
+explicitly asks for payload bytes.
+
 ## Development Priorities
 
-1. Build stream filtering and view state on top of Stream Inventory: hide rules,
+1. Build pattern matching on top of Stream Content: substring, regex, binary
+   substring, and match ranges for highlighting.
+2. Build stream filtering and view state on top of Stream Inventory: hide rules,
    favorites, service/pattern scopes, and per-stream navigation metadata.
-2. Move TLS analyzer onto stream input, keeping packet-level analyzers for
+3. Move TLS analyzer onto stream input, keeping packet-level analyzers for
    stateless heuristics.
-3. Expand benchmark fixtures with real PCAP corpora and track throughput deltas
+4. Expand benchmark fixtures with real PCAP corpora and track throughput deltas
    across worker counts.
-4. Split outputs into debug sinks and production sinks. JSONL is useful for
+5. Split outputs into debug sinks and production sinks. JSONL is useful for
    inspection, but the high-load path should support faster formats and bounded
    queues.
-5. Add machine-readable metrics export for long-running capture: Prometheus or
+6. Add machine-readable metrics export for long-running capture: Prometheus or
    lightweight JSON stats snapshots.
-6. Add benchmarks with fixed PCAP fixtures and track packets/sec, bytes/sec,
+7. Add benchmarks with fixed PCAP fixtures and track packets/sec, bytes/sec,
    allocations, and dropped packets.
-7. Grow analyzers around the flow layer: HTTP bodies, DNS names, TLS ClientHello
+8. Grow analyzers around the flow layer: HTTP bodies, DNS names, TLS ClientHello
    metadata, secrets/flag extraction, and protocol heuristics.
 
 ## Checks

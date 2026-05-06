@@ -18,6 +18,7 @@ use rustmate::{
     output::jsonl::JsonlWriter,
     pipeline::{Pipeline, PipelineConfig},
     sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, resolve_worker_count},
+    stream_content::StreamContentConfig,
     stream_inventory::StreamInventoryConfig,
 };
 
@@ -55,6 +56,14 @@ async fn main() -> anyhow::Result<()> {
             preview_bytes_per_direction: opts.stream_preview_bytes,
             update_packet_interval: opts.stream_update_packets,
             update_byte_interval: opts.stream_update_bytes,
+        },
+        stream_content: StreamContentConfig {
+            enabled: !opts.disable_stream_content,
+            max_streams: opts.max_streams.max(1),
+            idle_timeout_ms: opts.flow_idle_timeout_ms,
+            max_total_bytes: opts.max_stream_content_bytes,
+            max_bytes_per_stream: opts.max_stream_content_bytes_per_stream,
+            max_segment_bytes: opts.stream_content_segment_bytes,
         },
     };
     let worker_count = resolve_worker_count(opts.workers);
@@ -222,6 +231,15 @@ fn log_completed(message: &str, stats: &rustmate::pipeline::PipelineStats, out_p
         inventory_dropped_new_streams = stats.inventory_dropped_new_streams,
         inventory_closed_streams = stats.inventory_closed_streams,
         inventory_events = stats.inventory_events,
+        content_active_streams = stats.content_active_streams,
+        content_active_segments = stats.content_active_segments,
+        content_stored_bytes = stats.content_stored_bytes,
+        content_observed_bytes = stats.content_observed_bytes,
+        content_dropped_bytes = stats.content_dropped_bytes,
+        content_evicted_streams = stats.content_evicted_streams,
+        content_truncated_streams = stats.content_truncated_streams,
+        content_updates = stats.content_updates,
+        content_merged_segments = stats.content_merged_segments,
         output = %out_path.display(),
         "{message}"
     );

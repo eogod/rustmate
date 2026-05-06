@@ -19,6 +19,7 @@ use crate::{
     output::EventSink,
     packet::{DecodedPacket, LinkLayer, RawPacket, TransportProtocol},
     pipeline::{PipelineConfig, PipelineStats},
+    stream_content::{StreamContent, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryStats},
 };
 
@@ -50,7 +51,7 @@ struct RoutedPacket {
 
 enum WorkerMessage {
     Events(Vec<Event>),
-    Stats(WorkerStats),
+    Stats(Box<WorkerStats>),
 }
 
 #[derive(Debug, Default)]
@@ -59,6 +60,7 @@ struct WorkerStats {
     decode_errors: u64,
     flow_stats: FlowTableStats,
     stream_inventory_stats: StreamInventoryStats,
+    stream_content_stats: StreamContentStats,
 }
 
 struct WorkerHandle {
@@ -70,6 +72,16 @@ struct WorkerHandle {
 struct WorkerPool {
     workers: Vec<WorkerHandle>,
     output_rx: Receiver<WorkerMessage>,
+}
+
+struct WorkerRuntime {
+    mode: RunMode,
+    flow_table: FlowTable,
+    stream_inventory: StreamInventory,
+    stream_content: StreamContent,
+    analyzers: Vec<Box<dyn Analyzer>>,
+    events: Vec<Event>,
+    stats: WorkerStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +361,7 @@ impl WorkerPool {
                         .saturating_add(worker_stats.decode_errors);
                     stats.add_flow_table_stats(worker_stats.flow_stats);
                     stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
+                    stats.add_stream_content_stats(worker_stats.stream_content_stats);
                     received_stats += 1;
                     tracing::debug!(
                         worker = worker_stats.id,
@@ -403,88 +416,81 @@ fn run_worker(
     receiver: Receiver<WorkerCommand>,
     output_tx: Sender<WorkerMessage>,
 ) -> Result<()> {
-    let mut flow_table = FlowTable::new(flow_config);
-    let mut stream_inventory = StreamInventory::new(config.stream_inventory);
-    let mut analyzers = analyzer_factories
-        .iter()
-        .map(|factory| factory())
-        .collect::<Vec<_>>();
     let event_batch_capacity = config.batch_size.clamp(1, 8192);
-    let mut events = Vec::with_capacity(event_batch_capacity);
-    let mut stats = WorkerStats {
-        id,
-        ..WorkerStats::default()
+    let mut runtime = WorkerRuntime {
+        mode: config.mode,
+        flow_table: FlowTable::new(flow_config),
+        stream_inventory: StreamInventory::new(config.stream_inventory),
+        stream_content: StreamContent::new(config.stream_content),
+        analyzers: analyzer_factories
+            .iter()
+            .map(|factory| factory())
+            .collect::<Vec<_>>(),
+        events: Vec::with_capacity(event_batch_capacity),
+        stats: WorkerStats {
+            id,
+            ..WorkerStats::default()
+        },
     };
 
     while let Ok(command) = receiver.recv() {
         match command {
             WorkerCommand::Packet(packet) => {
-                process_worker_packet(
-                    &packet,
-                    config.mode,
-                    &mut flow_table,
-                    &mut stream_inventory,
-                    &mut analyzers,
-                    &mut events,
-                    &mut stats,
-                );
+                runtime.process_packet(&packet);
 
-                if events.len() >= event_batch_capacity {
-                    flush_worker_events(&output_tx, &mut events)?;
+                if runtime.events.len() >= event_batch_capacity {
+                    flush_worker_events(&output_tx, &mut runtime.events)?;
                 }
             }
             WorkerCommand::Shutdown => break,
         }
     }
 
-    flush_worker_events(&output_tx, &mut events)?;
-    stats.flow_stats = flow_table.stats();
-    stats.stream_inventory_stats = stream_inventory.stats();
+    flush_worker_events(&output_tx, &mut runtime.events)?;
+    runtime.stats.flow_stats = runtime.flow_table.stats();
+    runtime.stats.stream_inventory_stats = runtime.stream_inventory.stats();
+    runtime.stats.stream_content_stats = runtime.stream_content.stats();
     output_tx
-        .send(WorkerMessage::Stats(stats))
+        .send(WorkerMessage::Stats(Box::new(runtime.stats)))
         .map_err(|_| anyhow!("coordinator stopped before worker shard {id} sent stats"))?;
     Ok(())
 }
 
-fn process_worker_packet(
-    routed: &RoutedPacket,
-    mode: RunMode,
-    flow_table: &mut FlowTable,
-    stream_inventory: &mut StreamInventory,
-    analyzers: &mut [Box<dyn Analyzer>],
-    events: &mut Vec<Event>,
-    stats: &mut WorkerStats,
-) {
-    let raw = &routed.raw;
-    match mode {
-        RunMode::Dump => events.push(Event::packet_dump(raw)),
-        RunMode::Analyze => {
-            let packet = DecodedPacket::from_raw(raw);
-            if packet.decode_error().is_some() {
-                stats.decode_errors = stats.decode_errors.saturating_add(1);
-                return;
-            }
+impl WorkerRuntime {
+    fn process_packet(&mut self, routed: &RoutedPacket) {
+        let raw = &routed.raw;
+        match self.mode {
+            RunMode::Dump => self.events.push(Event::packet_dump(raw)),
+            RunMode::Analyze => {
+                let packet = DecodedPacket::from_raw(raw);
+                if packet.decode_error().is_some() {
+                    self.stats.decode_errors = self.stats.decode_errors.saturating_add(1);
+                    return;
+                }
 
-            let flow = routed
-                .flow_route
-                .map(|route| flow_table.observe_with_route(&packet, route))
-                .unwrap_or_else(|| flow_table.observe(&packet));
-            if let Some(flow) = flow.as_ref() {
-                stream_inventory.observe_flow(&packet, flow, events);
-            }
-            if let Some((flow, tcp)) = flow
-                .as_ref()
-                .and_then(|flow| flow.tcp.as_ref().map(|tcp| (flow, tcp)))
-            {
-                for chunk in &tcp.stream_chunks {
-                    for analyzer in analyzers.iter_mut() {
-                        analyzer.analyze_stream(&packet, flow, chunk, events);
+                let flow = routed
+                    .flow_route
+                    .map(|route| self.flow_table.observe_with_route(&packet, route))
+                    .unwrap_or_else(|| self.flow_table.observe(&packet));
+                if let Some(flow) = flow.as_ref() {
+                    self.stream_inventory
+                        .observe_flow(&packet, flow, &mut self.events);
+                    self.stream_content.observe_flow(&packet, flow);
+                }
+                if let Some((flow, tcp)) = flow
+                    .as_ref()
+                    .and_then(|flow| flow.tcp.as_ref().map(|tcp| (flow, tcp)))
+                {
+                    for chunk in &tcp.stream_chunks {
+                        for analyzer in &mut self.analyzers {
+                            analyzer.analyze_stream(&packet, flow, chunk, &mut self.events);
+                        }
                     }
                 }
-            }
 
-            for analyzer in analyzers.iter_mut() {
-                analyzer.analyze(&packet, events);
+                for analyzer in &mut self.analyzers {
+                    analyzer.analyze(&packet, &mut self.events);
+                }
             }
         }
     }
@@ -515,6 +521,7 @@ fn write_worker_message(
                 .saturating_add(worker_stats.decode_errors);
             stats.add_flow_table_stats(worker_stats.flow_stats);
             stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
+            stats.add_stream_content_stats(worker_stats.stream_content_stats);
             Ok(())
         }
     }
@@ -799,6 +806,7 @@ mod tests {
         ingest::{PacketBatch, PacketSource},
         output::EventSink,
         packet::{LinkLayer, PacketTimestamp},
+        stream_content::StreamContentConfig,
         stream_inventory::StreamInventoryConfig,
     };
 
@@ -832,6 +840,9 @@ mod tests {
         let events = events.lock().unwrap();
         assert_eq!(4, stats.workers);
         assert_eq!(3, stats.tcp_stream_chunks);
+        assert_eq!(43, stats.content_observed_bytes);
+        assert_eq!(43, stats.content_stored_bytes);
+        assert_eq!(1, stats.content_active_streams);
         assert_eq!(2, stats.events);
         assert_eq!(1, stats.inventory_created_streams);
         assert_eq!(1, stats.inventory_events);
@@ -1000,6 +1011,7 @@ mod tests {
                 max_tcp_buffered_bytes_per_flow: 64 * 1024,
                 max_tcp_out_of_order_segments_per_direction: 16,
                 stream_inventory: test_stream_inventory_config(),
+                stream_content: test_stream_content_config(),
             },
             worker_count: 2,
             worker_queue_depth: 1,
@@ -1127,6 +1139,7 @@ mod tests {
                 max_tcp_buffered_bytes_per_flow: 64 * 1024,
                 max_tcp_out_of_order_segments_per_direction: 16,
                 stream_inventory: test_stream_inventory_config(),
+                stream_content: test_stream_content_config(),
             },
             worker_count,
             worker_queue_depth: 8,
@@ -1142,6 +1155,17 @@ mod tests {
             preview_bytes_per_direction: 128,
             update_packet_interval: 64,
             update_byte_interval: 64 * 1024,
+        }
+    }
+
+    fn test_stream_content_config() -> StreamContentConfig {
+        StreamContentConfig {
+            enabled: true,
+            max_streams: 1024,
+            idle_timeout_ms: 120_000,
+            max_total_bytes: 1024 * 1024,
+            max_bytes_per_stream: 64 * 1024,
+            max_segment_bytes: 64 * 1024,
         }
     }
 

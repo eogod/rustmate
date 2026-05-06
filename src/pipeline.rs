@@ -9,6 +9,7 @@ use crate::{
     ingest::{PacketBatch, PacketSource, PacketSourceStats},
     output::EventSink,
     packet::{DecodedPacket, RawPacket},
+    stream_content::{StreamContent, StreamContentConfig, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryConfig, StreamInventoryStats},
 };
 
@@ -42,6 +43,15 @@ pub struct PipelineStats {
     pub inventory_dropped_new_streams: u64,
     pub inventory_closed_streams: u64,
     pub inventory_events: u64,
+    pub content_active_streams: usize,
+    pub content_active_segments: usize,
+    pub content_stored_bytes: usize,
+    pub content_observed_bytes: u64,
+    pub content_dropped_bytes: u64,
+    pub content_evicted_streams: u64,
+    pub content_truncated_streams: u64,
+    pub content_updates: u64,
+    pub content_merged_segments: u64,
 }
 
 impl PipelineStats {
@@ -122,6 +132,48 @@ impl PipelineStats {
             .inventory_events
             .saturating_add(inventory_stats.stream_events);
     }
+
+    pub(crate) fn set_stream_content_stats(&mut self, content_stats: StreamContentStats) {
+        self.content_active_streams = content_stats.active_content_streams;
+        self.content_active_segments = content_stats.active_content_segments;
+        self.content_stored_bytes = content_stats.stored_content_bytes;
+        self.content_observed_bytes = content_stats.observed_content_bytes;
+        self.content_dropped_bytes = content_stats.dropped_content_bytes;
+        self.content_evicted_streams = content_stats.evicted_content_streams;
+        self.content_truncated_streams = content_stats.truncated_content_streams;
+        self.content_updates = content_stats.content_updates;
+        self.content_merged_segments = content_stats.merged_content_segments;
+    }
+
+    pub(crate) fn add_stream_content_stats(&mut self, content_stats: StreamContentStats) {
+        self.content_active_streams = self
+            .content_active_streams
+            .saturating_add(content_stats.active_content_streams);
+        self.content_active_segments = self
+            .content_active_segments
+            .saturating_add(content_stats.active_content_segments);
+        self.content_stored_bytes = self
+            .content_stored_bytes
+            .saturating_add(content_stats.stored_content_bytes);
+        self.content_observed_bytes = self
+            .content_observed_bytes
+            .saturating_add(content_stats.observed_content_bytes);
+        self.content_dropped_bytes = self
+            .content_dropped_bytes
+            .saturating_add(content_stats.dropped_content_bytes);
+        self.content_evicted_streams = self
+            .content_evicted_streams
+            .saturating_add(content_stats.evicted_content_streams);
+        self.content_truncated_streams = self
+            .content_truncated_streams
+            .saturating_add(content_stats.truncated_content_streams);
+        self.content_updates = self
+            .content_updates
+            .saturating_add(content_stats.content_updates);
+        self.content_merged_segments = self
+            .content_merged_segments
+            .saturating_add(content_stats.merged_content_segments);
+    }
 }
 
 pub struct Pipeline {
@@ -131,6 +183,7 @@ pub struct Pipeline {
     sinks: Vec<Box<dyn EventSink>>,
     flow_table: FlowTable,
     stream_inventory: StreamInventory,
+    stream_content: StreamContent,
     events: Vec<Event>,
 }
 
@@ -144,6 +197,7 @@ pub struct PipelineConfig {
     pub max_tcp_buffered_bytes_per_flow: usize,
     pub max_tcp_out_of_order_segments_per_direction: usize,
     pub stream_inventory: StreamInventoryConfig,
+    pub stream_content: StreamContentConfig,
 }
 
 impl Pipeline {
@@ -160,6 +214,7 @@ impl Pipeline {
                 config.max_tcp_out_of_order_segments_per_direction,
             )),
             stream_inventory: StreamInventory::new(config.stream_inventory),
+            stream_content: StreamContent::new(config.stream_content),
             events: Vec::with_capacity(config.batch_size),
         }
     }
@@ -230,6 +285,7 @@ impl Pipeline {
 
         stats.set_flow_table_stats(self.flow_table.stats());
         stats.set_stream_inventory_stats(self.stream_inventory.stats());
+        stats.set_stream_content_stats(self.stream_content.stats());
     }
 
     fn process_packet(&mut self, raw: &RawPacket, stats: &mut PipelineStats) {
@@ -246,6 +302,7 @@ impl Pipeline {
                 if let Some(flow) = flow.as_ref() {
                     self.stream_inventory
                         .observe_flow(&packet, flow, &mut self.events);
+                    self.stream_content.observe_flow(&packet, flow);
                 }
                 if let Some(flow) = flow
                     .as_ref()
@@ -298,6 +355,7 @@ mod tests {
             max_tcp_buffered_bytes_per_flow: 64 * 1024,
             max_tcp_out_of_order_segments_per_direction: 16,
             stream_inventory: test_stream_inventory_config(),
+            stream_content: test_stream_content_config(),
         });
         pipeline.register_analyzer(Box::new(StreamCollector {
             chunks: Arc::clone(&chunks),
@@ -312,6 +370,9 @@ mod tests {
 
         assert_eq!(3, stats.tcp_stream_chunks);
         assert_eq!(8, stats.tcp_stream_bytes);
+        assert_eq!(8, stats.content_observed_bytes);
+        assert_eq!(8, stats.content_stored_bytes);
+        assert_eq!(1, stats.content_active_streams);
         assert_eq!(
             vec![b"abc".to_vec(), b"def".to_vec(), b"gh".to_vec()],
             *chunks.lock().unwrap()
@@ -472,6 +533,7 @@ mod tests {
             max_tcp_buffered_bytes_per_flow: 64 * 1024,
             max_tcp_out_of_order_segments_per_direction: 16,
             stream_inventory: test_stream_inventory_config(),
+            stream_content: test_stream_content_config(),
         })
     }
 
@@ -483,6 +545,17 @@ mod tests {
             preview_bytes_per_direction: 128,
             update_packet_interval: 64,
             update_byte_interval: 64 * 1024,
+        }
+    }
+
+    fn test_stream_content_config() -> StreamContentConfig {
+        StreamContentConfig {
+            enabled: true,
+            max_streams: 1024,
+            idle_timeout_ms: 120_000,
+            max_total_bytes: 1024 * 1024,
+            max_bytes_per_stream: 64 * 1024,
+            max_segment_bytes: 64 * 1024,
         }
     }
 
