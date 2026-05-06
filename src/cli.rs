@@ -4,12 +4,13 @@ use std::path::PathBuf;
 use crate::config::{
     DEFAULT_BATCH_SIZE, DEFAULT_CAPTURE_BUFFER_SIZE, DEFAULT_CAPTURE_READ_TIMEOUT_MS,
     DEFAULT_CAPTURE_SNAPLEN, DEFAULT_EVENT_QUEUE_DEPTH, DEFAULT_FLOW_IDLE_TIMEOUT_MS,
-    DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS, DEFAULT_MAX_STREAM_CONTENT_BYTES,
+    DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS, DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM,
+    DEFAULT_MAX_PATTERN_MATCHES_TOTAL, DEFAULT_MAX_STREAM_CONTENT_BYTES,
     DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM, DEFAULT_MAX_STREAMS,
     DEFAULT_MAX_TCP_BUFFERED_BYTES_PER_FLOW, DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION,
-    DEFAULT_STREAM_CONTENT_SEGMENT_BYTES, DEFAULT_STREAM_PREVIEW_BYTES,
-    DEFAULT_STREAM_UPDATE_BYTES, DEFAULT_STREAM_UPDATE_PACKETS, DEFAULT_WORKER_QUEUE_DEPTH,
-    DEFAULT_WORKERS, RunMode,
+    DEFAULT_PATTERN_REGEX_WINDOW_BYTES, DEFAULT_STREAM_CONTENT_SEGMENT_BYTES,
+    DEFAULT_STREAM_PREVIEW_BYTES, DEFAULT_STREAM_UPDATE_BYTES, DEFAULT_STREAM_UPDATE_PACKETS,
+    DEFAULT_WORKER_QUEUE_DEPTH, DEFAULT_WORKERS, RunMode,
 };
 
 /// CLI opts, kept flat so the tool stays script-friendly.
@@ -103,6 +104,30 @@ pub struct Opts {
     /// Max bytes per stored stream content segment
     #[arg(long, default_value_t = DEFAULT_STREAM_CONTENT_SEGMENT_BYTES)]
     pub stream_content_segment_bytes: usize,
+
+    /// Substring pattern to match in stream content; repeatable
+    #[arg(long = "pattern")]
+    pub patterns: Vec<String>,
+
+    /// Regex pattern to match in stream content; repeatable
+    #[arg(long = "regex")]
+    pub regex_patterns: Vec<String>,
+
+    /// Binary hex pattern to match in stream content; repeatable
+    #[arg(long = "binary-pattern")]
+    pub binary_patterns: Vec<String>,
+
+    /// Max emitted pattern matches per stream
+    #[arg(long, default_value_t = DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM)]
+    pub max_pattern_matches_per_stream: u64,
+
+    /// Max emitted pattern matches across the run
+    #[arg(long, default_value_t = DEFAULT_MAX_PATTERN_MATCHES_TOTAL)]
+    pub max_pattern_matches_total: u64,
+
+    /// Regex lookbehind window bytes for boundary-spanning matches
+    #[arg(long, default_value_t = DEFAULT_PATTERN_REGEX_WINDOW_BYTES)]
+    pub pattern_regex_window_bytes: usize,
 
     /// Health log interval in milliseconds; 0 disables it
     #[arg(long, default_value_t = DEFAULT_HEALTH_INTERVAL_MS)]

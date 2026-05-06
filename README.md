@@ -31,6 +31,10 @@ PacketSource -> PacketBatch -> Flow-sharded workers -> Analyzer events -> Output
   direction-aware content ranges, merges adjacent TCP chunks, trims old bytes
   under per-stream pressure, evicts old content under global pressure, and does
   not dump stored payload into JSONL by default.
+- Pattern Matching Engine on top of stored stream content. It supports repeated
+  substring, regex, and binary hex patterns; scans across chunk boundaries; emits
+  logical match ranges for highlighting; and has per-stream plus global match
+  caps so noisy streams cannot dominate output.
 - Flow-sharded worker pool for multi-threaded analysis. Each shard owns its
   `FlowTable`, stream inventory, stream content store, and analyzer state;
   bounded queues provide backpressure, and the coordinator writes output batches
@@ -64,6 +68,9 @@ cargo run -- --pcap sample.pcap --disable-stream-inventory
 cargo run -- --pcap sample.pcap --max-stream-content-bytes 536870912
 cargo run -- --pcap sample.pcap --max-stream-content-bytes-per-stream 16777216
 cargo run -- --pcap sample.pcap --disable-stream-content
+cargo run -- --pcap sample.pcap --pattern flag --regex 'token=[a-z0-9]+'
+cargo run -- --pcap sample.pcap --binary-pattern 'de ad be ef'
+cargo run -- --pcap sample.pcap --max-pattern-matches-per-stream 256
 cargo run -- --list-interfaces
 cargo run -- --iface en0 --output live.jsonl --workers 0
 cargo run -- --iface en0 --capture-filter "tcp or udp" --capture-buffer-size 67108864
@@ -86,12 +93,18 @@ inventory. It is the in-memory base for pattern matching, highlighting,
 copy/export, and decode layers; JSONL stays metadata-oriented unless a later sink
 explicitly asks for payload bytes.
 
+Pattern matching is opt-in. `--pattern` adds byte-exact text substring matches,
+`--regex` adds byte regex matches, and `--binary-pattern` accepts hex bytes with
+optional spaces, colons, underscores, dashes, or a `0x` prefix. Match events carry
+`stream_id`, direction, logical byte offsets, base64 bytes, and text preview when
+the matched bytes are printable.
+
 ## Development Priorities
 
-1. Build pattern matching on top of Stream Content: substring, regex, binary
-   substring, and match ranges for highlighting.
-2. Build stream filtering and view state on top of Stream Inventory: hide rules,
+1. Build stream filtering and view state on top of Stream Inventory: hide rules,
    favorites, service/pattern scopes, and per-stream navigation metadata.
+2. Add the display/highlight layer for pattern ranges and packet/stream content
+   slices.
 3. Move TLS analyzer onto stream input, keeping packet-level analyzers for
    stateless heuristics.
 4. Expand benchmark fixtures with real PCAP corpora and track throughput deltas

@@ -19,6 +19,9 @@ pub const DEFAULT_STREAM_UPDATE_BYTES: u64 = 64 * 1024;
 pub const DEFAULT_MAX_STREAM_CONTENT_BYTES: usize = 256 * 1024 * 1024;
 pub const DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM: usize = 8 * 1024 * 1024;
 pub const DEFAULT_STREAM_CONTENT_SEGMENT_BYTES: usize = 64 * 1024;
+pub const DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM: u64 = 1024;
+pub const DEFAULT_MAX_PATTERN_MATCHES_TOTAL: u64 = 1_000_000;
+pub const DEFAULT_PATTERN_REGEX_WINDOW_BYTES: usize = 4096;
 pub const DEFAULT_CAPTURE_SNAPLEN: usize = 262_144;
 pub const DEFAULT_CAPTURE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 pub const DEFAULT_CAPTURE_READ_TIMEOUT_MS: usize = 100;
@@ -62,6 +65,9 @@ pub struct Config {
     pub max_stream_content_bytes: usize,
     pub max_stream_content_bytes_per_stream: usize,
     pub stream_content_segment_bytes: usize,
+    pub max_pattern_matches_per_stream: u64,
+    pub max_pattern_matches_total: u64,
+    pub pattern_regex_window_bytes: usize,
     pub capture_snaplen: usize,
     pub capture_buffer_size: usize,
     pub capture_read_timeout_ms: usize,
@@ -92,6 +98,9 @@ impl Default for Config {
             max_stream_content_bytes: DEFAULT_MAX_STREAM_CONTENT_BYTES,
             max_stream_content_bytes_per_stream: DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM,
             stream_content_segment_bytes: DEFAULT_STREAM_CONTENT_SEGMENT_BYTES,
+            max_pattern_matches_per_stream: DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM,
+            max_pattern_matches_total: DEFAULT_MAX_PATTERN_MATCHES_TOTAL,
+            pattern_regex_window_bytes: DEFAULT_PATTERN_REGEX_WINDOW_BYTES,
             capture_snaplen: DEFAULT_CAPTURE_SNAPLEN,
             capture_buffer_size: DEFAULT_CAPTURE_BUFFER_SIZE,
             capture_read_timeout_ms: DEFAULT_CAPTURE_READ_TIMEOUT_MS,

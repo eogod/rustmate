@@ -80,6 +80,14 @@ pub struct StreamContentRange {
     pub stored_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamContentWindow {
+    pub stream_id: u64,
+    pub direction: FlowDirection,
+    pub logical_start: u64,
+    pub bytes: Vec<u8>,
+}
+
 pub struct StreamContent {
     config: StreamContentConfig,
     streams: AHashMap<FlowKey, ContentRecord>,
@@ -233,6 +241,18 @@ impl StreamContent {
         self.streams
             .get(key)
             .map(|record| record.direction_ranges(direction))
+    }
+
+    pub fn direction_windows(
+        &self,
+        key: &FlowKey,
+        direction: FlowDirection,
+        logical_start: u64,
+        logical_end: u64,
+    ) -> Option<Vec<StreamContentWindow>> {
+        self.streams
+            .get(key)
+            .map(|record| record.direction_windows(direction, logical_start, logical_end))
     }
 
     pub fn stats(&self) -> StreamContentStats {
@@ -445,6 +465,20 @@ impl ContentRecord {
     fn direction_ranges(&self, direction: FlowDirection) -> Vec<StreamContentRange> {
         self.directions[direction_index(direction)].ranges(self.id, direction)
     }
+
+    fn direction_windows(
+        &self,
+        direction: FlowDirection,
+        logical_start: u64,
+        logical_end: u64,
+    ) -> Vec<StreamContentWindow> {
+        self.directions[direction_index(direction)].windows(
+            self.id,
+            direction,
+            logical_start,
+            logical_end,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -614,6 +648,67 @@ impl DirectionContent {
             })
             .collect()
     }
+
+    fn windows(
+        &self,
+        stream_id: u64,
+        direction: FlowDirection,
+        logical_start: u64,
+        logical_end: u64,
+    ) -> Vec<StreamContentWindow> {
+        if logical_start >= logical_end {
+            return Vec::new();
+        }
+
+        let mut windows = Vec::new();
+        let mut current_start = 0u64;
+        let mut current_end = 0u64;
+        let mut current_bytes = Vec::new();
+
+        for segment in &self.segments {
+            let segment_start = segment.logical_start;
+            let segment_end = segment.logical_end();
+            let start = segment_start.max(logical_start);
+            let end = segment_end.min(logical_end);
+            if start >= end {
+                continue;
+            }
+
+            let offset = start.saturating_sub(segment_start) as usize;
+            let len = end.saturating_sub(start) as usize;
+            let bytes = &segment.bytes[offset..offset + len];
+
+            if current_bytes.is_empty() {
+                current_start = start;
+                current_end = end;
+                current_bytes.extend_from_slice(bytes);
+            } else if start == current_end {
+                current_end = end;
+                current_bytes.extend_from_slice(bytes);
+            } else {
+                windows.push(StreamContentWindow {
+                    stream_id,
+                    direction,
+                    logical_start: current_start,
+                    bytes: std::mem::take(&mut current_bytes),
+                });
+                current_start = start;
+                current_end = end;
+                current_bytes.extend_from_slice(bytes);
+            }
+        }
+
+        if !current_bytes.is_empty() {
+            windows.push(StreamContentWindow {
+                stream_id,
+                direction,
+                logical_start: current_start,
+                bytes: current_bytes,
+            });
+        }
+
+        windows
+    }
 }
 
 impl ContentSegment {
@@ -711,6 +806,36 @@ mod tests {
         assert_eq!(
             b"response".to_vec(),
             content.direction_bytes(&key, FlowDirection::BToA).unwrap()
+        );
+    }
+
+    #[test]
+    fn returns_contiguous_windows_for_logical_range() {
+        let mut content = StreamContent::new(StreamContentConfig {
+            max_segment_bytes: 4,
+            ..config()
+        });
+        let mut flow_table = flow_table();
+
+        let key = feed(
+            &mut content,
+            &mut flow_table,
+            &tcp_packet(1, 1111, 80, b"abcdef"),
+        )
+        .key;
+
+        let windows = content
+            .direction_windows(&key, FlowDirection::AToB, 2, 6)
+            .unwrap();
+
+        assert_eq!(
+            vec![StreamContentWindow {
+                stream_id: key.stable_id(),
+                direction: FlowDirection::AToB,
+                logical_start: 2,
+                bytes: b"cdef".to_vec(),
+            }],
+            windows
         );
     }
 

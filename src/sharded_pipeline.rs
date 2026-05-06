@@ -18,6 +18,7 @@ use crate::{
     ingest::{PacketBatch, PacketSource},
     output::EventSink,
     packet::{DecodedPacket, LinkLayer, RawPacket, TransportProtocol},
+    pattern::{PatternEngine, PatternEngineConfig, PatternEngineStats},
     pipeline::{PipelineConfig, PipelineStats},
     stream_content::{StreamContent, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryStats},
@@ -35,6 +36,7 @@ pub struct ShardedPipelineConfig {
 
 pub struct ShardedPipeline {
     config: ShardedPipelineConfig,
+    pattern_config: PatternEngineConfig,
     analyzer_factories: Vec<AnalyzerFactory>,
     sinks: Vec<Box<dyn EventSink>>,
 }
@@ -61,6 +63,7 @@ struct WorkerStats {
     flow_stats: FlowTableStats,
     stream_inventory_stats: StreamInventoryStats,
     stream_content_stats: StreamContentStats,
+    pattern_stats: PatternEngineStats,
 }
 
 struct WorkerHandle {
@@ -79,6 +82,7 @@ struct WorkerRuntime {
     flow_table: FlowTable,
     stream_inventory: StreamInventory,
     stream_content: StreamContent,
+    pattern_engine: PatternEngine,
     analyzers: Vec<Box<dyn Analyzer>>,
     events: Vec<Event>,
     stats: WorkerStats,
@@ -100,9 +104,14 @@ impl ShardedPipeline {
                 event_queue_depth: config.event_queue_depth.max(1),
                 ..config
             },
+            pattern_config: PatternEngineConfig::disabled(),
             analyzer_factories: Vec::new(),
             sinks: Vec::new(),
         }
+    }
+
+    pub fn set_pattern_config(&mut self, config: PatternEngineConfig) {
+        self.pattern_config = config;
     }
 
     pub fn register_analyzer_factory<F>(&mut self, factory: F)
@@ -126,7 +135,11 @@ impl ShardedPipeline {
         };
         let mut batch = PacketBatch::with_capacity(self.config.pipeline.batch_size.max(1));
         let mut packet_sequence = 0u64;
-        let mut pool = WorkerPool::start(self.config, Arc::new(self.analyzer_factories.clone()))?;
+        let mut pool = WorkerPool::start(
+            self.config,
+            self.pattern_config.clone(),
+            Arc::new(self.analyzer_factories.clone()),
+        )?;
         let mut worker_packets = vec![0u64; self.config.worker_count];
         let mut health = PipelineHealthReporter::new(self.config.pipeline.health_interval_ms);
         let mut run_error = None;
@@ -238,6 +251,7 @@ impl ShardedPipeline {
 impl WorkerPool {
     fn start(
         config: ShardedPipelineConfig,
+        pattern_config: PatternEngineConfig,
         analyzer_factories: Arc<Vec<AnalyzerFactory>>,
     ) -> Result<Self> {
         let mut workers = Vec::with_capacity(config.worker_count);
@@ -247,6 +261,7 @@ impl WorkerPool {
             let (sender, receiver) = bounded(config.worker_queue_depth);
             let output_tx = output_tx.clone();
             let analyzer_factories = Arc::clone(&analyzer_factories);
+            let pattern_config = pattern_config.clone();
             let flow_config = flow_table_config(config);
             let join_handle = thread::Builder::new()
                 .name(format!("rustmate-flow-shard-{id}"))
@@ -255,6 +270,7 @@ impl WorkerPool {
                         id,
                         config.pipeline,
                         flow_config,
+                        pattern_config,
                         analyzer_factories,
                         receiver,
                         output_tx,
@@ -362,6 +378,7 @@ impl WorkerPool {
                     stats.add_flow_table_stats(worker_stats.flow_stats);
                     stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
                     stats.add_stream_content_stats(worker_stats.stream_content_stats);
+                    stats.add_pattern_stats(worker_stats.pattern_stats);
                     received_stats += 1;
                     tracing::debug!(
                         worker = worker_stats.id,
@@ -412,6 +429,7 @@ fn run_worker(
     id: usize,
     config: PipelineConfig,
     flow_config: FlowTableConfig,
+    pattern_config: PatternEngineConfig,
     analyzer_factories: Arc<Vec<AnalyzerFactory>>,
     receiver: Receiver<WorkerCommand>,
     output_tx: Sender<WorkerMessage>,
@@ -422,6 +440,7 @@ fn run_worker(
         flow_table: FlowTable::new(flow_config),
         stream_inventory: StreamInventory::new(config.stream_inventory),
         stream_content: StreamContent::new(config.stream_content),
+        pattern_engine: PatternEngine::new(pattern_config),
         analyzers: analyzer_factories
             .iter()
             .map(|factory| factory())
@@ -450,6 +469,7 @@ fn run_worker(
     runtime.stats.flow_stats = runtime.flow_table.stats();
     runtime.stats.stream_inventory_stats = runtime.stream_inventory.stats();
     runtime.stats.stream_content_stats = runtime.stream_content.stats();
+    runtime.stats.pattern_stats = runtime.pattern_engine.stats();
     output_tx
         .send(WorkerMessage::Stats(Box::new(runtime.stats)))
         .map_err(|_| anyhow!("coordinator stopped before worker shard {id} sent stats"))?;
@@ -475,7 +495,14 @@ impl WorkerRuntime {
                 if let Some(flow) = flow.as_ref() {
                     self.stream_inventory
                         .observe_flow(&packet, flow, &mut self.events);
-                    self.stream_content.observe_flow(&packet, flow);
+                    if let Some(update) = self.stream_content.observe_flow(&packet, flow) {
+                        self.pattern_engine.scan_update(
+                            &packet,
+                            &self.stream_content,
+                            &update,
+                            &mut self.events,
+                        );
+                    }
                 }
                 if let Some((flow, tcp)) = flow
                     .as_ref()
@@ -522,6 +549,7 @@ fn write_worker_message(
             stats.add_flow_table_stats(worker_stats.flow_stats);
             stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
             stats.add_stream_content_stats(worker_stats.stream_content_stats);
+            stats.add_pattern_stats(worker_stats.pattern_stats);
             Ok(())
         }
     }
@@ -806,6 +834,7 @@ mod tests {
         ingest::{PacketBatch, PacketSource},
         output::EventSink,
         packet::{LinkLayer, PacketTimestamp},
+        pattern::{PatternDefinition, PatternEngineConfig},
         stream_content::StreamContentConfig,
         stream_inventory::StreamInventoryConfig,
     };
@@ -898,6 +927,43 @@ mod tests {
         assert_eq!(4, stats.events);
         assert_eq!(2, stats.inventory_created_streams);
         assert_eq!(vec!["/a".to_owned(), "/b".to_owned()], targets);
+    }
+
+    #[tokio::test]
+    async fn emits_pattern_match_on_flow_shard() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = test_pipeline(4);
+        pipeline.set_pattern_config(
+            PatternEngineConfig::compile(
+                vec![PatternDefinition::substring("substring:0", "flag")],
+                1024,
+                1024,
+                4096,
+            )
+            .unwrap(),
+        );
+        pipeline.register_sink(Box::new(CollectSink {
+            events: Arc::clone(&events),
+        }));
+
+        let source = VecPacketSource::new(vec![
+            tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 100, b"fl", 1),
+            tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 102, b"ag", 2),
+        ]);
+
+        let stats = pipeline.run_with_source(source).await.unwrap();
+
+        let events = events.lock().unwrap();
+        let pattern = events
+            .iter()
+            .find(|event| event["event_type"] == "pattern_match")
+            .unwrap();
+        assert_eq!(1, stats.pattern_matches);
+        assert_eq!(1, stats.pattern_matched_streams);
+        assert_eq!("substring", pattern["fields"]["pattern_type"]);
+        assert_eq!("flag", pattern["fields"]["match_text"]);
+        assert_eq!(0, pattern["fields"]["logical_start"]);
+        assert_eq!(4, pattern["fields"]["logical_end"]);
     }
 
     #[test]

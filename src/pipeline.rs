@@ -9,6 +9,7 @@ use crate::{
     ingest::{PacketBatch, PacketSource, PacketSourceStats},
     output::EventSink,
     packet::{DecodedPacket, RawPacket},
+    pattern::{PatternEngine, PatternEngineConfig, PatternEngineStats},
     stream_content::{StreamContent, StreamContentConfig, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryConfig, StreamInventoryStats},
 };
@@ -52,6 +53,9 @@ pub struct PipelineStats {
     pub content_truncated_streams: u64,
     pub content_updates: u64,
     pub content_merged_segments: u64,
+    pub pattern_matches: u64,
+    pub pattern_dropped_matches: u64,
+    pub pattern_matched_streams: usize,
 }
 
 impl PipelineStats {
@@ -174,6 +178,24 @@ impl PipelineStats {
             .content_merged_segments
             .saturating_add(content_stats.merged_content_segments);
     }
+
+    pub(crate) fn set_pattern_stats(&mut self, pattern_stats: PatternEngineStats) {
+        self.pattern_matches = pattern_stats.pattern_matches;
+        self.pattern_dropped_matches = pattern_stats.pattern_dropped_matches;
+        self.pattern_matched_streams = pattern_stats.pattern_matched_streams;
+    }
+
+    pub(crate) fn add_pattern_stats(&mut self, pattern_stats: PatternEngineStats) {
+        self.pattern_matches = self
+            .pattern_matches
+            .saturating_add(pattern_stats.pattern_matches);
+        self.pattern_dropped_matches = self
+            .pattern_dropped_matches
+            .saturating_add(pattern_stats.pattern_dropped_matches);
+        self.pattern_matched_streams = self
+            .pattern_matched_streams
+            .saturating_add(pattern_stats.pattern_matched_streams);
+    }
 }
 
 pub struct Pipeline {
@@ -184,6 +206,7 @@ pub struct Pipeline {
     flow_table: FlowTable,
     stream_inventory: StreamInventory,
     stream_content: StreamContent,
+    pattern_engine: PatternEngine,
     events: Vec<Event>,
 }
 
@@ -215,8 +238,13 @@ impl Pipeline {
             )),
             stream_inventory: StreamInventory::new(config.stream_inventory),
             stream_content: StreamContent::new(config.stream_content),
+            pattern_engine: PatternEngine::new(PatternEngineConfig::disabled()),
             events: Vec::with_capacity(config.batch_size),
         }
+    }
+
+    pub fn set_pattern_config(&mut self, config: PatternEngineConfig) {
+        self.pattern_engine = PatternEngine::new(config);
     }
 
     pub fn register_analyzer(&mut self, analyzer: Box<dyn Analyzer>) {
@@ -286,6 +314,7 @@ impl Pipeline {
         stats.set_flow_table_stats(self.flow_table.stats());
         stats.set_stream_inventory_stats(self.stream_inventory.stats());
         stats.set_stream_content_stats(self.stream_content.stats());
+        stats.set_pattern_stats(self.pattern_engine.stats());
     }
 
     fn process_packet(&mut self, raw: &RawPacket, stats: &mut PipelineStats) {
@@ -302,7 +331,14 @@ impl Pipeline {
                 if let Some(flow) = flow.as_ref() {
                     self.stream_inventory
                         .observe_flow(&packet, flow, &mut self.events);
-                    self.stream_content.observe_flow(&packet, flow);
+                    if let Some(update) = self.stream_content.observe_flow(&packet, flow) {
+                        self.pattern_engine.scan_update(
+                            &packet,
+                            &self.stream_content,
+                            &update,
+                            &mut self.events,
+                        );
+                    }
                 }
                 if let Some(flow) = flow
                     .as_ref()
@@ -339,6 +375,7 @@ mod tests {
         ingest::{PacketBatch, PacketSource},
         output::EventSink,
         packet::{LinkLayer, PacketTimestamp},
+        pattern::{PatternDefinition, PatternEngineConfig},
     };
 
     use super::*;
@@ -432,6 +469,39 @@ mod tests {
             .find(|event| event["event_type"] == "http_request")
             .unwrap();
         assert_eq!("/idle", http["fields"]["target"]);
+    }
+
+    #[tokio::test]
+    async fn emits_pattern_match_from_stream_content() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = test_pipeline();
+        pipeline.set_pattern_config(
+            PatternEngineConfig::compile(
+                vec![PatternDefinition::substring("substring:0", "flag")],
+                1024,
+                1024,
+                4096,
+            )
+            .unwrap(),
+        );
+        pipeline.register_sink(Box::new(CollectSink {
+            events: Arc::clone(&events),
+        }));
+
+        let source = VecPacketSource::new(vec![tcp_packet(100, b"fl"), tcp_packet(102, b"ag")]);
+        let stats = pipeline.run_with_source(source).await.unwrap();
+
+        let events = events.lock().unwrap();
+        let pattern = events
+            .iter()
+            .find(|event| event["event_type"] == "pattern_match")
+            .unwrap();
+        assert_eq!(1, stats.pattern_matches);
+        assert_eq!(1, stats.pattern_matched_streams);
+        assert_eq!("substring", pattern["fields"]["pattern_type"]);
+        assert_eq!("flag", pattern["fields"]["match_text"]);
+        assert_eq!(0, pattern["fields"]["logical_start"]);
+        assert_eq!(4, pattern["fields"]["logical_end"]);
     }
 
     struct StreamCollector {

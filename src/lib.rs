@@ -7,6 +7,7 @@ pub mod health;
 pub mod ingest;
 pub mod output;
 pub mod packet;
+pub mod pattern;
 pub mod pipeline;
 pub mod sharded_pipeline;
 pub mod stream_content;

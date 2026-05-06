@@ -16,6 +16,7 @@ use rustmate::{
         LiveCaptureConfig, LiveCaptureSource, PacketSource, PcapFileSource, list_capture_devices,
     },
     output::jsonl::JsonlWriter,
+    pattern::{PatternDefinition, PatternEngineConfig},
     pipeline::{Pipeline, PipelineConfig},
     sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, resolve_worker_count},
     stream_content::StreamContentConfig,
@@ -66,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
             max_segment_bytes: opts.stream_content_segment_bytes,
         },
     };
+    let pattern_config = build_pattern_config(&opts)?;
     let worker_count = resolve_worker_count(opts.workers);
 
     let out_path = opts
@@ -84,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         let stats = run_pipeline(
             src,
             pipeline_config,
+            pattern_config.clone(),
             worker_count,
             opts.worker_queue_depth,
             opts.event_queue_depth,
@@ -110,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         let stats = run_pipeline(
             src,
             pipeline_config,
+            pattern_config,
             worker_count,
             opts.worker_queue_depth,
             opts.event_queue_depth,
@@ -128,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_pipeline<T: PacketSource + 'static>(
     source: T,
     pipeline_config: PipelineConfig,
+    pattern_config: PatternEngineConfig,
     worker_count: usize,
     worker_queue_depth: usize,
     event_queue_depth: usize,
@@ -140,11 +145,13 @@ async fn run_pipeline<T: PacketSource + 'static>(
             worker_queue_depth,
             event_queue_depth,
         });
+        pipeline.set_pattern_config(pattern_config);
         register_sharded_analyzers(&mut pipeline);
         pipeline.register_sink(Box::new(JsonlWriter::create(out_path)?));
         pipeline.run_with_source(source).await
     } else {
         let mut pipeline = Pipeline::new(pipeline_config);
+        pipeline.set_pattern_config(pattern_config);
         register_analyzers(&mut pipeline);
         pipeline.register_sink(Box::new(JsonlWriter::create(out_path)?));
         pipeline.run_with_source(source).await
@@ -161,6 +168,40 @@ fn register_sharded_analyzers(pipeline: &mut ShardedPipeline) {
     pipeline.register_analyzer_factory(|| Box::new(HttpAnalyzer::new()));
     pipeline.register_analyzer_factory(|| Box::new(DnsAnalyzer::new()));
     pipeline.register_analyzer_factory(|| Box::new(TlsMetaAnalyzer::new()));
+}
+
+fn build_pattern_config(opts: &Opts) -> anyhow::Result<PatternEngineConfig> {
+    let mut definitions = Vec::with_capacity(
+        opts.patterns.len() + opts.regex_patterns.len() + opts.binary_patterns.len(),
+    );
+
+    for (index, pattern) in opts.patterns.iter().enumerate() {
+        definitions.push(PatternDefinition::substring(
+            format!("substring:{index}"),
+            pattern.clone(),
+        ));
+    }
+
+    for (index, pattern) in opts.regex_patterns.iter().enumerate() {
+        definitions.push(PatternDefinition::regex(
+            format!("regex:{index}"),
+            pattern.clone(),
+        ));
+    }
+
+    for (index, pattern) in opts.binary_patterns.iter().enumerate() {
+        definitions.push(PatternDefinition::binary_hex(
+            format!("binary:{index}"),
+            pattern.clone(),
+        )?);
+    }
+
+    PatternEngineConfig::compile(
+        definitions,
+        opts.max_pattern_matches_per_stream,
+        opts.max_pattern_matches_total,
+        opts.pattern_regex_window_bytes,
+    )
 }
 
 fn install_shutdown_handler(shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
@@ -240,6 +281,9 @@ fn log_completed(message: &str, stats: &rustmate::pipeline::PipelineStats, out_p
         content_truncated_streams = stats.content_truncated_streams,
         content_updates = stats.content_updates,
         content_merged_segments = stats.content_merged_segments,
+        pattern_matches = stats.pattern_matches,
+        pattern_dropped_matches = stats.pattern_dropped_matches,
+        pattern_matched_streams = stats.pattern_matched_streams,
         output = %out_path.display(),
         "{message}"
     );
