@@ -43,6 +43,9 @@ PacketSource -> PacketBatch -> Flow-sharded workers -> Analyzer events -> Output
   retained pattern matches to requested logical ranges, returns text, hex, or raw
   views, keeps segment boundaries for gaps, and provides bounded copy/export
   helpers without dumping full streams through the event path.
+- Read-only local API snapshot for stream lists, stream details, match ranges,
+  health stats, and viewport content slices. In sharded runs, content requests
+  are routed back to the shard that owns the stream.
 - Flow-sharded worker pool for multi-threaded analysis. Each shard owns its
   `FlowTable`, stream inventory, stream content store, and analyzer state;
   bounded queues provide backpressure, and the coordinator writes output batches
@@ -83,6 +86,7 @@ cargo run -- --pcap sample.pcap --max-stream-view-matches-per-stream 512
 cargo run -- --pcap sample.pcap --disable-stream-view
 cargo run -- --pcap sample.pcap --max-stream-slice-bytes 131072
 cargo run -- --pcap sample.pcap --max-stream-slice-highlights 8192
+cargo run -- --pcap sample.pcap --api-listen 127.0.0.1:33111
 cargo run -- --list-interfaces
 cargo run -- --iface en0 --output live.jsonl --workers 0
 cargo run -- --iface en0 --capture-filter "tcp or udp" --capture-buffer-size 67108864
@@ -121,27 +125,43 @@ future UI is slow or disconnected.
 Content slicing is designed for viewport reads, not bulk export. The reader asks
 the shard-local content store for a logical byte window and combines it with the
 view state's retained match ranges. The result carries clipped highlights plus
-text, hex, or raw/base64 segment views. In sharded mode, a future API should route
-slice requests to the worker that owns the stream instead of copying payload
-stores into the coordinator.
+text, hex, or raw/base64 segment views. In sharded mode, slice requests use the
+same flow hash as packet routing, so the coordinator does not clone payload
+stores across shards.
+
+The local API is intentionally snapshot-first right now: it starts after the
+input source finishes, then serves bounded query results from memory. That keeps
+the first API contract deterministic before live deltas and backpressure-aware UI
+subscriptions are added.
+
+```bash
+curl http://127.0.0.1:33111/api/health
+curl 'http://127.0.0.1:33111/api/streams?limit=50&only_matched=true'
+curl http://127.0.0.1:33111/api/streams/123456789
+curl http://127.0.0.1:33111/api/streams/123456789/matches
+curl 'http://127.0.0.1:33111/api/streams/123456789/content?direction=a_to_b&start=0&len=65536&mode=text'
+```
 
 ## Development Priorities
 
-1. Add local Web UI serving: stream list API, content slice API, match range API,
-   and batched live deltas.
-2. Add shard-routed content slice requests for the live/sharded API server.
-3. Move TLS analyzer onto stream input, keeping packet-level analyzers for
+1. Add the frontend shell on top of the local API: stream table, details pane,
+   content viewport, match highlights, favorites, hide toggles, and hotkeys.
+2. Turn the snapshot API into a live API: coordinator-owned deltas, bounded
+   subscriptions, explicit backpressure, and cheap reconnect snapshots.
+3. Add decode/transform stages for stream content: URL decode, gzip HTTP bodies,
+   compressed WebSocket messages, and copy formats.
+4. Move TLS analyzer onto stream input, keeping packet-level analyzers for
    stateless heuristics.
-4. Expand benchmark fixtures with real PCAP corpora and track throughput deltas
+5. Expand benchmark fixtures with real PCAP corpora and track throughput deltas
    across worker counts.
-5. Split outputs into debug sinks and production sinks. JSONL is useful for
+6. Split outputs into debug sinks and production sinks. JSONL is useful for
    inspection, but the high-load path should support faster formats and bounded
    queues.
-6. Add machine-readable metrics export for long-running capture: Prometheus or
+7. Add machine-readable metrics export for long-running capture: Prometheus or
    lightweight JSON stats snapshots.
-7. Add benchmarks with fixed PCAP fixtures and track packets/sec, bytes/sec,
+8. Add benchmarks with fixed PCAP fixtures and track packets/sec, bytes/sec,
    allocations, and dropped packets.
-8. Grow analyzers around the flow layer: HTTP bodies, DNS names, TLS ClientHello
+9. Grow analyzers around the flow layer: HTTP bodies, DNS names, TLS ClientHello
    metadata, secrets/flag extraction, and protocol heuristics.
 
 ## Checks

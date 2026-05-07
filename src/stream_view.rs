@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, net::IpAddr};
 
 use ahash::{AHashMap, AHashSet};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
@@ -31,7 +32,7 @@ impl StreamViewConfig {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct StreamViewStats {
     pub tracked_streams: usize,
     pub favorite_streams: usize,
@@ -77,14 +78,14 @@ impl Default for StreamViewQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamViewQueryResult {
     pub rows: Vec<StreamViewRow>,
     pub next_cursor: Option<usize>,
     pub scanned: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamViewRow {
     pub stream_id: u64,
     pub first_seen_us: u64,
@@ -130,20 +131,20 @@ pub struct StreamViewEntry {
     pattern_ids: AHashSet<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct StreamViewEndpoint {
     pub addr: IpAddr,
     pub port: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamViewService {
     pub name: String,
     pub side: String,
     pub confidence: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamViewDirection {
     pub packets: u64,
     pub bytes: u64,
@@ -157,7 +158,7 @@ pub struct StreamViewDirection {
     pub preview_text: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamPatternMatch {
     pub stream_id: u64,
     pub pattern_id: String,
@@ -170,7 +171,8 @@ pub struct StreamPatternMatch {
     pub match_text: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StreamViewStatus {
     Open,
     Closing,
@@ -178,7 +180,8 @@ pub enum StreamViewStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StreamViewContentKind {
     Unknown,
     Text,
@@ -186,7 +189,8 @@ pub enum StreamViewContentKind {
     Mixed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StreamPatternType {
     Substring,
     Regex,
@@ -312,6 +316,11 @@ impl StreamViewState {
 
     pub fn stream(&self, stream_id: u64) -> Option<&StreamViewEntry> {
         self.streams.get(&stream_id)
+    }
+
+    pub fn stream_row(&self, stream_id: u64) -> Option<StreamViewRow> {
+        let entry = self.streams.get(&stream_id)?;
+        Some(self.row(entry, self.hidden_reason(entry)))
     }
 
     pub fn stream_matches(&self, stream_id: u64) -> Option<&[StreamPatternMatch]> {

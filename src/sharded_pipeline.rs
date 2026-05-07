@@ -13,7 +13,7 @@ use crate::{
     analyzers::Analyzer,
     config::RunMode,
     event::Event,
-    flow::{Endpoint, FlowRoute, FlowTable, FlowTableConfig, FlowTableStats},
+    flow::{Endpoint, FlowKey, FlowRoute, FlowTable, FlowTableConfig, FlowTableStats},
     health::{PipelineHealthReporter, ShardedQueueSnapshot, WorkerQueueSnapshot},
     ingest::{PacketBatch, PacketSource},
     output::EventSink,
@@ -22,6 +22,10 @@ use crate::{
     pipeline::{PipelineConfig, PipelineStats},
     stream_content::{StreamContent, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryStats},
+    stream_slice::{
+        StreamContentSlice, StreamSliceConfig, StreamSliceError, StreamSliceReader,
+        StreamSliceRequest,
+    },
     stream_view::StreamViewState,
 };
 
@@ -39,6 +43,7 @@ pub struct ShardedPipeline {
     config: ShardedPipelineConfig,
     pattern_config: PatternEngineConfig,
     stream_view: StreamViewState,
+    stream_content_shards: Vec<Option<StreamContent>>,
     analyzer_factories: Vec<AnalyzerFactory>,
     sinks: Vec<Box<dyn EventSink>>,
 }
@@ -55,7 +60,12 @@ struct RoutedPacket {
 
 enum WorkerMessage {
     Events(Vec<Event>),
-    Stats(Box<WorkerStats>),
+    Stats(Box<WorkerReport>),
+}
+
+struct WorkerReport {
+    stats: WorkerStats,
+    stream_content: StreamContent,
 }
 
 #[derive(Debug, Default)]
@@ -99,15 +109,19 @@ struct PacketRoute {
 
 impl ShardedPipeline {
     pub fn new(config: ShardedPipelineConfig) -> Self {
+        let config = ShardedPipelineConfig {
+            worker_count: resolve_worker_count(config.worker_count),
+            worker_queue_depth: config.worker_queue_depth.max(1),
+            event_queue_depth: config.event_queue_depth.max(1),
+            ..config
+        };
+        let stream_content_shards = (0..config.worker_count).map(|_| None).collect();
+
         Self {
-            config: ShardedPipelineConfig {
-                worker_count: resolve_worker_count(config.worker_count),
-                worker_queue_depth: config.worker_queue_depth.max(1),
-                event_queue_depth: config.event_queue_depth.max(1),
-                ..config
-            },
+            config,
             pattern_config: PatternEngineConfig::disabled(),
             stream_view: StreamViewState::new(config.pipeline.stream_view),
+            stream_content_shards,
             analyzer_factories: Vec::new(),
             sinks: Vec::new(),
         }
@@ -132,6 +146,48 @@ impl ShardedPipeline {
         &self.stream_view
     }
 
+    pub fn content_slice(
+        &self,
+        request: &StreamSliceRequest,
+    ) -> std::result::Result<StreamContentSlice, StreamSliceError> {
+        let Some(entry) = self.stream_view.stream(request.stream_id) else {
+            return Err(StreamSliceError::StreamNotFound {
+                stream_id: request.stream_id,
+            });
+        };
+        let shard = shard_for_flow_key(&entry.flow_key(), self.stream_content_shards.len());
+        let Some(content) = self
+            .stream_content_shards
+            .get(shard)
+            .and_then(Option::as_ref)
+        else {
+            return Err(StreamSliceError::ContentNotFound {
+                stream_id: request.stream_id,
+            });
+        };
+
+        StreamSliceReader::new(
+            content,
+            &self.stream_view,
+            self.config.pipeline.stream_slice,
+        )
+        .slice(request)
+    }
+
+    pub fn into_api_parts(
+        self,
+    ) -> (
+        StreamViewState,
+        Vec<Option<StreamContent>>,
+        StreamSliceConfig,
+    ) {
+        (
+            self.stream_view,
+            self.stream_content_shards,
+            self.config.pipeline.stream_slice,
+        )
+    }
+
     pub async fn run_with_source<T: PacketSource + 'static>(
         &mut self,
         mut source: T,
@@ -154,9 +210,12 @@ impl ShardedPipeline {
         loop {
             match source.next_batch(&mut batch).await {
                 Ok(0) => {
-                    if let Err(err) =
-                        pool.drain_available(&mut self.sinks, &mut self.stream_view, &mut stats)
-                    {
+                    if let Err(err) = pool.drain_available(
+                        &mut self.sinks,
+                        &mut self.stream_view,
+                        &mut self.stream_content_shards,
+                        &mut stats,
+                    ) {
                         run_error = Some(err);
                         break;
                     }
@@ -205,6 +264,7 @@ impl ShardedPipeline {
                             packet,
                             &mut self.sinks,
                             &mut self.stream_view,
+                            &mut self.stream_content_shards,
                             &mut stats,
                         ) {
                             run_error = Some(err);
@@ -216,9 +276,12 @@ impl ShardedPipeline {
                         break;
                     }
 
-                    if let Err(err) =
-                        pool.drain_available(&mut self.sinks, &mut self.stream_view, &mut stats)
-                    {
+                    if let Err(err) = pool.drain_available(
+                        &mut self.sinks,
+                        &mut self.stream_view,
+                        &mut self.stream_content_shards,
+                        &mut stats,
+                    ) {
                         run_error = Some(err);
                         break;
                     }
@@ -244,7 +307,12 @@ impl ShardedPipeline {
             None
         };
 
-        let shutdown_result = pool.shutdown(&mut self.sinks, &mut self.stream_view, &mut stats);
+        let shutdown_result = pool.shutdown(
+            &mut self.sinks,
+            &mut self.stream_view,
+            &mut self.stream_content_shards,
+            &mut stats,
+        );
         if let Some(err) = run_error {
             if let Err(shutdown_err) = shutdown_result {
                 tracing::warn!(
@@ -311,6 +379,7 @@ impl WorkerPool {
         mut packet: RoutedPacket,
         sinks: &mut [Box<dyn EventSink>],
         stream_view: &mut StreamViewState,
+        stream_content_shards: &mut [Option<StreamContent>],
         stats: &mut PipelineStats,
     ) -> Result<()> {
         let sender = self
@@ -327,7 +396,7 @@ impl WorkerPool {
                 Ok(()) => return Ok(()),
                 Err(TrySendError::Full(WorkerCommand::Packet(returned_packet))) => {
                     packet = returned_packet;
-                    self.drain_available(sinks, stream_view, stats)?;
+                    self.drain_available(sinks, stream_view, stream_content_shards, stats)?;
                     thread::yield_now();
                 }
                 Err(TrySendError::Full(WorkerCommand::Shutdown)) => {
@@ -346,11 +415,14 @@ impl WorkerPool {
         &mut self,
         sinks: &mut [Box<dyn EventSink>],
         stream_view: &mut StreamViewState,
+        stream_content_shards: &mut [Option<StreamContent>],
         stats: &mut PipelineStats,
     ) -> Result<()> {
         loop {
             match self.output_rx.try_recv() {
-                Ok(message) => write_worker_message(message, sinks, stream_view, stats)?,
+                Ok(message) => {
+                    write_worker_message(message, sinks, stream_view, stream_content_shards, stats)?
+                }
                 Err(TryRecvError::Empty) => return Ok(()),
                 Err(TryRecvError::Disconnected) => {
                     return Err(anyhow!("worker output channel disconnected"));
@@ -380,6 +452,7 @@ impl WorkerPool {
         self,
         sinks: &mut [Box<dyn EventSink>],
         stream_view: &mut StreamViewState,
+        stream_content_shards: &mut [Option<StreamContent>],
         stats: &mut PipelineStats,
     ) -> Result<()> {
         let worker_count = self.workers.len();
@@ -394,19 +467,16 @@ impl WorkerPool {
         let mut received_stats = 0usize;
         while received_stats < worker_count {
             match self.output_rx.recv() {
-                Ok(WorkerMessage::Stats(worker_stats)) => {
-                    stats.decode_errors = stats
-                        .decode_errors
-                        .saturating_add(worker_stats.decode_errors);
-                    stats.add_flow_table_stats(worker_stats.flow_stats);
-                    stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
-                    stats.add_stream_content_stats(worker_stats.stream_content_stats);
-                    stats.add_pattern_stats(worker_stats.pattern_stats);
-                    received_stats += 1;
-                    tracing::debug!(
-                        worker = worker_stats.id,
-                        "Worker shard reported final stats"
+                Ok(WorkerMessage::Stats(worker_report)) => {
+                    let worker_id = worker_report.stats.id;
+                    add_worker_stats(stats, &worker_report.stats);
+                    store_worker_content(
+                        stream_content_shards,
+                        worker_id,
+                        worker_report.stream_content,
                     );
+                    received_stats += 1;
+                    tracing::debug!(worker = worker_id, "Worker shard reported final stats");
                 }
                 Ok(WorkerMessage::Events(events)) => {
                     if let Err(err) = write_events(events, sinks, stream_view, stats) {
@@ -493,8 +563,12 @@ fn run_worker(
     runtime.stats.stream_inventory_stats = runtime.stream_inventory.stats();
     runtime.stats.stream_content_stats = runtime.stream_content.stats();
     runtime.stats.pattern_stats = runtime.pattern_engine.stats();
+    let report = WorkerReport {
+        stats: runtime.stats,
+        stream_content: runtime.stream_content,
+    };
     output_tx
-        .send(WorkerMessage::Stats(Box::new(runtime.stats)))
+        .send(WorkerMessage::Stats(Box::new(report)))
         .map_err(|_| anyhow!("coordinator stopped before worker shard {id} sent stats"))?;
     Ok(())
 }
@@ -562,20 +636,46 @@ fn write_worker_message(
     message: WorkerMessage,
     sinks: &mut [Box<dyn EventSink>],
     stream_view: &mut StreamViewState,
+    stream_content_shards: &mut [Option<StreamContent>],
     stats: &mut PipelineStats,
 ) -> Result<()> {
     match message {
         WorkerMessage::Events(events) => write_events(events, sinks, stream_view, stats),
-        WorkerMessage::Stats(worker_stats) => {
-            stats.decode_errors = stats
-                .decode_errors
-                .saturating_add(worker_stats.decode_errors);
-            stats.add_flow_table_stats(worker_stats.flow_stats);
-            stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
-            stats.add_stream_content_stats(worker_stats.stream_content_stats);
-            stats.add_pattern_stats(worker_stats.pattern_stats);
+        WorkerMessage::Stats(worker_report) => {
+            let worker_id = worker_report.stats.id;
+            add_worker_stats(stats, &worker_report.stats);
+            store_worker_content(
+                stream_content_shards,
+                worker_id,
+                worker_report.stream_content,
+            );
             Ok(())
         }
+    }
+}
+
+fn add_worker_stats(stats: &mut PipelineStats, worker_stats: &WorkerStats) {
+    stats.decode_errors = stats
+        .decode_errors
+        .saturating_add(worker_stats.decode_errors);
+    stats.add_flow_table_stats(worker_stats.flow_stats);
+    stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
+    stats.add_stream_content_stats(worker_stats.stream_content_stats);
+    stats.add_pattern_stats(worker_stats.pattern_stats);
+}
+
+fn store_worker_content(
+    stream_content_shards: &mut [Option<StreamContent>],
+    worker_id: usize,
+    stream_content: StreamContent,
+) {
+    if let Some(slot) = stream_content_shards.get_mut(worker_id) {
+        *slot = Some(stream_content);
+    } else {
+        tracing::warn!(
+            worker = worker_id,
+            "Worker content shard index is out of range"
+        );
     }
 }
 
@@ -825,6 +925,10 @@ fn fallback_shard(sequence: u64, worker_count: usize) -> usize {
     (sequence as usize) % worker_count
 }
 
+pub fn shard_for_flow_key(key: &FlowKey, worker_count: usize) -> usize {
+    hash_to_shard(key, worker_count.max(1))
+}
+
 fn flow_table_config(config: ShardedPipelineConfig) -> FlowTableConfig {
     FlowTableConfig::new(
         max_flows_per_worker(config.pipeline.max_flows, config.worker_count),
@@ -858,14 +962,17 @@ mod tests {
     use crate::{
         analyzers::http::HttpAnalyzer,
         config::RunMode,
+        flow::FlowDirection,
         ingest::{PacketBatch, PacketSource},
         output::EventSink,
         packet::{LinkLayer, PacketTimestamp},
         pattern::{PatternDefinition, PatternEngineConfig},
         stream_content::StreamContentConfig,
         stream_inventory::StreamInventoryConfig,
-        stream_slice::StreamSliceConfig,
-        stream_view::StreamViewConfig,
+        stream_slice::{
+            StreamSliceConfig, StreamSliceCopyFormat, StreamSliceMode, StreamSliceRequest,
+        },
+        stream_view::{StreamViewConfig, StreamViewQuery},
     };
 
     use super::*;
@@ -996,6 +1103,47 @@ mod tests {
         assert_eq!("flag", pattern["fields"]["match_text"]);
         assert_eq!(0, pattern["fields"]["logical_start"]);
         assert_eq!(4, pattern["fields"]["logical_end"]);
+    }
+
+    #[tokio::test]
+    async fn reads_content_slice_from_owner_shard() {
+        let mut pipeline = test_pipeline(4);
+        pipeline.set_pattern_config(
+            PatternEngineConfig::compile(
+                vec![PatternDefinition::substring("substring:0", "flag")],
+                1024,
+                1024,
+                4096,
+            )
+            .unwrap(),
+        );
+
+        let source = VecPacketSource::new(vec![
+            tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 100, b"fl", 1),
+            tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 102, b"ag", 2),
+        ]);
+
+        let stats = pipeline.run_with_source(source).await.unwrap();
+        let rows = pipeline.stream_view().query(&StreamViewQuery {
+            only_matched: true,
+            ..StreamViewQuery::default()
+        });
+        let stream_id = rows.rows.first().unwrap().stream_id;
+        let slice = pipeline
+            .content_slice(&StreamSliceRequest {
+                stream_id,
+                direction: FlowDirection::AToB,
+                logical_start: 0,
+                max_bytes: 16,
+                mode: StreamSliceMode::Text,
+            })
+            .unwrap();
+
+        assert_eq!(1, stats.pattern_matches);
+        assert_eq!("flag", slice.copy_as(StreamSliceCopyFormat::Text));
+        assert_eq!(1, slice.highlights.len());
+        assert_eq!(0, slice.highlights[0].logical_start);
+        assert_eq!(4, slice.highlights[0].logical_end);
     }
 
     #[test]

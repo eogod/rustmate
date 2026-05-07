@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use crate::config::{
     DEFAULT_BATCH_SIZE, DEFAULT_CAPTURE_BUFFER_SIZE, DEFAULT_CAPTURE_READ_TIMEOUT_MS,
@@ -34,6 +34,10 @@ pub struct Opts {
     /// JSONL output path
     #[arg(short, long)]
     pub output: Option<PathBuf>,
+
+    /// Serve a read-only local API snapshot after input processing completes
+    #[arg(long)]
+    pub api_listen: Option<SocketAddr>,
 
     /// Run mode: analyze | dump
     #[arg(short, long, value_enum, default_value_t = RunMode::Analyze)]
@@ -143,11 +147,11 @@ pub struct Opts {
     #[arg(long, default_value_t = DEFAULT_STREAM_VIEW_QUERY_LIMIT)]
     pub stream_view_query_limit: usize,
 
-    /// Max bytes returned by one future stream content slice query
+    /// Max bytes returned by one stream content slice query
     #[arg(long, default_value_t = DEFAULT_MAX_STREAM_SLICE_BYTES)]
     pub max_stream_slice_bytes: usize,
 
-    /// Max highlight ranges returned by one future stream content slice query
+    /// Max highlight ranges returned by one stream content slice query
     #[arg(long, default_value_t = DEFAULT_MAX_STREAM_SLICE_HIGHLIGHTS)]
     pub max_stream_slice_highlights: usize,
 

@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, net::IpAddr};
 
 use ahash::AHashMap;
+use serde::Serialize;
 use smallvec::SmallVec;
 
 use crate::packet::{DecodedPacket, PacketTimestamp, TcpSegment, TransportProtocol};
@@ -24,7 +25,8 @@ pub struct FlowRoute {
     pub direction: FlowDirection,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FlowDirection {
     AToB,
     BToA,

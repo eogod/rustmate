@@ -1,6 +1,7 @@
 use std::fmt;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::Serialize;
 
 use crate::{
     flow::FlowDirection,
@@ -46,14 +47,15 @@ pub struct StreamSliceRequest {
     pub mode: StreamSliceMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StreamSliceMode {
     Raw,
     Text,
     Hex,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamContentSlice {
     pub stream_id: u64,
     pub direction: FlowDirection,
@@ -66,7 +68,7 @@ pub struct StreamContentSlice {
     pub dropped_highlights: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamSliceSegment {
     pub logical_start: u64,
     pub logical_end: u64,
@@ -75,21 +77,22 @@ pub struct StreamSliceSegment {
     pub view: StreamSliceSegmentView,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamSliceSegmentView {
     Raw { base64: String },
     Text { text: String, lossy: bool },
     Hex { rows: Vec<StreamSliceHexRow> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamSliceHexRow {
     pub logical_start: u64,
     pub hex: String,
     pub ascii: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamSliceHighlight {
     pub stream_id: u64,
     pub pattern_id: String,
@@ -285,7 +288,8 @@ impl StreamContentSlice {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StreamSliceCopyFormat {
     Base64,
     Hex,

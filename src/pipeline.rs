@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::{
     analyzers::Analyzer,
@@ -19,7 +20,7 @@ use crate::{
     stream_view::{StreamViewConfig, StreamViewState, StreamViewStats},
 };
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct PipelineStats {
     pub workers: usize,
     pub batches: u64,
@@ -300,6 +301,14 @@ impl Pipeline {
             self.config.stream_slice,
         )
         .slice(request)
+    }
+
+    pub fn into_api_parts(self) -> (StreamContent, StreamViewState, StreamSliceConfig) {
+        (
+            self.stream_content,
+            self.stream_view,
+            self.config.stream_slice,
+        )
     }
 
     pub async fn run_with_source<T: PacketSource + 'static>(

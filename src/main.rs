@@ -10,6 +10,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use rustmate::{
     analyzers::{dns::DnsAnalyzer, http::HttpAnalyzer, tls_meta::TlsMetaAnalyzer},
+    api::{ApiSnapshot, serve_snapshot},
     cli::Opts,
     config::Config,
     ingest::{
@@ -31,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
     fmt().with_env_filter(filter).init();
 
     let opts = Opts::parse();
+    let api_listen = opts.api_listen;
     tracing::info!("Starting rustmate, mode={}", opts.mode);
 
     if opts.list_interfaces {
@@ -96,17 +98,23 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pcap_path) = opts.pcap.as_deref() {
         tracing::info!("Reading pcap file: {}", pcap_path.display());
         let src = PcapFileSource::open(PathBuf::from(pcap_path))?;
-        let stats = run_pipeline(
+        let run = run_pipeline(
             src,
             pipeline_config,
             pattern_config.clone(),
-            worker_count,
-            opts.worker_queue_depth,
-            opts.event_queue_depth,
-            out_path.clone(),
+            PipelineRunOptions {
+                worker_count,
+                worker_queue_depth: opts.worker_queue_depth,
+                event_queue_depth: opts.event_queue_depth,
+                out_path: out_path.clone(),
+                keep_api_snapshot: api_listen.is_some(),
+            },
         )
         .await?;
-        log_completed("Pcap processing completed", &stats, &out_path);
+        log_completed("Pcap processing completed", &run.stats, &out_path);
+        if let (Some(addr), Some(snapshot)) = (api_listen, run.api_snapshot) {
+            serve_snapshot(snapshot, addr).await?;
+        }
     } else if let Some(interface) = opts.iface.as_deref() {
         let shutdown = Arc::new(AtomicBool::new(false));
         install_shutdown_handler(Arc::clone(&shutdown))?;
@@ -123,17 +131,23 @@ async fn main() -> anyhow::Result<()> {
             max_packets: opts.max_packets,
             shutdown,
         })?;
-        let stats = run_pipeline(
+        let run = run_pipeline(
             src,
             pipeline_config,
             pattern_config,
-            worker_count,
-            opts.worker_queue_depth,
-            opts.event_queue_depth,
-            out_path.clone(),
+            PipelineRunOptions {
+                worker_count,
+                worker_queue_depth: opts.worker_queue_depth,
+                event_queue_depth: opts.event_queue_depth,
+                out_path: out_path.clone(),
+                keep_api_snapshot: api_listen.is_some(),
+            },
         )
         .await?;
-        log_completed("Live capture completed", &stats, &out_path);
+        log_completed("Live capture completed", &run.stats, &out_path);
+        if let (Some(addr), Some(snapshot)) = (api_listen, run.api_snapshot) {
+            serve_snapshot(snapshot, addr).await?;
+        }
     } else {
         tracing::warn!("No input set. Use --pcap, --iface, or --list-interfaces.");
     }
@@ -142,32 +156,58 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_pipeline<T: PacketSource + 'static>(
-    source: T,
-    pipeline_config: PipelineConfig,
-    pattern_config: PatternEngineConfig,
+struct PipelineRun {
+    stats: rustmate::pipeline::PipelineStats,
+    api_snapshot: Option<ApiSnapshot>,
+}
+
+struct PipelineRunOptions {
     worker_count: usize,
     worker_queue_depth: usize,
     event_queue_depth: usize,
     out_path: PathBuf,
-) -> anyhow::Result<rustmate::pipeline::PipelineStats> {
-    if worker_count > 1 {
+    keep_api_snapshot: bool,
+}
+
+async fn run_pipeline<T: PacketSource + 'static>(
+    source: T,
+    pipeline_config: PipelineConfig,
+    pattern_config: PatternEngineConfig,
+    options: PipelineRunOptions,
+) -> anyhow::Result<PipelineRun> {
+    if options.worker_count > 1 {
         let mut pipeline = ShardedPipeline::new(ShardedPipelineConfig {
             pipeline: pipeline_config,
-            worker_count,
-            worker_queue_depth,
-            event_queue_depth,
+            worker_count: options.worker_count,
+            worker_queue_depth: options.worker_queue_depth,
+            event_queue_depth: options.event_queue_depth,
         });
         pipeline.set_pattern_config(pattern_config);
         register_sharded_analyzers(&mut pipeline);
-        pipeline.register_sink(Box::new(JsonlWriter::create(out_path)?));
-        pipeline.run_with_source(source).await
+        pipeline.register_sink(Box::new(JsonlWriter::create(options.out_path)?));
+        let stats = pipeline.run_with_source(source).await?;
+        let api_snapshot = options.keep_api_snapshot.then(|| {
+            let (view, content_shards, slice_config) = pipeline.into_api_parts();
+            ApiSnapshot::sharded(stats, view, content_shards, slice_config)
+        });
+        Ok(PipelineRun {
+            stats,
+            api_snapshot,
+        })
     } else {
         let mut pipeline = Pipeline::new(pipeline_config);
         pipeline.set_pattern_config(pattern_config);
         register_analyzers(&mut pipeline);
-        pipeline.register_sink(Box::new(JsonlWriter::create(out_path)?));
-        pipeline.run_with_source(source).await
+        pipeline.register_sink(Box::new(JsonlWriter::create(options.out_path)?));
+        let stats = pipeline.run_with_source(source).await?;
+        let api_snapshot = options.keep_api_snapshot.then(|| {
+            let (content, view, slice_config) = pipeline.into_api_parts();
+            ApiSnapshot::single(stats, content, view, slice_config)
+        });
+        Ok(PipelineRun {
+            stats,
+            api_snapshot,
+        })
     }
 }
 
