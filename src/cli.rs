@@ -6,12 +6,13 @@ use crate::config::{
     DEFAULT_CAPTURE_SNAPLEN, DEFAULT_EVENT_QUEUE_DEPTH, DEFAULT_FLOW_IDLE_TIMEOUT_MS,
     DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS, DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM,
     DEFAULT_MAX_PATTERN_MATCHES_TOTAL, DEFAULT_MAX_STREAM_CONTENT_BYTES,
-    DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM, DEFAULT_MAX_STREAM_VIEW_MATCHES_PER_STREAM,
+    DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM, DEFAULT_MAX_STREAM_SLICE_BYTES,
+    DEFAULT_MAX_STREAM_SLICE_HIGHLIGHTS, DEFAULT_MAX_STREAM_VIEW_MATCHES_PER_STREAM,
     DEFAULT_MAX_STREAMS, DEFAULT_MAX_TCP_BUFFERED_BYTES_PER_FLOW,
     DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION, DEFAULT_PATTERN_REGEX_WINDOW_BYTES,
     DEFAULT_STREAM_CONTENT_SEGMENT_BYTES, DEFAULT_STREAM_PREVIEW_BYTES,
-    DEFAULT_STREAM_UPDATE_BYTES, DEFAULT_STREAM_UPDATE_PACKETS, DEFAULT_STREAM_VIEW_QUERY_LIMIT,
-    DEFAULT_WORKER_QUEUE_DEPTH, DEFAULT_WORKERS, RunMode,
+    DEFAULT_STREAM_SLICE_HEX_ROW_BYTES, DEFAULT_STREAM_UPDATE_BYTES, DEFAULT_STREAM_UPDATE_PACKETS,
+    DEFAULT_STREAM_VIEW_QUERY_LIMIT, DEFAULT_WORKER_QUEUE_DEPTH, DEFAULT_WORKERS, RunMode,
 };
 
 /// CLI opts, kept flat so the tool stays script-friendly.
@@ -141,6 +142,18 @@ pub struct Opts {
     /// Max streams returned by one stream view query
     #[arg(long, default_value_t = DEFAULT_STREAM_VIEW_QUERY_LIMIT)]
     pub stream_view_query_limit: usize,
+
+    /// Max bytes returned by one future stream content slice query
+    #[arg(long, default_value_t = DEFAULT_MAX_STREAM_SLICE_BYTES)]
+    pub max_stream_slice_bytes: usize,
+
+    /// Max highlight ranges returned by one future stream content slice query
+    #[arg(long, default_value_t = DEFAULT_MAX_STREAM_SLICE_HIGHLIGHTS)]
+    pub max_stream_slice_highlights: usize,
+
+    /// Bytes per row in hex stream content slices
+    #[arg(long, default_value_t = DEFAULT_STREAM_SLICE_HEX_ROW_BYTES)]
+    pub stream_slice_hex_row_bytes: usize,
 
     /// Health log interval in milliseconds; 0 disables it
     #[arg(long, default_value_t = DEFAULT_HEALTH_INTERVAL_MS)]

@@ -12,6 +12,10 @@ use crate::{
     pattern::{PatternEngine, PatternEngineConfig, PatternEngineStats},
     stream_content::{StreamContent, StreamContentConfig, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryConfig, StreamInventoryStats},
+    stream_slice::{
+        StreamContentSlice, StreamSliceConfig, StreamSliceError, StreamSliceReader,
+        StreamSliceRequest,
+    },
     stream_view::{StreamViewConfig, StreamViewState, StreamViewStats},
 };
 
@@ -245,6 +249,7 @@ pub struct PipelineConfig {
     pub stream_inventory: StreamInventoryConfig,
     pub stream_content: StreamContentConfig,
     pub stream_view: StreamViewConfig,
+    pub stream_slice: StreamSliceConfig,
 }
 
 impl Pipeline {
@@ -283,6 +288,18 @@ impl Pipeline {
 
     pub fn stream_view(&self) -> &StreamViewState {
         &self.stream_view
+    }
+
+    pub fn content_slice(
+        &self,
+        request: &StreamSliceRequest,
+    ) -> std::result::Result<StreamContentSlice, StreamSliceError> {
+        StreamSliceReader::new(
+            &self.stream_content,
+            &self.stream_view,
+            self.config.stream_slice,
+        )
+        .slice(request)
     }
 
     pub async fn run_with_source<T: PacketSource + 'static>(
@@ -403,11 +420,14 @@ mod tests {
 
     use crate::{
         analyzers::{Analyzer, http::HttpAnalyzer},
-        flow::{FlowObservation, StreamChunk},
+        flow::{FlowDirection, FlowObservation, StreamChunk},
         ingest::{PacketBatch, PacketSource},
         output::EventSink,
         packet::{LinkLayer, PacketTimestamp},
         pattern::{PatternDefinition, PatternEngineConfig},
+        stream_slice::{
+            StreamSliceConfig, StreamSliceMode, StreamSliceRequest, StreamSliceSegmentView,
+        },
         stream_view::StreamViewConfig,
     };
 
@@ -427,6 +447,7 @@ mod tests {
             stream_inventory: test_stream_inventory_config(),
             stream_content: test_stream_content_config(),
             stream_view: test_stream_view_config(),
+            stream_slice: test_stream_slice_config(),
         });
         pipeline.register_analyzer(Box::new(StreamCollector {
             chunks: Arc::clone(&chunks),
@@ -541,6 +562,50 @@ mod tests {
         assert_eq!(4, pattern["fields"]["logical_end"]);
     }
 
+    #[tokio::test]
+    async fn returns_content_slice_with_highlights() {
+        let mut pipeline = test_pipeline();
+        pipeline.set_pattern_config(
+            PatternEngineConfig::compile(
+                vec![PatternDefinition::substring("substring:0", "flag")],
+                1024,
+                1024,
+                4096,
+            )
+            .unwrap(),
+        );
+
+        let stats = pipeline
+            .run_with_source(VecPacketSource::new(vec![tcp_packet(100, b"GET /flag")]))
+            .await
+            .unwrap();
+        assert_eq!(1, stats.view_matched_streams);
+
+        let stream_id = pipeline.stream_view().query(&Default::default()).rows[0].stream_id;
+        let slice = pipeline
+            .content_slice(&StreamSliceRequest {
+                stream_id,
+                direction: FlowDirection::AToB,
+                logical_start: 0,
+                max_bytes: 16,
+                mode: StreamSliceMode::Text,
+            })
+            .unwrap();
+
+        assert_eq!(1, slice.segments.len());
+        assert_eq!(9, slice.returned_bytes);
+        assert_eq!(1, slice.highlights.len());
+        assert_eq!(5, slice.highlights[0].segment_start);
+        assert_eq!(9, slice.highlights[0].segment_end);
+        match &slice.segments[0].view {
+            StreamSliceSegmentView::Text { text, lossy } => {
+                assert_eq!("GET /flag", text);
+                assert!(!lossy);
+            }
+            other => panic!("unexpected slice view: {other:?}"),
+        }
+    }
+
     struct StreamCollector {
         chunks: Arc<Mutex<Vec<Vec<u8>>>>,
     }
@@ -642,6 +707,7 @@ mod tests {
             stream_inventory: test_stream_inventory_config(),
             stream_content: test_stream_content_config(),
             stream_view: test_stream_view_config(),
+            stream_slice: test_stream_slice_config(),
         })
     }
 
@@ -673,6 +739,14 @@ mod tests {
             max_streams: 1024,
             max_matches_per_stream: 256,
             max_query_limit: 512,
+        }
+    }
+
+    fn test_stream_slice_config() -> StreamSliceConfig {
+        StreamSliceConfig {
+            max_slice_bytes: 64 * 1024,
+            max_highlights: 4096,
+            hex_row_bytes: 16,
         }
     }
 

@@ -39,6 +39,10 @@ PacketSource -> PacketBatch -> Flow-sharded workers -> Analyzer events -> Output
   keeps bounded stream rows, retained match ranges, favorites, manual hidden
   flags, hide rules, service/pattern scopes, and cursor-based stream queries
   without making worker shards share mutable UI state.
+- Highlight / Content Slice Layer for viewport-sized stream reads. It clips
+  retained pattern matches to requested logical ranges, returns text, hex, or raw
+  views, keeps segment boundaries for gaps, and provides bounded copy/export
+  helpers without dumping full streams through the event path.
 - Flow-sharded worker pool for multi-threaded analysis. Each shard owns its
   `FlowTable`, stream inventory, stream content store, and analyzer state;
   bounded queues provide backpressure, and the coordinator writes output batches
@@ -77,6 +81,8 @@ cargo run -- --pcap sample.pcap --binary-pattern 'de ad be ef'
 cargo run -- --pcap sample.pcap --max-pattern-matches-per-stream 256
 cargo run -- --pcap sample.pcap --max-stream-view-matches-per-stream 512
 cargo run -- --pcap sample.pcap --disable-stream-view
+cargo run -- --pcap sample.pcap --max-stream-slice-bytes 131072
+cargo run -- --pcap sample.pcap --max-stream-slice-highlights 8192
 cargo run -- --list-interfaces
 cargo run -- --iface en0 --output live.jsonl --workers 0
 cargo run -- --iface en0 --capture-filter "tcp or udp" --capture-buffer-size 67108864
@@ -112,12 +118,18 @@ only, service scopes, pattern scopes, ports, protocol, status, and content kind.
 The sharded coordinator owns this state, so worker shards keep running even if a
 future UI is slow or disconnected.
 
+Content slicing is designed for viewport reads, not bulk export. The reader asks
+the shard-local content store for a logical byte window and combines it with the
+view state's retained match ranges. The result carries clipped highlights plus
+text, hex, or raw/base64 segment views. In sharded mode, a future API should route
+slice requests to the worker that owns the stream instead of copying payload
+stores into the coordinator.
+
 ## Development Priorities
 
-1. Add the display/highlight layer for pattern ranges and packet/stream content
-   slices.
-2. Add local Web UI serving: stream list API, content slice API, match range API,
+1. Add local Web UI serving: stream list API, content slice API, match range API,
    and batched live deltas.
+2. Add shard-routed content slice requests for the live/sharded API server.
 3. Move TLS analyzer onto stream input, keeping packet-level analyzers for
    stateless heuristics.
 4. Expand benchmark fixtures with real PCAP corpora and track throughput deltas

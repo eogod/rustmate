@@ -21,6 +21,7 @@ use rustmate::{
     sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, resolve_worker_count},
     stream_content::StreamContentConfig,
     stream_inventory::StreamInventoryConfig,
+    stream_slice::StreamSliceConfig,
     stream_view::StreamViewConfig,
 };
 
@@ -72,6 +73,11 @@ async fn main() -> anyhow::Result<()> {
             max_streams: opts.max_streams.max(1),
             max_matches_per_stream: opts.max_stream_view_matches_per_stream,
             max_query_limit: opts.stream_view_query_limit.max(1),
+        },
+        stream_slice: StreamSliceConfig {
+            max_slice_bytes: opts.max_stream_slice_bytes,
+            max_highlights: opts.max_stream_slice_highlights,
+            hex_row_bytes: opts.stream_slice_hex_row_bytes,
         },
     };
     let pattern_config = build_pattern_config(&opts)?;

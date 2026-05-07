@@ -864,6 +864,7 @@ mod tests {
         pattern::{PatternDefinition, PatternEngineConfig},
         stream_content::StreamContentConfig,
         stream_inventory::StreamInventoryConfig,
+        stream_slice::StreamSliceConfig,
         stream_view::StreamViewConfig,
     };
 
@@ -1110,6 +1111,7 @@ mod tests {
                 stream_inventory: test_stream_inventory_config(),
                 stream_content: test_stream_content_config(),
                 stream_view: test_stream_view_config(),
+                stream_slice: test_stream_slice_config(),
             },
             worker_count: 2,
             worker_queue_depth: 1,
@@ -1239,6 +1241,7 @@ mod tests {
                 stream_inventory: test_stream_inventory_config(),
                 stream_content: test_stream_content_config(),
                 stream_view: test_stream_view_config(),
+                stream_slice: test_stream_slice_config(),
             },
             worker_count,
             worker_queue_depth: 8,
@@ -1274,6 +1277,14 @@ mod tests {
             max_streams: 1024,
             max_matches_per_stream: 256,
             max_query_limit: 512,
+        }
+    }
+
+    fn test_stream_slice_config() -> StreamSliceConfig {
+        StreamSliceConfig {
+            max_slice_bytes: 64 * 1024,
+            max_highlights: 4096,
+            hex_row_bytes: 16,
         }
     }
 

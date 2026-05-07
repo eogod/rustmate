@@ -3,7 +3,11 @@ use std::{collections::VecDeque, net::IpAddr};
 use ahash::{AHashMap, AHashSet};
 use serde_json::Value;
 
-use crate::{event::Event, flow::FlowDirection, packet::TransportProtocol};
+use crate::{
+    event::Event,
+    flow::{Endpoint, FlowDirection, FlowKey},
+    packet::TransportProtocol,
+};
 
 const DEFAULT_QUERY_LIMIT: usize = 100;
 const MATCH_TEXT_PREVIEW_LIMIT: usize = 256;
@@ -546,6 +550,20 @@ impl StreamViewState {
 }
 
 impl StreamViewEntry {
+    pub fn flow_key(&self) -> FlowKey {
+        FlowKey {
+            protocol: self.protocol,
+            a: Endpoint {
+                addr: self.endpoint_a.addr,
+                port: self.endpoint_a.port,
+            },
+            b: Endpoint {
+                addr: self.endpoint_b.addr,
+                port: self.endpoint_b.port,
+            },
+        }
+    }
+
     fn from_stream_event(event: &Event) -> Option<Self> {
         let fields = &event.fields;
         Some(Self {
