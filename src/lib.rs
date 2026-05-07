@@ -12,3 +12,4 @@ pub mod pipeline;
 pub mod sharded_pipeline;
 pub mod stream_content;
 pub mod stream_inventory;
+pub mod stream_view;

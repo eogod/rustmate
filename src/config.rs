@@ -22,6 +22,8 @@ pub const DEFAULT_STREAM_CONTENT_SEGMENT_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM: u64 = 1024;
 pub const DEFAULT_MAX_PATTERN_MATCHES_TOTAL: u64 = 1_000_000;
 pub const DEFAULT_PATTERN_REGEX_WINDOW_BYTES: usize = 4096;
+pub const DEFAULT_MAX_STREAM_VIEW_MATCHES_PER_STREAM: usize = 256;
+pub const DEFAULT_STREAM_VIEW_QUERY_LIMIT: usize = 512;
 pub const DEFAULT_CAPTURE_SNAPLEN: usize = 262_144;
 pub const DEFAULT_CAPTURE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 pub const DEFAULT_CAPTURE_READ_TIMEOUT_MS: usize = 100;
@@ -68,6 +70,9 @@ pub struct Config {
     pub max_pattern_matches_per_stream: u64,
     pub max_pattern_matches_total: u64,
     pub pattern_regex_window_bytes: usize,
+    pub stream_view_enabled: bool,
+    pub max_stream_view_matches_per_stream: usize,
+    pub stream_view_query_limit: usize,
     pub capture_snaplen: usize,
     pub capture_buffer_size: usize,
     pub capture_read_timeout_ms: usize,
@@ -101,6 +106,9 @@ impl Default for Config {
             max_pattern_matches_per_stream: DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM,
             max_pattern_matches_total: DEFAULT_MAX_PATTERN_MATCHES_TOTAL,
             pattern_regex_window_bytes: DEFAULT_PATTERN_REGEX_WINDOW_BYTES,
+            stream_view_enabled: true,
+            max_stream_view_matches_per_stream: DEFAULT_MAX_STREAM_VIEW_MATCHES_PER_STREAM,
+            stream_view_query_limit: DEFAULT_STREAM_VIEW_QUERY_LIMIT,
             capture_snaplen: DEFAULT_CAPTURE_SNAPLEN,
             capture_buffer_size: DEFAULT_CAPTURE_BUFFER_SIZE,
             capture_read_timeout_ms: DEFAULT_CAPTURE_READ_TIMEOUT_MS,

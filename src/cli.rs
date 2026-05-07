@@ -6,10 +6,11 @@ use crate::config::{
     DEFAULT_CAPTURE_SNAPLEN, DEFAULT_EVENT_QUEUE_DEPTH, DEFAULT_FLOW_IDLE_TIMEOUT_MS,
     DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS, DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM,
     DEFAULT_MAX_PATTERN_MATCHES_TOTAL, DEFAULT_MAX_STREAM_CONTENT_BYTES,
-    DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM, DEFAULT_MAX_STREAMS,
-    DEFAULT_MAX_TCP_BUFFERED_BYTES_PER_FLOW, DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION,
-    DEFAULT_PATTERN_REGEX_WINDOW_BYTES, DEFAULT_STREAM_CONTENT_SEGMENT_BYTES,
-    DEFAULT_STREAM_PREVIEW_BYTES, DEFAULT_STREAM_UPDATE_BYTES, DEFAULT_STREAM_UPDATE_PACKETS,
+    DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM, DEFAULT_MAX_STREAM_VIEW_MATCHES_PER_STREAM,
+    DEFAULT_MAX_STREAMS, DEFAULT_MAX_TCP_BUFFERED_BYTES_PER_FLOW,
+    DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION, DEFAULT_PATTERN_REGEX_WINDOW_BYTES,
+    DEFAULT_STREAM_CONTENT_SEGMENT_BYTES, DEFAULT_STREAM_PREVIEW_BYTES,
+    DEFAULT_STREAM_UPDATE_BYTES, DEFAULT_STREAM_UPDATE_PACKETS, DEFAULT_STREAM_VIEW_QUERY_LIMIT,
     DEFAULT_WORKER_QUEUE_DEPTH, DEFAULT_WORKERS, RunMode,
 };
 
@@ -128,6 +129,18 @@ pub struct Opts {
     /// Regex lookbehind window bytes for boundary-spanning matches
     #[arg(long, default_value_t = DEFAULT_PATTERN_REGEX_WINDOW_BYTES)]
     pub pattern_regex_window_bytes: usize,
+
+    /// Disable in-memory stream view indexes for future UI/query layers
+    #[arg(long)]
+    pub disable_stream_view: bool,
+
+    /// Max retained pattern match ranges per stream in the view index
+    #[arg(long, default_value_t = DEFAULT_MAX_STREAM_VIEW_MATCHES_PER_STREAM)]
+    pub max_stream_view_matches_per_stream: usize,
+
+    /// Max streams returned by one stream view query
+    #[arg(long, default_value_t = DEFAULT_STREAM_VIEW_QUERY_LIMIT)]
+    pub stream_view_query_limit: usize,
 
     /// Health log interval in milliseconds; 0 disables it
     #[arg(long, default_value_t = DEFAULT_HEALTH_INTERVAL_MS)]

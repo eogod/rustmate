@@ -22,6 +22,7 @@ use crate::{
     pipeline::{PipelineConfig, PipelineStats},
     stream_content::{StreamContent, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryStats},
+    stream_view::StreamViewState,
 };
 
 type AnalyzerFactory = Arc<dyn Fn() -> Box<dyn Analyzer> + Send + Sync + 'static>;
@@ -37,6 +38,7 @@ pub struct ShardedPipelineConfig {
 pub struct ShardedPipeline {
     config: ShardedPipelineConfig,
     pattern_config: PatternEngineConfig,
+    stream_view: StreamViewState,
     analyzer_factories: Vec<AnalyzerFactory>,
     sinks: Vec<Box<dyn EventSink>>,
 }
@@ -105,6 +107,7 @@ impl ShardedPipeline {
                 ..config
             },
             pattern_config: PatternEngineConfig::disabled(),
+            stream_view: StreamViewState::new(config.pipeline.stream_view),
             analyzer_factories: Vec::new(),
             sinks: Vec::new(),
         }
@@ -123,6 +126,10 @@ impl ShardedPipeline {
 
     pub fn register_sink(&mut self, sink: Box<dyn EventSink>) {
         self.sinks.push(sink);
+    }
+
+    pub fn stream_view(&self) -> &StreamViewState {
+        &self.stream_view
     }
 
     pub async fn run_with_source<T: PacketSource + 'static>(
@@ -147,7 +154,9 @@ impl ShardedPipeline {
         loop {
             match source.next_batch(&mut batch).await {
                 Ok(0) => {
-                    if let Err(err) = pool.drain_available(&mut self.sinks, &mut stats) {
+                    if let Err(err) =
+                        pool.drain_available(&mut self.sinks, &mut self.stream_view, &mut stats)
+                    {
                         run_error = Some(err);
                         break;
                     }
@@ -191,9 +200,13 @@ impl ShardedPipeline {
                             flow_route: route.flow_route,
                         };
 
-                        if let Err(err) =
-                            pool.send_packet(route.shard, packet, &mut self.sinks, &mut stats)
-                        {
+                        if let Err(err) = pool.send_packet(
+                            route.shard,
+                            packet,
+                            &mut self.sinks,
+                            &mut self.stream_view,
+                            &mut stats,
+                        ) {
                             run_error = Some(err);
                             break;
                         }
@@ -203,7 +216,9 @@ impl ShardedPipeline {
                         break;
                     }
 
-                    if let Err(err) = pool.drain_available(&mut self.sinks, &mut stats) {
+                    if let Err(err) =
+                        pool.drain_available(&mut self.sinks, &mut self.stream_view, &mut stats)
+                    {
                         run_error = Some(err);
                         break;
                     }
@@ -229,7 +244,7 @@ impl ShardedPipeline {
             None
         };
 
-        let shutdown_result = pool.shutdown(&mut self.sinks, &mut stats);
+        let shutdown_result = pool.shutdown(&mut self.sinks, &mut self.stream_view, &mut stats);
         if let Some(err) = run_error {
             if let Err(shutdown_err) = shutdown_result {
                 tracing::warn!(
@@ -241,6 +256,7 @@ impl ShardedPipeline {
         }
 
         shutdown_result?;
+        stats.set_stream_view_stats(self.stream_view.stats());
         if let Some(source_stats) = source_stats_result.transpose()?.flatten() {
             stats.set_source_stats(source_stats);
         }
@@ -294,6 +310,7 @@ impl WorkerPool {
         shard: usize,
         mut packet: RoutedPacket,
         sinks: &mut [Box<dyn EventSink>],
+        stream_view: &mut StreamViewState,
         stats: &mut PipelineStats,
     ) -> Result<()> {
         let sender = self
@@ -310,7 +327,7 @@ impl WorkerPool {
                 Ok(()) => return Ok(()),
                 Err(TrySendError::Full(WorkerCommand::Packet(returned_packet))) => {
                     packet = returned_packet;
-                    self.drain_available(sinks, stats)?;
+                    self.drain_available(sinks, stream_view, stats)?;
                     thread::yield_now();
                 }
                 Err(TrySendError::Full(WorkerCommand::Shutdown)) => {
@@ -328,11 +345,12 @@ impl WorkerPool {
     fn drain_available(
         &mut self,
         sinks: &mut [Box<dyn EventSink>],
+        stream_view: &mut StreamViewState,
         stats: &mut PipelineStats,
     ) -> Result<()> {
         loop {
             match self.output_rx.try_recv() {
-                Ok(message) => write_worker_message(message, sinks, stats)?,
+                Ok(message) => write_worker_message(message, sinks, stream_view, stats)?,
                 Err(TryRecvError::Empty) => return Ok(()),
                 Err(TryRecvError::Disconnected) => {
                     return Err(anyhow!("worker output channel disconnected"));
@@ -358,7 +376,12 @@ impl WorkerPool {
         }
     }
 
-    fn shutdown(self, sinks: &mut [Box<dyn EventSink>], stats: &mut PipelineStats) -> Result<()> {
+    fn shutdown(
+        self,
+        sinks: &mut [Box<dyn EventSink>],
+        stream_view: &mut StreamViewState,
+        stats: &mut PipelineStats,
+    ) -> Result<()> {
         let worker_count = self.workers.len();
         let mut first_error = None;
 
@@ -386,7 +409,7 @@ impl WorkerPool {
                     );
                 }
                 Ok(WorkerMessage::Events(events)) => {
-                    if let Err(err) = write_events(events, sinks, stats) {
+                    if let Err(err) = write_events(events, sinks, stream_view, stats) {
                         record_first_error(&mut first_error, err);
                     }
                 }
@@ -538,10 +561,11 @@ fn flush_worker_events(output_tx: &Sender<WorkerMessage>, events: &mut Vec<Event
 fn write_worker_message(
     message: WorkerMessage,
     sinks: &mut [Box<dyn EventSink>],
+    stream_view: &mut StreamViewState,
     stats: &mut PipelineStats,
 ) -> Result<()> {
     match message {
-        WorkerMessage::Events(events) => write_events(events, sinks, stats),
+        WorkerMessage::Events(events) => write_events(events, sinks, stream_view, stats),
         WorkerMessage::Stats(worker_stats) => {
             stats.decode_errors = stats
                 .decode_errors
@@ -558,9 +582,12 @@ fn write_worker_message(
 fn write_events(
     events: Vec<Event>,
     sinks: &mut [Box<dyn EventSink>],
+    stream_view: &mut StreamViewState,
     stats: &mut PipelineStats,
 ) -> Result<()> {
     stats.events = stats.events.saturating_add(events.len() as u64);
+    stream_view.observe_events(&events);
+    stats.set_stream_view_stats(stream_view.stats());
     for sink in sinks {
         sink.write_batch(&events)?;
     }
@@ -837,6 +864,7 @@ mod tests {
         pattern::{PatternDefinition, PatternEngineConfig},
         stream_content::StreamContentConfig,
         stream_inventory::StreamInventoryConfig,
+        stream_view::StreamViewConfig,
     };
 
     use super::*;
@@ -960,6 +988,9 @@ mod tests {
             .unwrap();
         assert_eq!(1, stats.pattern_matches);
         assert_eq!(1, stats.pattern_matched_streams);
+        assert_eq!(1, stats.view_tracked_streams);
+        assert_eq!(1, stats.view_matched_streams);
+        assert_eq!(1, stats.view_stored_matches);
         assert_eq!("substring", pattern["fields"]["pattern_type"]);
         assert_eq!("flag", pattern["fields"]["match_text"]);
         assert_eq!(0, pattern["fields"]["logical_start"]);
@@ -1078,6 +1109,7 @@ mod tests {
                 max_tcp_out_of_order_segments_per_direction: 16,
                 stream_inventory: test_stream_inventory_config(),
                 stream_content: test_stream_content_config(),
+                stream_view: test_stream_view_config(),
             },
             worker_count: 2,
             worker_queue_depth: 1,
@@ -1206,6 +1238,7 @@ mod tests {
                 max_tcp_out_of_order_segments_per_direction: 16,
                 stream_inventory: test_stream_inventory_config(),
                 stream_content: test_stream_content_config(),
+                stream_view: test_stream_view_config(),
             },
             worker_count,
             worker_queue_depth: 8,
@@ -1232,6 +1265,15 @@ mod tests {
             max_total_bytes: 1024 * 1024,
             max_bytes_per_stream: 64 * 1024,
             max_segment_bytes: 64 * 1024,
+        }
+    }
+
+    fn test_stream_view_config() -> StreamViewConfig {
+        StreamViewConfig {
+            enabled: true,
+            max_streams: 1024,
+            max_matches_per_stream: 256,
+            max_query_limit: 512,
         }
     }
 

@@ -35,6 +35,10 @@ PacketSource -> PacketBatch -> Flow-sharded workers -> Analyzer events -> Output
   substring, regex, and binary hex patterns; scans across chunk boundaries; emits
   logical match ranges for highlighting; and has per-stream plus global match
   caps so noisy streams cannot dominate output.
+- Stream View State and Filtering Layer for the future UI/API. The coordinator
+  keeps bounded stream rows, retained match ranges, favorites, manual hidden
+  flags, hide rules, service/pattern scopes, and cursor-based stream queries
+  without making worker shards share mutable UI state.
 - Flow-sharded worker pool for multi-threaded analysis. Each shard owns its
   `FlowTable`, stream inventory, stream content store, and analyzer state;
   bounded queues provide backpressure, and the coordinator writes output batches
@@ -71,6 +75,8 @@ cargo run -- --pcap sample.pcap --disable-stream-content
 cargo run -- --pcap sample.pcap --pattern flag --regex 'token=[a-z0-9]+'
 cargo run -- --pcap sample.pcap --binary-pattern 'de ad be ef'
 cargo run -- --pcap sample.pcap --max-pattern-matches-per-stream 256
+cargo run -- --pcap sample.pcap --max-stream-view-matches-per-stream 512
+cargo run -- --pcap sample.pcap --disable-stream-view
 cargo run -- --list-interfaces
 cargo run -- --iface en0 --output live.jsonl --workers 0
 cargo run -- --iface en0 --capture-filter "tcp or udp" --capture-buffer-size 67108864
@@ -99,12 +105,19 @@ optional spaces, colons, underscores, dashes, or a `0x` prefix. Match events car
 `stream_id`, direction, logical byte offsets, base64 bytes, and text preview when
 the matched bytes are printable.
 
+Stream view state is enabled by default and is bounded separately from the
+content store. It indexes stream inventory events and pattern match events into
+typed rows for UI-style queries: favorites, hidden streams, hide rules, matched
+only, service scopes, pattern scopes, ports, protocol, status, and content kind.
+The sharded coordinator owns this state, so worker shards keep running even if a
+future UI is slow or disconnected.
+
 ## Development Priorities
 
-1. Build stream filtering and view state on top of Stream Inventory: hide rules,
-   favorites, service/pattern scopes, and per-stream navigation metadata.
-2. Add the display/highlight layer for pattern ranges and packet/stream content
+1. Add the display/highlight layer for pattern ranges and packet/stream content
    slices.
+2. Add local Web UI serving: stream list API, content slice API, match range API,
+   and batched live deltas.
 3. Move TLS analyzer onto stream input, keeping packet-level analyzers for
    stateless heuristics.
 4. Expand benchmark fixtures with real PCAP corpora and track throughput deltas

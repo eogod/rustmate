@@ -21,6 +21,7 @@ use rustmate::{
     sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, resolve_worker_count},
     stream_content::StreamContentConfig,
     stream_inventory::StreamInventoryConfig,
+    stream_view::StreamViewConfig,
 };
 
 #[tokio::main]
@@ -65,6 +66,12 @@ async fn main() -> anyhow::Result<()> {
             max_total_bytes: opts.max_stream_content_bytes,
             max_bytes_per_stream: opts.max_stream_content_bytes_per_stream,
             max_segment_bytes: opts.stream_content_segment_bytes,
+        },
+        stream_view: StreamViewConfig {
+            enabled: !opts.disable_stream_view,
+            max_streams: opts.max_streams.max(1),
+            max_matches_per_stream: opts.max_stream_view_matches_per_stream,
+            max_query_limit: opts.stream_view_query_limit.max(1),
         },
     };
     let pattern_config = build_pattern_config(&opts)?;
@@ -284,6 +291,15 @@ fn log_completed(message: &str, stats: &rustmate::pipeline::PipelineStats, out_p
         pattern_matches = stats.pattern_matches,
         pattern_dropped_matches = stats.pattern_dropped_matches,
         pattern_matched_streams = stats.pattern_matched_streams,
+        view_tracked_streams = stats.view_tracked_streams,
+        view_favorite_streams = stats.view_favorite_streams,
+        view_manually_hidden_streams = stats.view_manually_hidden_streams,
+        view_matched_streams = stats.view_matched_streams,
+        view_stored_matches = stats.view_stored_matches,
+        view_dropped_matches = stats.view_dropped_matches,
+        view_orphan_matches = stats.view_orphan_matches,
+        view_evicted_streams = stats.view_evicted_streams,
+        view_hide_rules = stats.view_hide_rules,
         output = %out_path.display(),
         "{message}"
     );

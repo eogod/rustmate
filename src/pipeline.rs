@@ -12,6 +12,7 @@ use crate::{
     pattern::{PatternEngine, PatternEngineConfig, PatternEngineStats},
     stream_content::{StreamContent, StreamContentConfig, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryConfig, StreamInventoryStats},
+    stream_view::{StreamViewConfig, StreamViewState, StreamViewStats},
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -56,6 +57,15 @@ pub struct PipelineStats {
     pub pattern_matches: u64,
     pub pattern_dropped_matches: u64,
     pub pattern_matched_streams: usize,
+    pub view_tracked_streams: usize,
+    pub view_favorite_streams: usize,
+    pub view_manually_hidden_streams: usize,
+    pub view_matched_streams: usize,
+    pub view_stored_matches: usize,
+    pub view_dropped_matches: u64,
+    pub view_orphan_matches: u64,
+    pub view_evicted_streams: u64,
+    pub view_hide_rules: usize,
 }
 
 impl PipelineStats {
@@ -196,6 +206,18 @@ impl PipelineStats {
             .pattern_matched_streams
             .saturating_add(pattern_stats.pattern_matched_streams);
     }
+
+    pub(crate) fn set_stream_view_stats(&mut self, view_stats: StreamViewStats) {
+        self.view_tracked_streams = view_stats.tracked_streams;
+        self.view_favorite_streams = view_stats.favorite_streams;
+        self.view_manually_hidden_streams = view_stats.manually_hidden_streams;
+        self.view_matched_streams = view_stats.matched_streams;
+        self.view_stored_matches = view_stats.stored_matches;
+        self.view_dropped_matches = view_stats.dropped_matches;
+        self.view_orphan_matches = view_stats.orphan_matches;
+        self.view_evicted_streams = view_stats.evicted_streams;
+        self.view_hide_rules = view_stats.hide_rules;
+    }
 }
 
 pub struct Pipeline {
@@ -207,6 +229,7 @@ pub struct Pipeline {
     stream_inventory: StreamInventory,
     stream_content: StreamContent,
     pattern_engine: PatternEngine,
+    stream_view: StreamViewState,
     events: Vec<Event>,
 }
 
@@ -221,6 +244,7 @@ pub struct PipelineConfig {
     pub max_tcp_out_of_order_segments_per_direction: usize,
     pub stream_inventory: StreamInventoryConfig,
     pub stream_content: StreamContentConfig,
+    pub stream_view: StreamViewConfig,
 }
 
 impl Pipeline {
@@ -239,6 +263,7 @@ impl Pipeline {
             stream_inventory: StreamInventory::new(config.stream_inventory),
             stream_content: StreamContent::new(config.stream_content),
             pattern_engine: PatternEngine::new(PatternEngineConfig::disabled()),
+            stream_view: StreamViewState::new(config.stream_view),
             events: Vec::with_capacity(config.batch_size),
         }
     }
@@ -254,6 +279,10 @@ impl Pipeline {
 
     pub fn register_sink(&mut self, sink: Box<dyn EventSink>) {
         self.sinks.push(sink);
+    }
+
+    pub fn stream_view(&self) -> &StreamViewState {
+        &self.stream_view
     }
 
     pub async fn run_with_source<T: PacketSource + 'static>(
@@ -300,6 +329,7 @@ impl Pipeline {
         if let Some(source_stats) = source_stats_result? {
             stats.set_source_stats(source_stats);
         }
+        stats.set_stream_view_stats(self.stream_view.stats());
 
         Ok(stats)
     }
@@ -315,6 +345,8 @@ impl Pipeline {
         stats.set_stream_inventory_stats(self.stream_inventory.stats());
         stats.set_stream_content_stats(self.stream_content.stats());
         stats.set_pattern_stats(self.pattern_engine.stats());
+        self.stream_view.observe_events(&self.events);
+        stats.set_stream_view_stats(self.stream_view.stats());
     }
 
     fn process_packet(&mut self, raw: &RawPacket, stats: &mut PipelineStats) {
@@ -376,6 +408,7 @@ mod tests {
         output::EventSink,
         packet::{LinkLayer, PacketTimestamp},
         pattern::{PatternDefinition, PatternEngineConfig},
+        stream_view::StreamViewConfig,
     };
 
     use super::*;
@@ -393,6 +426,7 @@ mod tests {
             max_tcp_out_of_order_segments_per_direction: 16,
             stream_inventory: test_stream_inventory_config(),
             stream_content: test_stream_content_config(),
+            stream_view: test_stream_view_config(),
         });
         pipeline.register_analyzer(Box::new(StreamCollector {
             chunks: Arc::clone(&chunks),
@@ -498,6 +532,9 @@ mod tests {
             .unwrap();
         assert_eq!(1, stats.pattern_matches);
         assert_eq!(1, stats.pattern_matched_streams);
+        assert_eq!(1, stats.view_tracked_streams);
+        assert_eq!(1, stats.view_matched_streams);
+        assert_eq!(1, stats.view_stored_matches);
         assert_eq!("substring", pattern["fields"]["pattern_type"]);
         assert_eq!("flag", pattern["fields"]["match_text"]);
         assert_eq!(0, pattern["fields"]["logical_start"]);
@@ -604,6 +641,7 @@ mod tests {
             max_tcp_out_of_order_segments_per_direction: 16,
             stream_inventory: test_stream_inventory_config(),
             stream_content: test_stream_content_config(),
+            stream_view: test_stream_view_config(),
         })
     }
 
@@ -626,6 +664,15 @@ mod tests {
             max_total_bytes: 1024 * 1024,
             max_bytes_per_stream: 64 * 1024,
             max_segment_bytes: 64 * 1024,
+        }
+    }
+
+    fn test_stream_view_config() -> StreamViewConfig {
+        StreamViewConfig {
+            enabled: true,
+            max_streams: 1024,
+            max_matches_per_stream: 256,
+            max_query_limit: 512,
         }
     }
 

@@ -14,6 +14,7 @@ use rustmate::{
     sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig},
     stream_content::StreamContentConfig,
     stream_inventory::StreamInventoryConfig,
+    stream_view::StreamViewConfig,
 };
 use tokio::runtime::Builder;
 
@@ -110,6 +111,12 @@ fn pipeline_config(batch_size: usize) -> PipelineConfig {
             max_total_bytes: 256 * 1024 * 1024,
             max_bytes_per_stream: 8 * 1024 * 1024,
             max_segment_bytes: 64 * 1024,
+        },
+        stream_view: StreamViewConfig {
+            enabled: true,
+            max_streams: 131_072,
+            max_matches_per_stream: 256,
+            max_query_limit: 512,
         },
     }
 }
