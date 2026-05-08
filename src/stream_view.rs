@@ -88,6 +88,7 @@ pub struct StreamViewQueryResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamViewRow {
     pub stream_id: u64,
+    pub stream_id_hex: String,
     pub first_seen_us: u64,
     pub last_seen_us: u64,
     pub protocol: TransportProtocol,
@@ -161,6 +162,7 @@ pub struct StreamViewDirection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamPatternMatch {
     pub stream_id: u64,
+    pub stream_id_hex: String,
     pub pattern_id: String,
     pub pattern_name: String,
     pub pattern_type: StreamPatternType,
@@ -524,6 +526,7 @@ impl StreamViewState {
         pattern_ids.sort_unstable();
         StreamViewRow {
             stream_id: entry.stream_id,
+            stream_id_hex: stream_id_hex(entry.stream_id),
             first_seen_us: entry.first_seen_us,
             last_seen_us: entry.last_seen_us,
             protocol: entry.protocol,
@@ -600,10 +603,12 @@ impl StreamViewEntry {
 }
 
 impl StreamPatternMatch {
-    fn from_event(event: &Event) -> Option<Self> {
+    pub fn from_event(event: &Event) -> Option<Self> {
         let fields = &event.fields;
+        let stream_id = stream_id_field(fields, "stream_id")?;
         Some(Self {
-            stream_id: stream_id_field(fields, "stream_id")?,
+            stream_id,
+            stream_id_hex: stream_id_hex(stream_id),
             pattern_id: string_field(fields, "pattern_id")?.to_owned(),
             pattern_name: string_field(fields, "pattern_name")?.to_owned(),
             pattern_type: pattern_type_field(fields, "pattern_type")
@@ -615,6 +620,10 @@ impl StreamPatternMatch {
             match_text: string_field(fields, "match_text").map(trim_match_text),
         })
     }
+}
+
+fn stream_id_hex(stream_id: u64) -> String {
+    format!("{stream_id:016x}")
 }
 
 impl StreamHideRule {

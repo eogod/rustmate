@@ -123,6 +123,7 @@ fn pipeline_config(batch_size: usize) -> PipelineConfig {
             max_slice_bytes: 64 * 1024,
             max_highlights: 4096,
             hex_row_bytes: 16,
+            max_transform_bytes: 1024 * 1024,
         },
     }
 }

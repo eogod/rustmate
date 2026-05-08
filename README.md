@@ -43,9 +43,18 @@ PacketSource -> PacketBatch -> Flow-sharded workers -> Analyzer events -> Output
   retained pattern matches to requested logical ranges, returns text, hex, or raw
   views, keeps segment boundaries for gaps, and provides bounded copy/export
   helpers without dumping full streams through the event path.
-- Read-only local API snapshot for stream lists, stream details, match ranges,
-  health stats, and viewport content slices. In sharded runs, content requests
-  are routed back to the shard that owns the stream.
+- Decode / Transform Layer for bounded content views. It can URL-decode stream
+  slices, decode raw gzip payloads, inflate gzip HTTP bodies while preserving the
+  header prefix, and decode compressed WebSocket frames without letting decoded
+  output run past configured caps.
+- Read-only local live API for stream lists, stream details, match ranges,
+  health stats, retained deltas, and viewport content slices. In sharded runs,
+  content requests are routed back to the shard that owns the stream while
+  capture is active, then served from retained shard stores after shutdown.
+- Frontend shell served by the local API. It gives a dense stream table, details
+  pane, content viewport, retained match highlights, transform output, live
+  delta polling, and basic copy/navigation controls without adding a separate
+  web stack yet.
 - Flow-sharded worker pool for multi-threaded analysis. Each shard owns its
   `FlowTable`, stream inventory, stream content store, and analyzer state;
   bounded queues provide backpressure, and the coordinator writes output batches
@@ -86,7 +95,9 @@ cargo run -- --pcap sample.pcap --max-stream-view-matches-per-stream 512
 cargo run -- --pcap sample.pcap --disable-stream-view
 cargo run -- --pcap sample.pcap --max-stream-slice-bytes 131072
 cargo run -- --pcap sample.pcap --max-stream-slice-highlights 8192
+cargo run -- --pcap sample.pcap --max-stream-transform-bytes 1048576
 cargo run -- --pcap sample.pcap --api-listen 127.0.0.1:33111
+cargo run -- --pcap sample.pcap --api-listen 127.0.0.1:33111 --api-delta-capacity 65536
 cargo run -- --list-interfaces
 cargo run -- --iface en0 --output live.jsonl --workers 0
 cargo run -- --iface en0 --capture-filter "tcp or udp" --capture-buffer-size 67108864
@@ -129,27 +140,41 @@ text, hex, or raw/base64 segment views. In sharded mode, slice requests use the
 same flow hash as packet routing, so the coordinator does not clone payload
 stores across shards.
 
-The local API is intentionally snapshot-first right now: it starts after the
-input source finishes, then serves bounded query results from memory. That keeps
-the first API contract deterministic before live deltas and backpressure-aware UI
-subscriptions are added.
+Transforms sit on top of content slices and are also bounded. The API accepts
+`transform=auto`, `url_decode`, `gzip`, `http_gzip`, or `websocket_deflate` on a
+content request. Transform output is returned beside the original slice, so the
+UI can keep raw bytes visible while showing decoded copies where it helps.
+
+The local API starts before input processing and remains available after the
+source finishes. Stream list, detail, match, health, and content endpoints are
+safe for polling. `/api/live/deltas` exposes a bounded cursor log for UI clients:
+stats updates, changed stream rows, match ranges, and status changes. If a client
+falls behind the retained cursor window, the response marks `missed=true`; the
+client should refresh `/api/streams` and continue from `latest_cursor`. Stream
+rows, matches, and content slices include `stream_id_hex`, so browser clients do
+not lose precision on 64-bit stream ids.
+
+Open `http://127.0.0.1:33111/` while the API is running to use the built-in
+frontend shell.
 
 ```bash
 curl http://127.0.0.1:33111/api/health
+curl 'http://127.0.0.1:33111/api/live/deltas?cursor=0&limit=1024&wait_ms=1000'
 curl 'http://127.0.0.1:33111/api/streams?limit=50&only_matched=true'
 curl http://127.0.0.1:33111/api/streams/123456789
 curl http://127.0.0.1:33111/api/streams/123456789/matches
 curl 'http://127.0.0.1:33111/api/streams/123456789/content?direction=a_to_b&start=0&len=65536&mode=text'
+curl 'http://127.0.0.1:33111/api/streams/123456789/content?direction=a_to_b&start=0&len=65536&mode=text&transform=auto'
 ```
 
 ## Development Priorities
 
-1. Add the frontend shell on top of the local API: stream table, details pane,
-   content viewport, match highlights, favorites, hide toggles, and hotkeys.
-2. Turn the snapshot API into a live API: coordinator-owned deltas, bounded
-   subscriptions, explicit backpressure, and cheap reconnect snapshots.
-3. Add decode/transform stages for stream content: URL decode, gzip HTTP bodies,
-   compressed WebSocket messages, and copy formats.
+1. Harden the frontend shell for real traffic: keyboard navigation, stable row
+   virtualization, favorites, hide toggles, and richer copy/export formats.
+2. Add service profiles: port groups, pattern scopes, auto-hide rules, default
+   view filters, and service-specific decode preferences.
+3. Expand transform coverage: chunked HTTP bodies, charset handling, Brotli/zstd
+   when useful, and safer WebSocket message aggregation.
 4. Move TLS analyzer onto stream input, keeping packet-level analyzers for
    stateless heuristics.
 5. Expand benchmark fixtures with real PCAP corpora and track throughput deltas

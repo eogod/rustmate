@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rustmate</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">RM</div>
+          <div>
+            <h1>rustmate</h1>
+            <p id="status-line">connecting</p>
+          </div>
+        </div>
+        <div class="stats-strip" id="stats-strip">
+          <span>streams <b id="stat-streams">0</b></span>
+          <span>matches <b id="stat-matches">0</b></span>
+          <span>packets <b id="stat-packets">0</b></span>
+          <span>drops <b id="stat-drops">0</b></span>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="stream-pane">
+          <div class="toolbar">
+            <input id="filter-service" placeholder="service" autocomplete="off" />
+            <input id="filter-port" placeholder="port" inputmode="numeric" autocomplete="off" />
+            <button id="toggle-matched" type="button" aria-pressed="true">matched</button>
+            <button id="reload-streams" type="button">reload</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>stream</th>
+                  <th>service</th>
+                  <th>kind</th>
+                  <th>bytes</th>
+                  <th>matches</th>
+                </tr>
+              </thead>
+              <tbody id="stream-rows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="detail-pane">
+          <div class="detail-head">
+            <div>
+              <h2 id="stream-title">No stream selected</h2>
+              <p id="stream-subtitle">Select a row to inspect content</p>
+            </div>
+            <div class="detail-actions">
+              <select id="direction-select" aria-label="Direction">
+                <option value="a_to_b">a to b</option>
+                <option value="b_to_a">b to a</option>
+              </select>
+              <select id="mode-select" aria-label="View mode">
+                <option value="text">text</option>
+                <option value="hex">hex</option>
+                <option value="raw">raw</option>
+              </select>
+              <select id="transform-select" aria-label="Transform">
+                <option value="">raw bytes</option>
+                <option value="auto">auto transform</option>
+                <option value="url_decode">url decode</option>
+                <option value="gzip">gzip</option>
+                <option value="http_gzip">http gzip</option>
+                <option value="websocket_deflate">ws deflate</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="content-tools">
+            <button id="slice-prev" type="button">prev</button>
+            <label>offset <input id="slice-start" value="0" inputmode="numeric" /></label>
+            <label>bytes <input id="slice-len" value="65536" inputmode="numeric" /></label>
+            <button id="slice-next" type="button">next</button>
+            <button id="copy-content" type="button">copy</button>
+          </div>
+
+          <div class="content-grid">
+            <div class="viewer">
+              <div class="viewer-title">content</div>
+              <pre id="content-view"></pre>
+            </div>
+            <div class="side-panel">
+              <div class="viewer-title">matches</div>
+              <div id="match-list" class="match-list"></div>
+              <div class="viewer-title">transform</div>
+              <div id="transform-view" class="transform-view"></div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -12,6 +12,7 @@ pub const DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION: usize = 128;
 pub const DEFAULT_WORKERS: usize = 0;
 pub const DEFAULT_WORKER_QUEUE_DEPTH: usize = 4096;
 pub const DEFAULT_EVENT_QUEUE_DEPTH: usize = 4096;
+pub const DEFAULT_API_DELTA_CAPACITY: usize = 16_384;
 pub const DEFAULT_MAX_STREAMS: usize = DEFAULT_MAX_FLOWS;
 pub const DEFAULT_STREAM_PREVIEW_BYTES: usize = 256;
 pub const DEFAULT_STREAM_UPDATE_PACKETS: u64 = 64;
@@ -27,6 +28,7 @@ pub const DEFAULT_STREAM_VIEW_QUERY_LIMIT: usize = 512;
 pub const DEFAULT_MAX_STREAM_SLICE_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_STREAM_SLICE_HIGHLIGHTS: usize = 4096;
 pub const DEFAULT_STREAM_SLICE_HEX_ROW_BYTES: usize = 16;
+pub const DEFAULT_MAX_STREAM_TRANSFORM_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_CAPTURE_SNAPLEN: usize = 262_144;
 pub const DEFAULT_CAPTURE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 pub const DEFAULT_CAPTURE_READ_TIMEOUT_MS: usize = 100;
@@ -79,6 +81,7 @@ pub struct Config {
     pub max_stream_slice_bytes: usize,
     pub max_stream_slice_highlights: usize,
     pub stream_slice_hex_row_bytes: usize,
+    pub max_stream_transform_bytes: usize,
     pub capture_snaplen: usize,
     pub capture_buffer_size: usize,
     pub capture_read_timeout_ms: usize,
@@ -118,6 +121,7 @@ impl Default for Config {
             max_stream_slice_bytes: DEFAULT_MAX_STREAM_SLICE_BYTES,
             max_stream_slice_highlights: DEFAULT_MAX_STREAM_SLICE_HIGHLIGHTS,
             stream_slice_hex_row_bytes: DEFAULT_STREAM_SLICE_HEX_ROW_BYTES,
+            max_stream_transform_bytes: DEFAULT_MAX_STREAM_TRANSFORM_BYTES,
             capture_snaplen: DEFAULT_CAPTURE_SNAPLEN,
             capture_buffer_size: DEFAULT_CAPTURE_BUFFER_SIZE,
             capture_read_timeout_ms: DEFAULT_CAPTURE_READ_TIMEOUT_MS,

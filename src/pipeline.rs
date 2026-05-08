@@ -1,8 +1,11 @@
+use std::sync::{Arc, RwLock};
+
 use anyhow::Result;
 use serde::Serialize;
 
 use crate::{
     analyzers::Analyzer,
+    api::LiveApiHandle,
     config::RunMode,
     event::Event,
     flow::{FlowTable, FlowTableConfig, FlowTableStats},
@@ -233,8 +236,10 @@ pub struct Pipeline {
     flow_table: FlowTable,
     stream_inventory: StreamInventory,
     stream_content: StreamContent,
+    live_content: Option<Arc<RwLock<StreamContent>>>,
     pattern_engine: PatternEngine,
     stream_view: StreamViewState,
+    live_api: Option<LiveApiHandle>,
     events: Vec<Event>,
 }
 
@@ -268,8 +273,10 @@ impl Pipeline {
             )),
             stream_inventory: StreamInventory::new(config.stream_inventory),
             stream_content: StreamContent::new(config.stream_content),
+            live_content: None,
             pattern_engine: PatternEngine::new(PatternEngineConfig::disabled()),
             stream_view: StreamViewState::new(config.stream_view),
+            live_api: None,
             events: Vec::with_capacity(config.batch_size),
         }
     }
@@ -287,6 +294,11 @@ impl Pipeline {
         self.sinks.push(sink);
     }
 
+    pub fn attach_live_api(&mut self, live_api: LiveApiHandle) {
+        self.live_content = Some(live_api.install_local_content(self.config.stream_content));
+        self.live_api = Some(live_api);
+    }
+
     pub fn stream_view(&self) -> &StreamViewState {
         &self.stream_view
     }
@@ -295,6 +307,12 @@ impl Pipeline {
         &self,
         request: &StreamSliceRequest,
     ) -> std::result::Result<StreamContentSlice, StreamSliceError> {
+        if let Some(content) = &self.live_content {
+            let content = content.read().expect("live content lock is poisoned");
+            return StreamSliceReader::new(&content, &self.stream_view, self.config.stream_slice)
+                .slice(request);
+        }
+
         StreamSliceReader::new(
             &self.stream_content,
             &self.stream_view,
@@ -356,6 +374,9 @@ impl Pipeline {
             stats.set_source_stats(source_stats);
         }
         stats.set_stream_view_stats(self.stream_view.stats());
+        if let Some(live_api) = &self.live_api {
+            live_api.mark_completed(stats);
+        }
 
         Ok(stats)
     }
@@ -369,10 +390,13 @@ impl Pipeline {
 
         stats.set_flow_table_stats(self.flow_table.stats());
         stats.set_stream_inventory_stats(self.stream_inventory.stats());
-        stats.set_stream_content_stats(self.stream_content.stats());
+        stats.set_stream_content_stats(self.stream_content_stats());
         stats.set_pattern_stats(self.pattern_engine.stats());
         self.stream_view.observe_events(&self.events);
         stats.set_stream_view_stats(self.stream_view.stats());
+        if let Some(live_api) = &self.live_api {
+            live_api.publish_events(&self.events, *stats);
+        }
     }
 
     fn process_packet(&mut self, raw: &RawPacket, stats: &mut PipelineStats) {
@@ -389,14 +413,7 @@ impl Pipeline {
                 if let Some(flow) = flow.as_ref() {
                     self.stream_inventory
                         .observe_flow(&packet, flow, &mut self.events);
-                    if let Some(update) = self.stream_content.observe_flow(&packet, flow) {
-                        self.pattern_engine.scan_update(
-                            &packet,
-                            &self.stream_content,
-                            &update,
-                            &mut self.events,
-                        );
-                    }
+                    self.observe_stream_content(&packet, flow);
                 }
                 if let Some(flow) = flow
                     .as_ref()
@@ -414,6 +431,41 @@ impl Pipeline {
                 }
             }
         }
+    }
+
+    fn observe_stream_content(
+        &mut self,
+        packet: &DecodedPacket<'_>,
+        flow: &crate::flow::FlowObservation<'_>,
+    ) {
+        if let Some(content) = &self.live_content {
+            let mut content = content.write().expect("live content lock is poisoned");
+            if let Some(update) = content.observe_flow(packet, flow) {
+                self.pattern_engine
+                    .scan_update(packet, &content, &update, &mut self.events);
+            }
+            return;
+        }
+
+        if let Some(update) = self.stream_content.observe_flow(packet, flow) {
+            self.pattern_engine.scan_update(
+                packet,
+                &self.stream_content,
+                &update,
+                &mut self.events,
+            );
+        }
+    }
+
+    fn stream_content_stats(&self) -> StreamContentStats {
+        if let Some(content) = &self.live_content {
+            return content
+                .read()
+                .expect("live content lock is poisoned")
+                .stats();
+        }
+
+        self.stream_content.stats()
     }
 }
 
@@ -756,6 +808,7 @@ mod tests {
             max_slice_bytes: 64 * 1024,
             max_highlights: 4096,
             hex_row_bytes: 16,
+            max_transform_bytes: 1024 * 1024,
         }
     }
 

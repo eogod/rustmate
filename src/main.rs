@@ -10,7 +10,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use rustmate::{
     analyzers::{dns::DnsAnalyzer, http::HttpAnalyzer, tls_meta::TlsMetaAnalyzer},
-    api::{ApiSnapshot, serve_snapshot},
+    api::{ApiServer, LiveApiHandle, spawn_live},
     cli::Opts,
     config::Config,
     ingest::{
@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
             max_slice_bytes: opts.max_stream_slice_bytes,
             max_highlights: opts.max_stream_slice_highlights,
             hex_row_bytes: opts.stream_slice_hex_row_bytes,
+            max_transform_bytes: opts.max_stream_transform_bytes,
         },
     };
     let pattern_config = build_pattern_config(&opts)?;
@@ -98,6 +99,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pcap_path) = opts.pcap.as_deref() {
         tracing::info!("Reading pcap file: {}", pcap_path.display());
         let src = PcapFileSource::open(PathBuf::from(pcap_path))?;
+        let (live_api, api_server) =
+            start_live_api(api_listen, pipeline_config, opts.api_delta_capacity).await?;
         let run = run_pipeline(
             src,
             pipeline_config,
@@ -107,13 +110,17 @@ async fn main() -> anyhow::Result<()> {
                 worker_queue_depth: opts.worker_queue_depth,
                 event_queue_depth: opts.event_queue_depth,
                 out_path: out_path.clone(),
-                keep_api_snapshot: api_listen.is_some(),
+                live_api,
             },
         )
         .await?;
         log_completed("Pcap processing completed", &run.stats, &out_path);
-        if let (Some(addr), Some(snapshot)) = (api_listen, run.api_snapshot) {
-            serve_snapshot(snapshot, addr).await?;
+        if let Some(api_server) = api_server {
+            tracing::info!(
+                api = %api_server.local_addr(),
+                "Input finished; live API remains available until Ctrl-C"
+            );
+            api_server.wait_for_shutdown_signal().await?;
         }
     } else if let Some(interface) = opts.iface.as_deref() {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -131,6 +138,8 @@ async fn main() -> anyhow::Result<()> {
             max_packets: opts.max_packets,
             shutdown,
         })?;
+        let (live_api, api_server) =
+            start_live_api(api_listen, pipeline_config, opts.api_delta_capacity).await?;
         let run = run_pipeline(
             src,
             pipeline_config,
@@ -140,13 +149,17 @@ async fn main() -> anyhow::Result<()> {
                 worker_queue_depth: opts.worker_queue_depth,
                 event_queue_depth: opts.event_queue_depth,
                 out_path: out_path.clone(),
-                keep_api_snapshot: api_listen.is_some(),
+                live_api,
             },
         )
         .await?;
         log_completed("Live capture completed", &run.stats, &out_path);
-        if let (Some(addr), Some(snapshot)) = (api_listen, run.api_snapshot) {
-            serve_snapshot(snapshot, addr).await?;
+        if let Some(api_server) = api_server {
+            tracing::info!(
+                api = %api_server.local_addr(),
+                "Input finished; live API remains available until Ctrl-C"
+            );
+            api_server.wait_for_shutdown_signal().await?;
         }
     } else {
         tracing::warn!("No input set. Use --pcap, --iface, or --list-interfaces.");
@@ -158,7 +171,6 @@ async fn main() -> anyhow::Result<()> {
 
 struct PipelineRun {
     stats: rustmate::pipeline::PipelineStats,
-    api_snapshot: Option<ApiSnapshot>,
 }
 
 struct PipelineRunOptions {
@@ -166,7 +178,7 @@ struct PipelineRunOptions {
     worker_queue_depth: usize,
     event_queue_depth: usize,
     out_path: PathBuf,
-    keep_api_snapshot: bool,
+    live_api: Option<LiveApiHandle>,
 }
 
 async fn run_pipeline<T: PacketSource + 'static>(
@@ -183,32 +195,42 @@ async fn run_pipeline<T: PacketSource + 'static>(
             event_queue_depth: options.event_queue_depth,
         });
         pipeline.set_pattern_config(pattern_config);
+        if let Some(live_api) = options.live_api {
+            pipeline.attach_live_api(live_api);
+        }
         register_sharded_analyzers(&mut pipeline);
         pipeline.register_sink(Box::new(JsonlWriter::create(options.out_path)?));
         let stats = pipeline.run_with_source(source).await?;
-        let api_snapshot = options.keep_api_snapshot.then(|| {
-            let (view, content_shards, slice_config) = pipeline.into_api_parts();
-            ApiSnapshot::sharded(stats, view, content_shards, slice_config)
-        });
-        Ok(PipelineRun {
-            stats,
-            api_snapshot,
-        })
+        Ok(PipelineRun { stats })
     } else {
         let mut pipeline = Pipeline::new(pipeline_config);
         pipeline.set_pattern_config(pattern_config);
+        if let Some(live_api) = options.live_api {
+            pipeline.attach_live_api(live_api);
+        }
         register_analyzers(&mut pipeline);
         pipeline.register_sink(Box::new(JsonlWriter::create(options.out_path)?));
         let stats = pipeline.run_with_source(source).await?;
-        let api_snapshot = options.keep_api_snapshot.then(|| {
-            let (content, view, slice_config) = pipeline.into_api_parts();
-            ApiSnapshot::single(stats, content, view, slice_config)
-        });
-        Ok(PipelineRun {
-            stats,
-            api_snapshot,
-        })
+        Ok(PipelineRun { stats })
     }
+}
+
+async fn start_live_api(
+    api_listen: Option<std::net::SocketAddr>,
+    pipeline_config: PipelineConfig,
+    delta_capacity: usize,
+) -> anyhow::Result<(Option<LiveApiHandle>, Option<ApiServer>)> {
+    let Some(addr) = api_listen else {
+        return Ok((None, None));
+    };
+
+    let live_api = LiveApiHandle::new(
+        pipeline_config.stream_view,
+        pipeline_config.stream_slice,
+        delta_capacity,
+    );
+    let server = spawn_live(live_api.clone(), addr).await?;
+    Ok((Some(live_api), Some(server)))
 }
 
 fn register_analyzers(pipeline: &mut Pipeline) {

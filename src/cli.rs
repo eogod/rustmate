@@ -2,12 +2,13 @@ use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf};
 
 use crate::config::{
-    DEFAULT_BATCH_SIZE, DEFAULT_CAPTURE_BUFFER_SIZE, DEFAULT_CAPTURE_READ_TIMEOUT_MS,
-    DEFAULT_CAPTURE_SNAPLEN, DEFAULT_EVENT_QUEUE_DEPTH, DEFAULT_FLOW_IDLE_TIMEOUT_MS,
-    DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS, DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM,
-    DEFAULT_MAX_PATTERN_MATCHES_TOTAL, DEFAULT_MAX_STREAM_CONTENT_BYTES,
-    DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM, DEFAULT_MAX_STREAM_SLICE_BYTES,
-    DEFAULT_MAX_STREAM_SLICE_HIGHLIGHTS, DEFAULT_MAX_STREAM_VIEW_MATCHES_PER_STREAM,
+    DEFAULT_API_DELTA_CAPACITY, DEFAULT_BATCH_SIZE, DEFAULT_CAPTURE_BUFFER_SIZE,
+    DEFAULT_CAPTURE_READ_TIMEOUT_MS, DEFAULT_CAPTURE_SNAPLEN, DEFAULT_EVENT_QUEUE_DEPTH,
+    DEFAULT_FLOW_IDLE_TIMEOUT_MS, DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS,
+    DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM, DEFAULT_MAX_PATTERN_MATCHES_TOTAL,
+    DEFAULT_MAX_STREAM_CONTENT_BYTES, DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM,
+    DEFAULT_MAX_STREAM_SLICE_BYTES, DEFAULT_MAX_STREAM_SLICE_HIGHLIGHTS,
+    DEFAULT_MAX_STREAM_TRANSFORM_BYTES, DEFAULT_MAX_STREAM_VIEW_MATCHES_PER_STREAM,
     DEFAULT_MAX_STREAMS, DEFAULT_MAX_TCP_BUFFERED_BYTES_PER_FLOW,
     DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION, DEFAULT_PATTERN_REGEX_WINDOW_BYTES,
     DEFAULT_STREAM_CONTENT_SEGMENT_BYTES, DEFAULT_STREAM_PREVIEW_BYTES,
@@ -35,9 +36,13 @@ pub struct Opts {
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
-    /// Serve a read-only local API snapshot after input processing completes
+    /// Serve the local read-only API while processing input
     #[arg(long)]
     pub api_listen: Option<SocketAddr>,
+
+    /// Retained live API delta records for polling clients
+    #[arg(long, default_value_t = DEFAULT_API_DELTA_CAPACITY)]
+    pub api_delta_capacity: usize,
 
     /// Run mode: analyze | dump
     #[arg(short, long, value_enum, default_value_t = RunMode::Analyze)]
@@ -158,6 +163,10 @@ pub struct Opts {
     /// Bytes per row in hex stream content slices
     #[arg(long, default_value_t = DEFAULT_STREAM_SLICE_HEX_ROW_BYTES)]
     pub stream_slice_hex_row_bytes: usize,
+
+    /// Max bytes returned by one decoded stream transform
+    #[arg(long, default_value_t = DEFAULT_MAX_STREAM_TRANSFORM_BYTES)]
+    pub max_stream_transform_bytes: usize,
 
     /// Health log interval in milliseconds; 0 disables it
     #[arg(long, default_value_t = DEFAULT_HEALTH_INTERVAL_MS)]

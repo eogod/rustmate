@@ -6,6 +6,7 @@ use serde::Serialize;
 use crate::{
     flow::FlowDirection,
     stream_content::{StreamContent, StreamContentWindow},
+    stream_transform::StreamTransformOutput,
     stream_view::{StreamPatternMatch, StreamPatternType, StreamViewState},
 };
 
@@ -16,6 +17,7 @@ pub struct StreamSliceConfig {
     pub max_slice_bytes: usize,
     pub max_highlights: usize,
     pub hex_row_bytes: usize,
+    pub max_transform_bytes: usize,
 }
 
 impl Default for StreamSliceConfig {
@@ -24,6 +26,7 @@ impl Default for StreamSliceConfig {
             max_slice_bytes: 64 * 1024,
             max_highlights: 4096,
             hex_row_bytes: DEFAULT_HEX_ROW_BYTES,
+            max_transform_bytes: 1024 * 1024,
         }
     }
 }
@@ -34,6 +37,7 @@ impl StreamSliceConfig {
             max_slice_bytes: self.max_slice_bytes.max(1),
             max_highlights: self.max_highlights,
             hex_row_bytes: self.hex_row_bytes.clamp(1, 64),
+            max_transform_bytes: self.max_transform_bytes.max(1),
         }
     }
 }
@@ -58,6 +62,7 @@ pub enum StreamSliceMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamContentSlice {
     pub stream_id: u64,
+    pub stream_id_hex: String,
     pub direction: FlowDirection,
     pub requested_start: u64,
     pub requested_end: u64,
@@ -66,6 +71,8 @@ pub struct StreamContentSlice {
     pub segments: Vec<StreamSliceSegment>,
     pub highlights: Vec<StreamSliceHighlight>,
     pub dropped_highlights: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transforms: Vec<StreamTransformOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -167,9 +174,27 @@ impl<'a> StreamSliceReader<'a> {
             });
         };
 
+        self.slice_with_context(
+            request,
+            entry.flow_key(),
+            self.view
+                .stream_matches(request.stream_id)
+                .unwrap_or_default(),
+        )
+    }
+
+    pub fn slice_with_context(
+        &self,
+        request: &StreamSliceRequest,
+        key: crate::flow::FlowKey,
+        matches: &[StreamPatternMatch],
+    ) -> Result<StreamContentSlice, StreamSliceError> {
+        if request.max_bytes == 0 {
+            return Err(StreamSliceError::EmptyRequest);
+        }
+
         let max_bytes = request.max_bytes.min(self.config.max_slice_bytes).max(1);
         let requested_end = request.logical_start.saturating_add(max_bytes as u64);
-        let key = entry.flow_key();
         let Some(windows) = self.content.direction_windows(
             &key,
             request.direction,
@@ -192,17 +217,12 @@ impl<'a> StreamSliceReader<'a> {
             ));
         }
 
-        let (highlights, dropped_highlights) = self.highlights(
-            request.stream_id,
-            request.direction,
-            self.view
-                .stream_matches(request.stream_id)
-                .unwrap_or_default(),
-            &segments,
-        );
+        let (highlights, dropped_highlights) =
+            self.highlights(request.stream_id, request.direction, matches, &segments);
 
         Ok(StreamContentSlice {
             stream_id: request.stream_id,
+            stream_id_hex: format!("{:016x}", request.stream_id),
             direction: request.direction,
             requested_start: request.logical_start,
             requested_end,
@@ -211,6 +231,7 @@ impl<'a> StreamSliceReader<'a> {
             segments,
             highlights,
             dropped_highlights,
+            transforms: Vec::new(),
         })
     }
 
@@ -277,7 +298,7 @@ impl StreamContentSlice {
         }
     }
 
-    fn concatenated_bytes(&self) -> Vec<u8> {
+    pub fn concatenated_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.returned_bytes);
         for segment in &self.segments {
             if let Ok(decoded) = STANDARD.decode(&segment.base64) {
