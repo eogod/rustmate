@@ -168,7 +168,7 @@ impl ServiceProfileSet {
             .into_iter()
             .map(ServiceProfile::normalized)
             .collect();
-        profiles.sort_by(|left, right| right.priority.cmp(&left.priority));
+        profiles.sort_by_key(|profile| std::cmp::Reverse(profile.priority));
         Self { profiles }
     }
 
@@ -212,7 +212,7 @@ impl ServiceProfileSet {
 
     fn sort(&mut self) {
         self.profiles
-            .sort_by(|left, right| right.priority.cmp(&left.priority));
+            .sort_by_key(|profile| std::cmp::Reverse(profile.priority));
     }
 }
 
