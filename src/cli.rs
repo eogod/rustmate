@@ -5,6 +5,8 @@ use crate::config::{
     DEFAULT_API_DELTA_CAPACITY, DEFAULT_BATCH_SIZE, DEFAULT_CAPTURE_BUFFER_SIZE,
     DEFAULT_CAPTURE_READ_TIMEOUT_MS, DEFAULT_CAPTURE_SNAPLEN, DEFAULT_EVENT_QUEUE_DEPTH,
     DEFAULT_FLOW_IDLE_TIMEOUT_MS, DEFAULT_HEALTH_INTERVAL_MS, DEFAULT_MAX_FLOWS,
+    DEFAULT_MAX_HTTP1_BUFFER_BYTES, DEFAULT_MAX_HTTP1_HEADER_BYTES,
+    DEFAULT_MAX_HTTP1_PARSER_STATES, DEFAULT_MAX_PARSER_MESSAGES_PER_CHUNK,
     DEFAULT_MAX_PATTERN_MATCHES_PER_STREAM, DEFAULT_MAX_PATTERN_MATCHES_TOTAL,
     DEFAULT_MAX_STREAM_CONTENT_BYTES, DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM,
     DEFAULT_MAX_STREAM_SLICE_BYTES, DEFAULT_MAX_STREAM_SLICE_HIGHLIGHTS,
@@ -43,6 +45,10 @@ pub struct Opts {
     /// Retained live API delta records for polling clients
     #[arg(long, default_value_t = DEFAULT_API_DELTA_CAPACITY)]
     pub api_delta_capacity: usize,
+
+    /// JSON file with service profile overrides and additions
+    #[arg(long)]
+    pub service_profile_file: Option<PathBuf>,
 
     /// Run mode: analyze | dump
     #[arg(short, long, value_enum, default_value_t = RunMode::Analyze)]
@@ -167,6 +173,26 @@ pub struct Opts {
     /// Max bytes returned by one decoded stream transform
     #[arg(long, default_value_t = DEFAULT_MAX_STREAM_TRANSFORM_BYTES)]
     pub max_stream_transform_bytes: usize,
+
+    /// Disable protocol parser layer and message events
+    #[arg(long)]
+    pub disable_stream_parser: bool,
+
+    /// Max active HTTP/1 parser states across flow directions
+    #[arg(long, default_value_t = DEFAULT_MAX_HTTP1_PARSER_STATES)]
+    pub max_http1_parser_states: usize,
+
+    /// Max HTTP/1 header bytes buffered before a parse error
+    #[arg(long, default_value_t = DEFAULT_MAX_HTTP1_HEADER_BYTES)]
+    pub max_http1_header_bytes: usize,
+
+    /// Max HTTP/1 message bytes buffered per parser state
+    #[arg(long, default_value_t = DEFAULT_MAX_HTTP1_BUFFER_BYTES)]
+    pub max_http1_buffer_bytes: usize,
+
+    /// Max parser messages emitted from one stream chunk
+    #[arg(long, default_value_t = DEFAULT_MAX_PARSER_MESSAGES_PER_CHUNK)]
+    pub max_parser_messages_per_chunk: usize,
 
     /// Health log interval in milliseconds; 0 disables it
     #[arg(long, default_value_t = DEFAULT_HEALTH_INTERVAL_MS)]

@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, patch, post},
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -20,17 +20,24 @@ use crate::{
     flow::{FlowDirection, FlowKey},
     packet::TransportProtocol,
     pipeline::PipelineStats,
+    service_profile::{ServiceProfile, ServiceProfileSet, ServiceProfileStats},
     sharded_pipeline::{ShardedContentSliceError, ShardedContentSliceHandle, shard_for_flow_key},
     stream_content::{StreamContent, StreamContentConfig},
+    stream_message::{
+        StreamMessageKind, StreamMessageProtocol, StreamMessageQuery, StreamMessageQueryResult,
+        StreamMessageStatus, StreamMessageStore,
+    },
     stream_slice::{
         StreamContentSlice, StreamSliceConfig, StreamSliceError, StreamSliceMode,
         StreamSliceReader, StreamSliceRequest,
     },
-    stream_transform::{StreamTransformConfig, StreamTransformMode, apply_transform},
+    stream_transform::{
+        StreamTransformConfig, StreamTransformMode, StreamTransformPlan, apply_transform_plan,
+    },
     stream_view::{
-        StreamPatternMatch, StreamViewConfig, StreamViewContentKind, StreamViewDirection,
-        StreamViewQuery, StreamViewQueryResult, StreamViewRow, StreamViewState, StreamViewStats,
-        StreamViewStatus,
+        StreamHideRule, StreamPatternMatch, StreamViewConfig, StreamViewContentKind,
+        StreamViewDirection, StreamViewQuery, StreamViewQueryResult, StreamViewRow,
+        StreamViewState, StreamViewStats, StreamViewStatus,
     },
 };
 
@@ -41,8 +48,10 @@ const MAX_DELTA_POLL_MS: u64 = 30_000;
 pub struct ApiSnapshot {
     stats: PipelineStats,
     view: StreamViewState,
+    messages: StreamMessageStore,
     content_shards: Vec<Option<StreamContent>>,
     slice_config: StreamSliceConfig,
+    profiles: ServiceProfileSet,
 }
 
 impl ApiSnapshot {
@@ -50,27 +59,33 @@ impl ApiSnapshot {
         stats: PipelineStats,
         content: StreamContent,
         view: StreamViewState,
+        messages: StreamMessageStore,
         slice_config: StreamSliceConfig,
     ) -> Self {
         Self {
             stats,
             view,
+            messages,
             content_shards: vec![Some(content)],
             slice_config,
+            profiles: ServiceProfileSet::builtin(),
         }
     }
 
     pub fn sharded(
         stats: PipelineStats,
         view: StreamViewState,
+        messages: StreamMessageStore,
         content_shards: Vec<Option<StreamContent>>,
         slice_config: StreamSliceConfig,
     ) -> Self {
         Self {
             stats,
             view,
+            messages,
             content_shards,
             slice_config,
+            profiles: ServiceProfileSet::builtin(),
         }
     }
 
@@ -127,11 +142,13 @@ struct LiveApiState {
     deltas: Mutex<LiveDeltaLog>,
     notify: tokio::sync::Notify,
     slice_config: StreamSliceConfig,
+    profiles: ServiceProfileSet,
 }
 
 struct LiveApiCore {
     stats: PipelineStats,
     view: StreamViewState,
+    messages: StreamMessageStore,
     run_status: ApiRunStatus,
 }
 
@@ -148,17 +165,33 @@ impl LiveApiHandle {
         slice_config: StreamSliceConfig,
         delta_capacity: usize,
     ) -> Self {
+        Self::new_with_profiles(
+            view_config,
+            slice_config,
+            delta_capacity,
+            ServiceProfileSet::builtin(),
+        )
+    }
+
+    pub fn new_with_profiles(
+        view_config: StreamViewConfig,
+        slice_config: StreamSliceConfig,
+        delta_capacity: usize,
+        profiles: ServiceProfileSet,
+    ) -> Self {
         Self {
             inner: Arc::new(LiveApiState {
                 core: RwLock::new(LiveApiCore {
                     stats: PipelineStats::default(),
                     view: StreamViewState::new(view_config),
+                    messages: StreamMessageStore::default(),
                     run_status: ApiRunStatus::Running,
                 }),
                 content: RwLock::new(LiveContentBackend::None),
                 deltas: Mutex::new(LiveDeltaLog::new(delta_capacity)),
                 notify: tokio::sync::Notify::new(),
                 slice_config,
+                profiles,
             }),
         }
     }
@@ -196,6 +229,7 @@ impl LiveApiHandle {
                 return;
             };
             core.view.observe_events(events);
+            core.messages.observe_events(events);
             core.stats = stats;
             stream_ids
                 .iter()
@@ -301,6 +335,32 @@ impl LiveApiHandle {
         Ok(core.view.query(query))
     }
 
+    fn service_profiles(&self) -> Result<Vec<ServiceProfileView>, ApiError> {
+        let core = self
+            .inner
+            .core
+            .read()
+            .map_err(|_| ApiError::internal("live API core lock is poisoned"))?;
+        Ok(profile_views(&core.view, &self.inner.profiles))
+    }
+
+    fn service_profile(&self, id: &str) -> Result<ServiceProfileView, ApiError> {
+        let core = self
+            .inner
+            .core
+            .read()
+            .map_err(|_| ApiError::internal("live API core lock is poisoned"))?;
+        let profile = self
+            .inner
+            .profiles
+            .get(id)
+            .ok_or_else(|| ApiError::not_found(format!("service profile not found: {id}")))?;
+        Ok(ServiceProfileView {
+            profile: profile.clone(),
+            stats: core.view.profile_stats(profile),
+        })
+    }
+
     fn stream_detail(&self, stream_id: u64) -> Result<StreamDetailResponse, ApiError> {
         let core = self
             .inner
@@ -324,6 +384,116 @@ impl LiveApiHandle {
         })
     }
 
+    fn update_stream_state(
+        &self,
+        stream_id: u64,
+        patch: StreamStatePatch,
+    ) -> Result<StreamStateResponse, ApiError> {
+        let (response, stats, row) = {
+            let mut core = self
+                .inner
+                .core
+                .write()
+                .map_err(|_| ApiError::internal("live API core lock is poisoned"))?;
+            if core.view.stream(stream_id).is_none() {
+                return Err(ApiError::not_found(format!(
+                    "stream {stream_id:016x} is not tracked"
+                )));
+            }
+            if let Some(favorite) = patch.favorite {
+                core.view.set_favorite(stream_id, favorite);
+            }
+            if let Some(hidden) = patch.hidden {
+                core.view.set_hidden(stream_id, hidden);
+            }
+            let view = core.view.stats();
+            core.stats.set_stream_view_stats(view);
+            let row = core
+                .view
+                .stream_row(stream_id)
+                .expect("stream was checked before state update");
+            let response = StreamStateResponse {
+                row: row.clone(),
+                view,
+            };
+            (response, core.stats, row)
+        };
+
+        self.append_deltas(vec![
+            LiveDeltaPayload::Streams { rows: vec![row] },
+            LiveDeltaPayload::Stats { stats },
+        ]);
+        Ok(response)
+    }
+
+    fn hide_rules(&self) -> Result<ViewRulesResponse, ApiError> {
+        let core = self
+            .inner
+            .core
+            .read()
+            .map_err(|_| ApiError::internal("live API core lock is poisoned"))?;
+        Ok(view_rules_response(&core.view))
+    }
+
+    fn add_hide_rule(&self, rule: StreamHideRule) -> Result<ViewRulesResponse, ApiError> {
+        let (response, stats) = {
+            let mut core = self
+                .inner
+                .core
+                .write()
+                .map_err(|_| ApiError::internal("live API core lock is poisoned"))?;
+            core.view.add_hide_rule(rule);
+            let view = core.view.stats();
+            core.stats.set_stream_view_stats(view);
+            (view_rules_response(&core.view), core.stats)
+        };
+
+        self.append_deltas(vec![LiveDeltaPayload::Stats { stats }]);
+        Ok(response)
+    }
+
+    fn add_profile_hide_rules(&self, id: &str) -> Result<ViewRulesResponse, ApiError> {
+        let profile = self
+            .inner
+            .profiles
+            .get(id)
+            .ok_or_else(|| ApiError::not_found(format!("service profile not found: {id}")))?
+            .clone();
+        let (response, stats) = {
+            let mut core = self
+                .inner
+                .core
+                .write()
+                .map_err(|_| ApiError::internal("live API core lock is poisoned"))?;
+            for rule in profile.hide_rules {
+                core.view.add_hide_rule(rule);
+            }
+            let view = core.view.stats();
+            core.stats.set_stream_view_stats(view);
+            (view_rules_response(&core.view), core.stats)
+        };
+
+        self.append_deltas(vec![LiveDeltaPayload::Stats { stats }]);
+        Ok(response)
+    }
+
+    fn clear_hide_rules(&self) -> Result<ViewRulesResponse, ApiError> {
+        let (response, stats) = {
+            let mut core = self
+                .inner
+                .core
+                .write()
+                .map_err(|_| ApiError::internal("live API core lock is poisoned"))?;
+            core.view.clear_hide_rules();
+            let view = core.view.stats();
+            core.stats.set_stream_view_stats(view);
+            (view_rules_response(&core.view), core.stats)
+        };
+
+        self.append_deltas(vec![LiveDeltaPayload::Stats { stats }]);
+        Ok(response)
+    }
+
     fn stream_matches(&self, stream_id: u64) -> Result<StreamMatchesResponse, ApiError> {
         let core = self
             .inner
@@ -341,6 +511,24 @@ impl LiveApiHandle {
             stream_id_hex: format!("{stream_id:016x}"),
             matches: matches.to_vec(),
         })
+    }
+
+    fn stream_messages(
+        &self,
+        stream_id: u64,
+        query: &StreamMessageQuery,
+    ) -> Result<StreamMessageQueryResult, ApiError> {
+        let core = self
+            .inner
+            .core
+            .read()
+            .map_err(|_| ApiError::internal("live API core lock is poisoned"))?;
+        if core.view.stream(stream_id).is_none() {
+            return Err(ApiError::not_found(format!(
+                "stream {stream_id:016x} is not tracked"
+            )));
+        }
+        Ok(core.messages.query(stream_id, query))
     }
 
     async fn stream_content(
@@ -553,10 +741,25 @@ fn router(state: ApiState) -> Router {
         .route("/app.js", get(frontend_js))
         .route("/styles.css", get(frontend_css))
         .route("/api/health", get(health))
+        .route("/api/service-profiles", get(service_profiles))
+        .route(
+            "/api/service-profiles/{id}",
+            get(service_profile).post(add_profile_hide_rules),
+        )
+        .route(
+            "/api/service-profiles/{id}/hide-rules",
+            post(add_profile_hide_rules),
+        )
         .route("/api/streams", get(streams))
         .route("/api/streams/{id}", get(stream_detail))
+        .route("/api/streams/{id}/state", patch(patch_stream_state))
         .route("/api/streams/{id}/matches", get(stream_matches))
+        .route("/api/streams/{id}/messages", get(stream_messages))
         .route("/api/streams/{id}/content", get(stream_content))
+        .route(
+            "/api/view/hide-rules",
+            get(hide_rules).post(add_hide_rule).delete(clear_hide_rules),
+        )
         .route("/api/live/deltas", get(live_deltas))
         .with_state(state)
 }
@@ -613,14 +816,57 @@ async fn health(State(state): State<ApiState>) -> Result<Json<HealthResponse>, A
     }
 }
 
+async fn service_profiles(
+    State(state): State<ApiState>,
+) -> Result<Json<ServiceProfilesResponse>, ApiError> {
+    let profiles = match state {
+        ApiState::Snapshot(snapshot) => profile_views(&snapshot.view, &snapshot.profiles),
+        ApiState::Live(live) => live.service_profiles()?,
+    };
+    Ok(Json(ServiceProfilesResponse { profiles }))
+}
+
+async fn service_profile(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ServiceProfileView>, ApiError> {
+    match state {
+        ApiState::Snapshot(snapshot) => {
+            let profile = snapshot
+                .profiles
+                .get(&id)
+                .ok_or_else(|| ApiError::not_found(format!("service profile not found: {id}")))?;
+            Ok(Json(ServiceProfileView {
+                profile: profile.clone(),
+                stats: snapshot.view.profile_stats(profile),
+            }))
+        }
+        ApiState::Live(live) => Ok(Json(live.service_profile(&id)?)),
+    }
+}
+
 async fn streams(
     State(state): State<ApiState>,
     Query(params): Query<StreamQueryParams>,
 ) -> Result<Json<StreamViewQueryResult>, ApiError> {
-    let query = params.into_view_query()?;
+    let query = params.into_view_query(profiles_for_state(&state))?;
     match state {
         ApiState::Snapshot(snapshot) => Ok(Json(snapshot.view.query(&query))),
         ApiState::Live(live) => Ok(Json(live.streams(&query)?)),
+    }
+}
+
+async fn patch_stream_state(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(patch): Json<StreamStatePatch>,
+) -> Result<Json<StreamStateResponse>, ApiError> {
+    let stream_id = parse_stream_id(&id)?;
+    match state {
+        ApiState::Snapshot(_) => Err(ApiError::bad_request(
+            "stream state mutations are not available for snapshot API",
+        )),
+        ApiState::Live(live) => Ok(Json(live.update_stream_state(stream_id, patch)?)),
     }
 }
 
@@ -674,6 +920,26 @@ async fn stream_matches(
     }
 }
 
+async fn stream_messages(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<MessageQueryParams>,
+) -> Result<Json<StreamMessageQueryResult>, ApiError> {
+    let stream_id = parse_stream_id(&id)?;
+    let query = params.into_message_query()?;
+    match state {
+        ApiState::Snapshot(snapshot) => {
+            if snapshot.view.stream(stream_id).is_none() {
+                return Err(ApiError::not_found(format!(
+                    "stream {stream_id:016x} is not tracked"
+                )));
+            }
+            Ok(Json(snapshot.messages.query(stream_id, &query)))
+        }
+        ApiState::Live(live) => Ok(Json(live.stream_messages(stream_id, &query)?)),
+    }
+}
+
 async fn stream_content(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -681,7 +947,11 @@ async fn stream_content(
 ) -> Result<Json<StreamContentSlice>, ApiError> {
     let stream_id = parse_stream_id(&id)?;
     let view_mode = params.mode()?;
-    let transform = params.transform()?;
+    let transform_plan = match params.transform()? {
+        ContentTransformRequest::None => None,
+        ContentTransformRequest::Plan(plan) => Some(plan),
+        ContentTransformRequest::ProfileDefault => default_profile_transform(&state, stream_id)?,
+    };
     let transform_config = transform_config(&state);
     let request = StreamSliceRequest {
         stream_id,
@@ -691,13 +961,13 @@ async fn stream_content(
         mode: view_mode,
     };
 
-    let mut slice = match state {
+    let mut slice = match &state {
         ApiState::Snapshot(snapshot) => snapshot.slice(&request)?,
         ApiState::Live(live) => live.stream_content(request).await?,
     };
 
-    if let Some(transform) = transform {
-        let output = apply_transform(&slice, transform, view_mode, transform_config);
+    if let Some(transform_plan) = transform_plan {
+        let output = apply_transform_plan(&slice, transform_plan, view_mode, transform_config);
         slice.transforms.push(output);
     }
 
@@ -713,6 +983,49 @@ async fn live_deltas(
             "live deltas are not available for snapshot API",
         )),
         ApiState::Live(live) => Ok(Json(live.deltas(params).await?)),
+    }
+}
+
+async fn hide_rules(State(state): State<ApiState>) -> Result<Json<ViewRulesResponse>, ApiError> {
+    match state {
+        ApiState::Snapshot(snapshot) => Ok(Json(view_rules_response(&snapshot.view))),
+        ApiState::Live(live) => Ok(Json(live.hide_rules()?)),
+    }
+}
+
+async fn add_hide_rule(
+    State(state): State<ApiState>,
+    Json(request): Json<HideRuleRequest>,
+) -> Result<Json<ViewRulesResponse>, ApiError> {
+    let rule = request.into_rule()?;
+    match state {
+        ApiState::Snapshot(_) => Err(ApiError::bad_request(
+            "hide rule mutations are not available for snapshot API",
+        )),
+        ApiState::Live(live) => Ok(Json(live.add_hide_rule(rule)?)),
+    }
+}
+
+async fn add_profile_hide_rules(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ViewRulesResponse>, ApiError> {
+    match state {
+        ApiState::Snapshot(_) => Err(ApiError::bad_request(
+            "hide rule mutations are not available for snapshot API",
+        )),
+        ApiState::Live(live) => Ok(Json(live.add_profile_hide_rules(&id)?)),
+    }
+}
+
+async fn clear_hide_rules(
+    State(state): State<ApiState>,
+) -> Result<Json<ViewRulesResponse>, ApiError> {
+    match state {
+        ApiState::Snapshot(_) => Err(ApiError::bad_request(
+            "hide rule mutations are not available for snapshot API",
+        )),
+        ApiState::Live(live) => Ok(Json(live.clear_hide_rules()?)),
     }
 }
 
@@ -733,6 +1046,74 @@ fn transform_config(state: &ApiState) -> StreamTransformConfig {
     StreamTransformConfig {
         max_output_bytes: slice_config.max_transform_bytes,
         hex_row_bytes: slice_config.hex_row_bytes,
+    }
+}
+
+fn profiles_for_state(state: &ApiState) -> &ServiceProfileSet {
+    match state {
+        ApiState::Snapshot(snapshot) => &snapshot.profiles,
+        ApiState::Live(live) => &live.inner.profiles,
+    }
+}
+
+fn default_profile_transform(
+    state: &ApiState,
+    stream_id: u64,
+) -> Result<Option<StreamTransformPlan>, ApiError> {
+    Ok(match state {
+        ApiState::Snapshot(snapshot) => {
+            if snapshot.view.stream(stream_id).is_none() {
+                return Err(ApiError::not_found(format!(
+                    "stream {stream_id:016x} is not tracked"
+                )));
+            }
+            snapshot
+                .view
+                .primary_profile(&snapshot.profiles, stream_id)
+                .and_then(ServiceProfile::default_transform_plan)
+        }
+        ApiState::Live(live) => {
+            let core = live
+                .inner
+                .core
+                .read()
+                .map_err(|_| ApiError::internal("live API core lock is poisoned"))?;
+            if core.view.stream(stream_id).is_none() {
+                return Err(ApiError::not_found(format!(
+                    "stream {stream_id:016x} is not tracked"
+                )));
+            }
+            core.view
+                .primary_profile(&live.inner.profiles, stream_id)
+                .and_then(ServiceProfile::default_transform_plan)
+        }
+    })
+}
+
+fn profile_views(view: &StreamViewState, profiles: &ServiceProfileSet) -> Vec<ServiceProfileView> {
+    profiles
+        .profiles()
+        .iter()
+        .map(|profile| ServiceProfileView {
+            profile: profile.clone(),
+            stats: view.profile_stats(profile),
+        })
+        .collect()
+}
+
+fn view_rules_response(view: &StreamViewState) -> ViewRulesResponse {
+    ViewRulesResponse {
+        rules: view
+            .hide_rules()
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| ViewRule {
+                index,
+                label: rule.label(),
+                rule: rule.clone(),
+            })
+            .collect(),
+        view: view.stats(),
     }
 }
 
@@ -757,11 +1138,41 @@ pub struct HealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ServiceProfilesResponse {
+    profiles: Vec<ServiceProfileView>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceProfileView {
+    profile: ServiceProfile,
+    stats: ServiceProfileStats,
+}
+
+#[derive(Debug, Serialize)]
 struct StreamDetailResponse {
     row: StreamViewRow,
     directions: [StreamViewDirection; 2],
     matches: Vec<StreamPatternMatch>,
     content_shard: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamStateResponse {
+    row: StreamViewRow,
+    view: StreamViewStats,
+}
+
+#[derive(Debug, Serialize)]
+struct ViewRulesResponse {
+    rules: Vec<ViewRule>,
+    view: StreamViewStats,
+}
+
+#[derive(Debug, Serialize)]
+struct ViewRule {
+    index: usize,
+    label: String,
+    rule: StreamHideRule,
 }
 
 #[derive(Debug, Serialize)]
@@ -869,6 +1280,7 @@ struct StreamQueryParams {
     include_hidden: Option<bool>,
     only_favorites: Option<bool>,
     only_matched: Option<bool>,
+    profile: Option<String>,
     protocol: Option<String>,
     service: Option<String>,
     port: Option<u16>,
@@ -878,13 +1290,21 @@ struct StreamQueryParams {
 }
 
 impl StreamQueryParams {
-    fn into_view_query(self) -> Result<StreamViewQuery, ApiError> {
+    fn into_view_query(self, profiles: &ServiceProfileSet) -> Result<StreamViewQuery, ApiError> {
         let mut query = StreamViewQuery::default();
         query.cursor = self.cursor.unwrap_or(query.cursor);
         query.limit = self.limit.unwrap_or(query.limit);
         query.include_hidden = self.include_hidden.unwrap_or(query.include_hidden);
         query.only_favorites = self.only_favorites.unwrap_or(query.only_favorites);
         query.only_matched = self.only_matched.unwrap_or(query.only_matched);
+        query.profile = non_empty(self.profile)
+            .map(|profile| {
+                profiles
+                    .get(&profile)
+                    .cloned()
+                    .ok_or_else(|| ApiError::bad_request(format!("unknown profile: {profile}")))
+            })
+            .transpose()?;
         query.protocol = self.protocol.as_deref().map(parse_protocol).transpose()?;
         query.service = non_empty(self.service);
         query.port = self.port;
@@ -897,6 +1317,13 @@ impl StreamQueryParams {
         query.pattern_id = non_empty(self.pattern_id);
         Ok(query)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContentTransformRequest {
+    None,
+    Plan(StreamTransformPlan),
+    ProfileDefault,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -923,14 +1350,86 @@ impl ContentQueryParams {
             .unwrap_or(Ok(StreamSliceMode::Text))
     }
 
-    fn transform(&self) -> Result<Option<StreamTransformMode>, ApiError> {
+    fn transform(&self) -> Result<ContentTransformRequest, ApiError> {
         let Some(raw) = self.transform.as_deref() else {
-            return Ok(None);
+            return Ok(ContentTransformRequest::None);
         };
         match normalized_token(raw).as_str() {
-            "" | "none" | "raw" => Ok(None),
-            _ => parse_transform_mode(raw).map(Some),
+            "" | "none" | "raw" => Ok(ContentTransformRequest::None),
+            "profile" | "default" | "profile_default" => {
+                Ok(ContentTransformRequest::ProfileDefault)
+            }
+            _ => parse_transform_plan(raw).map(ContentTransformRequest::Plan),
         }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MessageQueryParams {
+    cursor: Option<usize>,
+    limit: Option<usize>,
+    direction: Option<String>,
+    protocol: Option<String>,
+    kind: Option<String>,
+    status: Option<String>,
+}
+
+impl MessageQueryParams {
+    fn into_message_query(self) -> Result<StreamMessageQuery, ApiError> {
+        Ok(StreamMessageQuery {
+            cursor: self.cursor.unwrap_or_default(),
+            limit: self.limit.unwrap_or(128),
+            direction: self.direction.as_deref().map(parse_direction).transpose()?,
+            protocol: self
+                .protocol
+                .as_deref()
+                .map(parse_message_protocol)
+                .transpose()?,
+            kind: self.kind.as_deref().map(parse_message_kind).transpose()?,
+            status: self
+                .status
+                .as_deref()
+                .map(parse_message_status)
+                .transpose()?,
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamStatePatch {
+    favorite: Option<bool>,
+    hidden: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HideRuleRequest {
+    kind: String,
+    value: serde_json::Value,
+}
+
+impl HideRuleRequest {
+    fn into_rule(self) -> Result<StreamHideRule, ApiError> {
+        let kind = normalized_token(&self.kind);
+        let value = json_scalar_to_string(&self.value)?;
+        let rule =
+            match kind.as_str() {
+                "stream" | "stream_id" => StreamHideRule::StreamId(parse_stream_id(&value)?),
+                "service" => StreamHideRule::Service(value),
+                "protocol" => StreamHideRule::Protocol(parse_protocol(&value)?),
+                "port" => StreamHideRule::Port(value.parse::<u16>().map_err(|_| {
+                    ApiError::bad_request(format!("invalid hide rule port: {value}"))
+                })?),
+                "content_kind" | "kind" => StreamHideRule::ContentKind(parse_content_kind(&value)?),
+                "status" => StreamHideRule::Status(parse_status(&value)?),
+                "pattern" | "pattern_id" => StreamHideRule::PatternId(value),
+                _ => {
+                    return Err(ApiError::bad_request(format!(
+                        "invalid hide rule kind: {}",
+                        self.kind
+                    )));
+                }
+            };
+        Ok(rule.normalized())
     }
 }
 
@@ -1122,6 +1621,37 @@ fn parse_direction(raw: &str) -> Result<FlowDirection, ApiError> {
     }
 }
 
+fn parse_message_protocol(raw: &str) -> Result<StreamMessageProtocol, ApiError> {
+    match normalized_token(raw).as_str() {
+        "http" | "http1" | "http_1" | "http/1" | "http/1.1" => Ok(StreamMessageProtocol::Http1),
+        _ => Err(ApiError::bad_request(format!(
+            "invalid message protocol: {raw}"
+        ))),
+    }
+}
+
+fn parse_message_kind(raw: &str) -> Result<StreamMessageKind, ApiError> {
+    match normalized_token(raw).as_str() {
+        "request" | "req" => Ok(StreamMessageKind::Request),
+        "response" | "resp" => Ok(StreamMessageKind::Response),
+        "unknown" => Ok(StreamMessageKind::Unknown),
+        _ => Err(ApiError::bad_request(format!(
+            "invalid message kind: {raw}"
+        ))),
+    }
+}
+
+fn parse_message_status(raw: &str) -> Result<StreamMessageStatus, ApiError> {
+    match normalized_token(raw).as_str() {
+        "complete" => Ok(StreamMessageStatus::Complete),
+        "partial" => Ok(StreamMessageStatus::Partial),
+        "parse_error" | "error" => Ok(StreamMessageStatus::ParseError),
+        _ => Err(ApiError::bad_request(format!(
+            "invalid message status: {raw}"
+        ))),
+    }
+}
+
 fn parse_slice_mode(raw: &str) -> Result<StreamSliceMode, ApiError> {
     match normalized_token(raw).as_str() {
         "raw" => Ok(StreamSliceMode::Raw),
@@ -1131,11 +1661,31 @@ fn parse_slice_mode(raw: &str) -> Result<StreamSliceMode, ApiError> {
     }
 }
 
+fn parse_transform_plan(raw: &str) -> Result<StreamTransformPlan, ApiError> {
+    let raw = raw
+        .trim()
+        .strip_prefix("chain:")
+        .or_else(|| raw.trim().strip_prefix("pipeline:"))
+        .unwrap_or_else(|| raw.trim());
+    let steps = raw
+        .split([',', '|', '+', '>'])
+        .map(str::trim)
+        .filter(|step| !step.is_empty())
+        .map(parse_transform_mode)
+        .collect::<Result<Vec<_>, _>>()?;
+    if steps.is_empty() {
+        Err(ApiError::bad_request("transform plan is empty"))
+    } else {
+        Ok(StreamTransformPlan::new(steps))
+    }
+}
+
 fn parse_transform_mode(raw: &str) -> Result<StreamTransformMode, ApiError> {
     match normalized_token(raw).as_str() {
         "auto" => Ok(StreamTransformMode::Auto),
         "url" | "url_decode" | "urldecode" => Ok(StreamTransformMode::UrlDecode),
         "gzip" => Ok(StreamTransformMode::Gzip),
+        "http_chunked" | "http-chunked" | "chunked" => Ok(StreamTransformMode::HttpChunked),
         "http_gzip" | "http-gzip" => Ok(StreamTransformMode::HttpGzip),
         "websocket_deflate" | "websocket-deflate" | "ws_deflate" | "ws-deflate" => {
             Ok(StreamTransformMode::WebSocketDeflate)
@@ -1155,6 +1705,24 @@ fn non_empty(value: Option<String>) -> Option<String> {
     })
 }
 
+fn json_scalar_to_string(value: &serde_json::Value) -> Result<String, ApiError> {
+    match value {
+        serde_json::Value::String(value) => {
+            let value = value.trim().to_owned();
+            if value.is_empty() {
+                Err(ApiError::bad_request("hide rule value is empty"))
+            } else {
+                Ok(value)
+            }
+        }
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        serde_json::Value::Bool(value) => Ok(value.to_string()),
+        _ => Err(ApiError::bad_request(
+            "hide rule value must be a string, number, or boolean",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,7 +1737,10 @@ mod tests {
 
     #[test]
     fn stream_query_keeps_view_defaults_when_params_are_absent() {
-        let query = StreamQueryParams::default().into_view_query().unwrap();
+        let profiles = ServiceProfileSet::builtin();
+        let query = StreamQueryParams::default()
+            .into_view_query(&profiles)
+            .unwrap();
         let default = StreamViewQuery::default();
 
         assert_eq!(default.cursor, query.cursor);
@@ -1179,11 +1750,71 @@ mod tests {
     }
 
     #[test]
+    fn stream_query_accepts_service_profile_filter() {
+        let profiles = ServiceProfileSet::builtin();
+        let query = StreamQueryParams {
+            profile: Some("http".to_owned()),
+            ..StreamQueryParams::default()
+        }
+        .into_view_query(&profiles)
+        .unwrap();
+
+        assert_eq!("http", query.profile.unwrap().id);
+    }
+
+    #[test]
+    fn parses_hide_rule_requests() {
+        let request = HideRuleRequest {
+            kind: "service".to_owned(),
+            value: serde_json::json!("http"),
+        };
+
+        assert_eq!(
+            StreamHideRule::Service("http".to_owned()),
+            request.into_rule().unwrap()
+        );
+    }
+
+    #[test]
     fn content_query_defaults_to_forward_text_slice() {
         let query = ContentQueryParams::default();
 
         assert_eq!(FlowDirection::AToB, query.direction().unwrap());
         assert_eq!(StreamSliceMode::Text, query.mode().unwrap());
+    }
+
+    #[test]
+    fn message_query_accepts_protocol_filters() {
+        let query = MessageQueryParams {
+            direction: Some("b_to_a".to_owned()),
+            protocol: Some("http1".to_owned()),
+            kind: Some("response".to_owned()),
+            status: Some("complete".to_owned()),
+            limit: Some(64),
+            ..MessageQueryParams::default()
+        }
+        .into_message_query()
+        .unwrap();
+
+        assert_eq!(Some(FlowDirection::BToA), query.direction);
+        assert_eq!(Some(StreamMessageProtocol::Http1), query.protocol);
+        assert_eq!(Some(StreamMessageKind::Response), query.kind);
+        assert_eq!(Some(StreamMessageStatus::Complete), query.status);
+        assert_eq!(64, query.limit);
+    }
+
+    #[test]
+    fn parses_transform_chains() {
+        let plan = parse_transform_plan("http_chunked,http_gzip,url_decode").unwrap();
+
+        assert_eq!(
+            vec![
+                StreamTransformMode::HttpChunked,
+                StreamTransformMode::HttpGzip,
+                StreamTransformMode::UrlDecode
+            ],
+            plan.steps
+        );
     }
 
     #[test]

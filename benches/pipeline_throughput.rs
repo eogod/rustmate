@@ -14,6 +14,7 @@ use rustmate::{
     sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig},
     stream_content::StreamContentConfig,
     stream_inventory::StreamInventoryConfig,
+    stream_parser::StreamParserConfig,
     stream_slice::StreamSliceConfig,
     stream_view::StreamViewConfig,
 };
@@ -113,6 +114,7 @@ fn pipeline_config(batch_size: usize) -> PipelineConfig {
             max_bytes_per_stream: 8 * 1024 * 1024,
             max_segment_bytes: 64 * 1024,
         },
+        stream_parser: StreamParserConfig::default(),
         stream_view: StreamViewConfig {
             enabled: true,
             max_streams: 131_072,

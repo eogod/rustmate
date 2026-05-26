@@ -18,6 +18,7 @@ pub enum StreamTransformMode {
     Auto,
     UrlDecode,
     Gzip,
+    HttpChunked,
     HttpGzip,
     WebSocketDeflate,
 }
@@ -27,6 +28,7 @@ pub enum StreamTransformMode {
 pub enum StreamTransformApplied {
     UrlDecode,
     Gzip,
+    HttpChunked,
     HttpGzip,
     WebSocketDeflate,
     None,
@@ -41,8 +43,35 @@ pub enum StreamTransformStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StreamTransformPlan {
+    pub steps: Vec<StreamTransformMode>,
+}
+
+impl StreamTransformPlan {
+    pub fn new(steps: Vec<StreamTransformMode>) -> Self {
+        Self { steps }
+    }
+
+    pub fn single(mode: StreamTransformMode) -> Self {
+        Self { steps: vec![mode] }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+}
+
+impl From<StreamTransformMode> for StreamTransformPlan {
+    fn from(mode: StreamTransformMode) -> Self {
+        Self::single(mode)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamTransformOutput {
     pub requested: StreamTransformMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_chain: Vec<StreamTransformMode>,
     pub applied: StreamTransformApplied,
     pub status: StreamTransformStatus,
     pub input_bytes: usize,
@@ -51,7 +80,20 @@ pub struct StreamTransformOutput {
     pub source_logical_start: Option<u64>,
     pub source_logical_end: Option<u64>,
     pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StreamTransformStep>,
     pub segments: Vec<StreamTransformSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StreamTransformStep {
+    pub requested: StreamTransformMode,
+    pub applied: StreamTransformApplied,
+    pub status: StreamTransformStatus,
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+    pub truncated_by_limit: bool,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -77,6 +119,15 @@ pub fn apply_transform(
     view_mode: StreamSliceMode,
     config: StreamTransformConfig,
 ) -> StreamTransformOutput {
+    apply_transform_plan(slice, requested.into(), view_mode, config)
+}
+
+pub fn apply_transform_plan(
+    slice: &StreamContentSlice,
+    plan: StreamTransformPlan,
+    view_mode: StreamSliceMode,
+    config: StreamTransformConfig,
+) -> StreamTransformOutput {
     let input = slice.concatenated_bytes();
     let source_logical_start = slice.segments.first().map(|segment| segment.logical_start);
     let source_logical_end = slice.segments.last().map(|segment| segment.logical_end);
@@ -84,27 +135,133 @@ pub fn apply_transform(
         max_output_bytes: config.max_output_bytes.max(1),
         hex_row_bytes: config.hex_row_bytes.clamp(1, 64),
     };
-
-    let outcome = match requested {
-        StreamTransformMode::Auto => auto_transform(&input, config.max_output_bytes),
-        StreamTransformMode::UrlDecode => url_decode_transform(&input),
-        StreamTransformMode::Gzip => gzip_transform(&input, config.max_output_bytes)
-            .map_applied(StreamTransformApplied::Gzip),
-        StreamTransformMode::HttpGzip => http_gzip_transform(&input, config.max_output_bytes),
-        StreamTransformMode::WebSocketDeflate => {
-            websocket_deflate_transform(&input, config.max_output_bytes)
-        }
-    };
-
-    output_from_outcome(
-        requested,
-        outcome,
-        input.len(),
+    let context = TransformOutputContext {
+        input_bytes: input.len(),
         source_logical_start,
         source_logical_end,
         view_mode,
         config,
-    )
+    };
+
+    let requested_chain = plan.steps;
+    let requested = requested_chain
+        .first()
+        .copied()
+        .unwrap_or(StreamTransformMode::Auto);
+
+    if requested_chain.is_empty() {
+        return output_from_outcome(
+            requested,
+            Vec::new(),
+            Vec::new(),
+            TransformOutcome::noop("empty transform plan"),
+            context,
+        );
+    }
+
+    let mut current = input.clone();
+    let mut steps = Vec::with_capacity(requested_chain.len());
+    let mut notes = Vec::new();
+    let mut applied = StreamTransformApplied::None;
+    let mut applied_count = 0usize;
+    let mut truncated_by_limit = false;
+    let mut failed = false;
+
+    for mode in &requested_chain {
+        let input_bytes = current.len();
+        let outcome = if requested_chain.len() > 1
+            && *mode == StreamTransformMode::UrlDecode
+            && !is_mostly_text(&current)
+        {
+            TransformOutcome::noop("chain URL decode was skipped for non-text input")
+        } else {
+            transform_step(&current, *mode, config.max_output_bytes)
+        };
+        let TransformOutcome {
+            applied: step_applied,
+            status,
+            bytes,
+            truncated_by_limit: step_truncated,
+            notes: step_notes,
+        } = outcome;
+        let output_bytes = bytes.len();
+
+        if !step_notes.is_empty() {
+            notes.push(format!(
+                "{}: {}",
+                transform_mode_name(*mode),
+                step_notes.join("; ")
+            ));
+        }
+
+        if status == StreamTransformStatus::Applied {
+            current = bytes;
+            applied = step_applied;
+            applied_count += 1;
+            truncated_by_limit |= step_truncated;
+        } else if status == StreamTransformStatus::Failed {
+            failed = true;
+        }
+
+        steps.push(StreamTransformStep {
+            requested: *mode,
+            applied: step_applied,
+            status,
+            input_bytes,
+            output_bytes,
+            truncated_by_limit: step_truncated,
+            notes: step_notes,
+        });
+
+        if failed {
+            break;
+        }
+    }
+
+    let status = if failed {
+        StreamTransformStatus::Failed
+    } else if applied_count == 0 {
+        StreamTransformStatus::Noop
+    } else {
+        StreamTransformStatus::Applied
+    };
+    let bytes = if status == StreamTransformStatus::Applied {
+        current
+    } else {
+        Vec::new()
+    };
+    let outcome = TransformOutcome {
+        applied: if status == StreamTransformStatus::Applied {
+            applied
+        } else {
+            StreamTransformApplied::None
+        },
+        status,
+        bytes,
+        truncated_by_limit,
+        notes,
+    };
+
+    output_from_outcome(requested, requested_chain, steps, outcome, context)
+}
+
+fn transform_step(
+    input: &[u8],
+    requested: StreamTransformMode,
+    max_output_bytes: usize,
+) -> TransformOutcome {
+    match requested {
+        StreamTransformMode::Auto => auto_transform(input, max_output_bytes),
+        StreamTransformMode::UrlDecode => url_decode_transform(input),
+        StreamTransformMode::Gzip => {
+            gzip_transform(input, max_output_bytes).map_applied(StreamTransformApplied::Gzip)
+        }
+        StreamTransformMode::HttpChunked => http_chunked_transform(input, max_output_bytes),
+        StreamTransformMode::HttpGzip => http_gzip_transform(input, max_output_bytes),
+        StreamTransformMode::WebSocketDeflate => {
+            websocket_deflate_transform(input, max_output_bytes)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -145,22 +302,29 @@ impl TransformOutcome {
     }
 }
 
-fn output_from_outcome(
-    requested: StreamTransformMode,
-    outcome: TransformOutcome,
+#[derive(Debug, Clone, Copy)]
+struct TransformOutputContext {
     input_bytes: usize,
     source_logical_start: Option<u64>,
     source_logical_end: Option<u64>,
     view_mode: StreamSliceMode,
     config: StreamTransformConfig,
+}
+
+fn output_from_outcome(
+    requested: StreamTransformMode,
+    requested_chain: Vec<StreamTransformMode>,
+    steps: Vec<StreamTransformStep>,
+    outcome: TransformOutcome,
+    context: TransformOutputContext,
 ) -> StreamTransformOutput {
     let segments = if outcome.status == StreamTransformStatus::Applied {
         vec![segment_from_bytes(
-            source_logical_start,
-            source_logical_end,
+            context.source_logical_start,
+            context.source_logical_end,
             &outcome.bytes,
-            view_mode,
-            config.hex_row_bytes,
+            context.view_mode,
+            context.config.hex_row_bytes,
         )]
     } else {
         Vec::new()
@@ -168,19 +332,26 @@ fn output_from_outcome(
 
     StreamTransformOutput {
         requested,
+        requested_chain,
         applied: outcome.applied,
         status: outcome.status,
-        input_bytes,
+        input_bytes: context.input_bytes,
         output_bytes: outcome.bytes.len(),
         truncated_by_limit: outcome.truncated_by_limit,
-        source_logical_start,
-        source_logical_end,
+        source_logical_start: context.source_logical_start,
+        source_logical_end: context.source_logical_end,
         notes: outcome.notes,
+        steps,
         segments,
     }
 }
 
 fn auto_transform(input: &[u8], max_output_bytes: usize) -> TransformOutcome {
+    let chunked = http_chunked_transform(input, max_output_bytes);
+    if chunked.status == StreamTransformStatus::Applied {
+        return chunked;
+    }
+
     let http = http_gzip_transform(input, max_output_bytes);
     if http.status == StreamTransformStatus::Applied {
         return http;
@@ -276,12 +447,16 @@ fn gzip_transform(input: &[u8], max_output_bytes: usize) -> TransformOutcome {
         Ok(LimitedRead {
             bytes,
             truncated_by_limit,
+            incomplete,
         }) => TransformOutcome {
             applied: StreamTransformApplied::Gzip,
             status: StreamTransformStatus::Applied,
             bytes,
             truncated_by_limit,
-            notes: Vec::new(),
+            notes: incomplete
+                .then(|| "gzip stream ended before trailer; decoded partial output".to_owned())
+                .into_iter()
+                .collect(),
         },
         Err(err) => TransformOutcome::failed(format!("gzip decode failed: {err}")),
     }
@@ -330,69 +505,129 @@ fn http_gzip_transform(input: &[u8], max_output_bytes: usize) -> TransformOutcom
     }
 }
 
+fn http_chunked_transform(input: &[u8], max_output_bytes: usize) -> TransformOutcome {
+    let Some((header_len, header_end)) = find_http_header_end(input) else {
+        return TransformOutcome::noop("no complete HTTP header was found");
+    };
+    let Ok(header_text) = std::str::from_utf8(&input[..header_len]) else {
+        return TransformOutcome::noop("HTTP header is not valid UTF-8");
+    };
+    if !looks_like_http_header(header_text) {
+        return TransformOutcome::noop("slice does not look like an HTTP message");
+    }
+    if !header_has_chunked_transfer_encoding(header_text) {
+        return TransformOutcome::noop("HTTP transfer-encoding is not chunked");
+    }
+
+    match decode_chunked_body(&input[header_end..], max_output_bytes) {
+        Ok(decoded) if decoded.chunks != 0 || decoded.reached_last_chunk => {
+            let mut bytes = Vec::with_capacity(header_end.saturating_add(decoded.bytes.len()));
+            bytes.extend_from_slice(&input[..header_end]);
+            bytes.extend_from_slice(&decoded.bytes);
+            let mut notes = vec![format!("decoded {} HTTP chunks", decoded.chunks)];
+            if decoded.partial {
+                notes.push("chunked body is incomplete; decoded available chunk data".to_owned());
+            }
+            if decoded.reached_last_chunk && decoded.trailing_bytes != 0 {
+                notes.push(format!("ignored {} trailer bytes", decoded.trailing_bytes));
+            }
+            TransformOutcome {
+                applied: StreamTransformApplied::HttpChunked,
+                status: StreamTransformStatus::Applied,
+                bytes,
+                truncated_by_limit: decoded.truncated_by_limit,
+                notes,
+            }
+        }
+        Ok(_) => TransformOutcome::noop("no HTTP chunk data was available"),
+        Err(err) => TransformOutcome::failed(format!("HTTP chunked decode failed: {err}")),
+    }
+}
+
 fn websocket_deflate_transform(input: &[u8], max_output_bytes: usize) -> TransformOutcome {
     let mut parser = WebSocketParser::new(input);
     let mut output = Vec::new();
-    let mut decoded_frames = 0usize;
-    let mut copied_frames = 0usize;
+    let mut current_message: Option<WebSocketMessageBuffer> = None;
+    let mut decoded_messages = 0usize;
+    let mut copied_messages = 0usize;
+    let mut control_frames = 0usize;
 
     while let Some(frame) = match parser.next_frame() {
         Ok(frame) => frame,
         Err(err) => return TransformOutcome::failed(err),
     } {
         if !matches!(frame.opcode, 0x0..=0x2) {
+            control_frames += 1;
             continue;
         }
 
-        if !output.is_empty() {
-            output.push(b'\n');
+        if frame.opcode == 0x0 {
+            let Some(message) = current_message.as_mut() else {
+                return TransformOutcome::failed(
+                    "websocket continuation frame arrived without a message".to_owned(),
+                );
+            };
+            message.payload.extend_from_slice(&frame.payload);
+        } else {
+            if current_message.is_some() {
+                return TransformOutcome::failed(
+                    "websocket data frame interrupted an unfinished fragmented message".to_owned(),
+                );
+            }
+            current_message = Some(WebSocketMessageBuffer {
+                compressed: frame.rsv1,
+                payload: frame.payload,
+            });
         }
 
-        if frame.rsv1 {
-            let mut payload = frame.payload;
-            payload.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
-            match read_limited(DeflateDecoder::new(payload.as_slice()), max_output_bytes) {
-                Ok(decoded) => {
-                    append_limited(&mut output, &decoded.bytes, max_output_bytes);
-                    decoded_frames += 1;
-                    if decoded.truncated_by_limit || output.len() >= max_output_bytes {
-                        return TransformOutcome {
-                            applied: StreamTransformApplied::WebSocketDeflate,
-                            status: StreamTransformStatus::Applied,
-                            bytes: output,
-                            truncated_by_limit: true,
-                            notes: vec![format!(
-                                "decoded {decoded_frames} compressed websocket frames"
-                            )],
-                        };
+        if frame.fin {
+            let Some(message) = current_message.take() else {
+                return TransformOutcome::failed("websocket message state is empty".to_owned());
+            };
+            if !output.is_empty() {
+                append_limited(&mut output, b"\n", max_output_bytes);
+            }
+            if message.compressed {
+                let mut payload = message.payload;
+                payload.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+                match read_limited(DeflateDecoder::new(payload.as_slice()), max_output_bytes) {
+                    Ok(decoded) => {
+                        append_limited(&mut output, &decoded.bytes, max_output_bytes);
+                        decoded_messages += 1;
+                    }
+                    Err(err) => {
+                        return TransformOutcome::failed(format!(
+                            "websocket deflate message decode failed: {err}"
+                        ));
                     }
                 }
-                Err(err) => {
-                    return TransformOutcome::failed(format!(
-                        "websocket deflate frame decode failed: {err}"
-                    ));
-                }
+            } else {
+                append_limited(&mut output, &message.payload, max_output_bytes);
+                copied_messages += 1;
             }
-        } else {
-            append_limited(&mut output, &frame.payload, max_output_bytes);
-            copied_frames += 1;
-        }
 
-        if output.len() >= max_output_bytes {
-            return TransformOutcome {
-                applied: StreamTransformApplied::WebSocketDeflate,
-                status: StreamTransformStatus::Applied,
-                bytes: output,
-                truncated_by_limit: true,
-                notes: vec![format!(
-                    "decoded {decoded_frames} compressed websocket frames and copied {copied_frames} plain frames"
-                )],
-            };
+            if output.len() >= max_output_bytes {
+                return TransformOutcome {
+                    applied: StreamTransformApplied::WebSocketDeflate,
+                    status: StreamTransformStatus::Applied,
+                    bytes: output,
+                    truncated_by_limit: true,
+                    notes: vec![websocket_note(
+                        decoded_messages,
+                        copied_messages,
+                        control_frames,
+                    )],
+                };
+            }
         }
     }
 
-    if decoded_frames == 0 {
-        return TransformOutcome::noop("no compressed websocket frames were found");
+    if current_message.is_some() {
+        return TransformOutcome::failed("truncated fragmented websocket message".to_owned());
+    }
+
+    if decoded_messages == 0 {
+        return TransformOutcome::noop("no compressed websocket messages were found");
     }
 
     TransformOutcome {
@@ -400,17 +635,36 @@ fn websocket_deflate_transform(input: &[u8], max_output_bytes: usize) -> Transfo
         status: StreamTransformStatus::Applied,
         bytes: output,
         truncated_by_limit: false,
-        notes: vec![format!(
-            "decoded {decoded_frames} compressed websocket frames and copied {copied_frames} plain frames"
+        notes: vec![websocket_note(
+            decoded_messages,
+            copied_messages,
+            control_frames,
         )],
     }
 }
 
 #[derive(Debug)]
 struct WebSocketFrame {
+    fin: bool,
     opcode: u8,
     rsv1: bool,
     payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct WebSocketMessageBuffer {
+    compressed: bool,
+    payload: Vec<u8>,
+}
+
+fn websocket_note(
+    decoded_messages: usize,
+    copied_messages: usize,
+    control_frames: usize,
+) -> String {
+    format!(
+        "decoded {decoded_messages} compressed websocket messages, copied {copied_messages} plain messages, skipped {control_frames} control frames"
+    )
 }
 
 struct WebSocketParser<'a> {
@@ -435,6 +689,7 @@ impl<'a> WebSocketParser<'a> {
         let second = self.input[self.offset + 1];
         self.offset += 2;
 
+        let fin = first & 0x80 != 0;
         let rsv1 = first & 0x40 != 0;
         let opcode = first & 0x0f;
         let masked = second & 0x80 != 0;
@@ -470,6 +725,7 @@ impl<'a> WebSocketParser<'a> {
         }
 
         Ok(Some(WebSocketFrame {
+            fin,
             opcode,
             rsv1,
             payload,
@@ -499,15 +755,24 @@ impl<'a> WebSocketParser<'a> {
 struct LimitedRead {
     bytes: Vec<u8>,
     truncated_by_limit: bool,
+    incomplete: bool,
 }
 
 fn read_limited<R: Read>(mut reader: R, max_output_bytes: usize) -> io::Result<LimitedRead> {
     let mut bytes = Vec::with_capacity(max_output_bytes.min(64 * 1024));
     let mut chunk = [0u8; 8192];
     let mut truncated_by_limit = false;
+    let mut incomplete = false;
 
     loop {
-        let read = reader.read(&mut chunk)?;
+        let read = match reader.read(&mut chunk) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && !bytes.is_empty() => {
+                incomplete = true;
+                break;
+            }
+            Err(err) => return Err(err),
+        };
         if read == 0 {
             break;
         }
@@ -522,7 +787,14 @@ fn read_limited<R: Read>(mut reader: R, max_output_bytes: usize) -> io::Result<L
 
         if bytes.len() == max_output_bytes {
             let mut probe = [0u8; 1];
-            truncated_by_limit = reader.read(&mut probe)? != 0;
+            truncated_by_limit = match reader.read(&mut probe) {
+                Ok(read) => read != 0,
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                    incomplete = true;
+                    false
+                }
+                Err(err) => return Err(err),
+            };
             break;
         }
     }
@@ -530,12 +802,128 @@ fn read_limited<R: Read>(mut reader: R, max_output_bytes: usize) -> io::Result<L
     Ok(LimitedRead {
         bytes,
         truncated_by_limit,
+        incomplete,
     })
 }
 
 fn append_limited(out: &mut Vec<u8>, bytes: &[u8], max_output_bytes: usize) {
     let remaining = max_output_bytes.saturating_sub(out.len());
     out.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+}
+
+#[derive(Debug)]
+struct ChunkedDecode {
+    bytes: Vec<u8>,
+    chunks: usize,
+    truncated_by_limit: bool,
+    partial: bool,
+    reached_last_chunk: bool,
+    trailing_bytes: usize,
+}
+
+fn decode_chunked_body(input: &[u8], max_output_bytes: usize) -> Result<ChunkedDecode, String> {
+    let mut bytes = Vec::with_capacity(max_output_bytes.min(input.len()));
+    let mut offset = 0usize;
+    let mut chunks = 0usize;
+    let mut truncated_by_limit = false;
+    let mut partial = false;
+    let mut reached_last_chunk = false;
+    let mut trailing_bytes = 0usize;
+
+    loop {
+        let Some((line_end, next_offset)) = find_line_end(input, offset) else {
+            partial = offset < input.len();
+            break;
+        };
+        let line = trim_ascii(&input[offset..line_end]);
+        if line.is_empty() {
+            return Err("empty chunk size line".to_owned());
+        }
+        let size = parse_chunk_size(line)?;
+        offset = next_offset;
+
+        if size == 0 {
+            reached_last_chunk = true;
+            trailing_bytes = input.len().saturating_sub(offset);
+            break;
+        }
+
+        let available = input.len().saturating_sub(offset);
+        let take = size.min(available);
+        let before = bytes.len();
+        append_limited(&mut bytes, &input[offset..offset + take], max_output_bytes);
+        truncated_by_limit |= bytes.len().saturating_sub(before) < take;
+        chunks += 1;
+        offset += take;
+
+        if take < size {
+            partial = true;
+            break;
+        }
+
+        if input.get(offset..offset + 2) == Some(b"\r\n") {
+            offset += 2;
+        } else if input.get(offset) == Some(&b'\n') {
+            offset += 1;
+        } else if offset == input.len() {
+            partial = true;
+            break;
+        } else {
+            return Err("chunk payload is not followed by CRLF".to_owned());
+        }
+
+        if bytes.len() >= max_output_bytes {
+            truncated_by_limit = offset < input.len();
+            break;
+        }
+    }
+
+    Ok(ChunkedDecode {
+        bytes,
+        chunks,
+        truncated_by_limit,
+        partial,
+        reached_last_chunk,
+        trailing_bytes,
+    })
+}
+
+fn find_line_end(input: &[u8], offset: usize) -> Option<(usize, usize)> {
+    input[offset..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|relative| {
+            let newline = offset + relative;
+            let line_end = if newline > offset && input[newline - 1] == b'\r' {
+                newline - 1
+            } else {
+                newline
+            };
+            (line_end, newline + 1)
+        })
+}
+
+fn parse_chunk_size(line: &[u8]) -> Result<usize, String> {
+    let size = line
+        .split(|byte| *byte == b';')
+        .next()
+        .map(trim_ascii)
+        .unwrap_or_default();
+    let size = std::str::from_utf8(size).map_err(|_| "chunk size is not UTF-8".to_owned())?;
+    usize::from_str_radix(size, 16).map_err(|_| format!("invalid chunk size: {size}"))
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
 }
 
 fn segment_from_bytes(
@@ -601,6 +989,29 @@ fn header_has_gzip_content_encoding(header: &str) -> bool {
                 .split(',')
                 .any(|encoding| encoding.trim().eq_ignore_ascii_case("gzip"))
     })
+}
+
+fn header_has_chunked_transfer_encoding(header: &str) -> bool {
+    header.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
+fn transform_mode_name(mode: StreamTransformMode) -> &'static str {
+    match mode {
+        StreamTransformMode::Auto => "auto",
+        StreamTransformMode::UrlDecode => "url_decode",
+        StreamTransformMode::Gzip => "gzip",
+        StreamTransformMode::HttpChunked => "http_chunked",
+        StreamTransformMode::HttpGzip => "http_gzip",
+        StreamTransformMode::WebSocketDeflate => "websocket_deflate",
+    }
 }
 
 fn is_gzip(bytes: &[u8]) -> bool {
@@ -787,6 +1198,84 @@ mod tests {
     }
 
     #[test]
+    fn decodes_http_chunked_body() {
+        let mut message = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        message.extend_from_slice(&chunked_body(&[
+            b"hello".as_slice(),
+            b" chunked".as_slice(),
+        ]));
+        let slice = test_slice(&message);
+        let output = apply_transform(
+            &slice,
+            StreamTransformMode::HttpChunked,
+            StreamSliceMode::Text,
+            config(),
+        );
+
+        assert_eq!(StreamTransformStatus::Applied, output.status);
+        assert_eq!(StreamTransformApplied::HttpChunked, output.applied);
+        match &output.segments[0].view {
+            StreamTransformSegmentView::Text { text, .. } => {
+                assert!(text.contains("hello chunked"));
+                assert!(!text.contains("\r\n0\r\n"));
+            }
+            _ => panic!("expected text transform"),
+        }
+    }
+
+    #[test]
+    fn transform_plan_decodes_chunked_gzip_url_encoded_http() {
+        let body = gzip_bytes(b"flag%7Bok%7D+done");
+        let mut message =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Encoding: gzip\r\n\r\n"
+                .to_vec();
+        message.extend_from_slice(&chunked_body(&[body.as_slice()]));
+        let slice = test_slice(&message);
+        let output = apply_transform_plan(
+            &slice,
+            StreamTransformPlan::new(vec![
+                StreamTransformMode::HttpChunked,
+                StreamTransformMode::HttpGzip,
+                StreamTransformMode::UrlDecode,
+            ]),
+            StreamSliceMode::Text,
+            config(),
+        );
+
+        assert_eq!(StreamTransformStatus::Applied, output.status);
+        assert_eq!(StreamTransformApplied::UrlDecode, output.applied);
+        assert_eq!(3, output.steps.len());
+        assert!(
+            output
+                .steps
+                .iter()
+                .all(|step| step.status == StreamTransformStatus::Applied)
+        );
+        match &output.segments[0].view {
+            StreamTransformSegmentView::Text { text, .. } => {
+                assert!(text.contains("flag{ok} done"));
+            }
+            _ => panic!("expected text transform"),
+        }
+    }
+
+    #[test]
+    fn gzip_decodes_output_without_trailer() {
+        let mut compressed = gzip_bytes(&[b'a'; 4096]);
+        compressed.truncate(compressed.len() - 8);
+        let slice = test_slice(&compressed);
+        let output = apply_transform(
+            &slice,
+            StreamTransformMode::Gzip,
+            StreamSliceMode::Text,
+            config(),
+        );
+
+        assert_eq!(StreamTransformStatus::Applied, output.status);
+        assert!(output.output_bytes > 0);
+    }
+
+    #[test]
     fn caps_gzip_output() {
         let compressed = gzip_bytes(&[b'a'; 128]);
         let slice = test_slice(&compressed);
@@ -832,6 +1321,17 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn chunked_body(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for chunk in chunks {
+            write!(&mut body, "{:x}\r\n", chunk.len()).unwrap();
+            body.extend_from_slice(chunk);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(b"0\r\n\r\n");
+        body
     }
 
     fn config() -> StreamTransformConfig {

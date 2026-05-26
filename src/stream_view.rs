@@ -8,6 +8,7 @@ use crate::{
     event::Event,
     flow::{Endpoint, FlowDirection, FlowKey},
     packet::TransportProtocol,
+    service_profile::{ServiceProfile, ServiceProfileSet, ServiceProfileStats},
 };
 
 const DEFAULT_QUERY_LIMIT: usize = 100;
@@ -52,6 +53,7 @@ pub struct StreamViewQuery {
     pub include_hidden: bool,
     pub only_favorites: bool,
     pub only_matched: bool,
+    pub profile: Option<ServiceProfile>,
     pub protocol: Option<TransportProtocol>,
     pub service: Option<String>,
     pub port: Option<u16>,
@@ -68,6 +70,7 @@ impl Default for StreamViewQuery {
             include_hidden: false,
             only_favorites: false,
             only_matched: false,
+            profile: None,
             protocol: None,
             service: None,
             port: None,
@@ -200,7 +203,8 @@ pub enum StreamPatternType {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum StreamHideRule {
     StreamId(u64),
     Service(String),
@@ -368,6 +372,52 @@ impl StreamViewState {
         self.hide_rules.clear();
     }
 
+    pub fn hide_rules(&self) -> &[StreamHideRule] {
+        &self.hide_rules
+    }
+
+    pub fn profile_stats(&self, profile: &ServiceProfile) -> ServiceProfileStats {
+        let mut stats = ServiceProfileStats::default();
+        if !self.config.enabled {
+            return stats;
+        }
+
+        for stream_id in &self.stream_order {
+            let Some(entry) = self.streams.get(stream_id) else {
+                continue;
+            };
+            if !matches_profile(entry, profile) {
+                continue;
+            }
+
+            stats.total_streams = stats.total_streams.saturating_add(1);
+            if entry.match_count != 0 {
+                stats.matched_streams = stats.matched_streams.saturating_add(1);
+            }
+            if self.favorites.contains(&entry.stream_id) {
+                stats.favorite_streams = stats.favorite_streams.saturating_add(1);
+            }
+            if self.hidden_reason(entry).is_some() {
+                stats.hidden_streams = stats.hidden_streams.saturating_add(1);
+            } else {
+                stats.visible_streams = stats.visible_streams.saturating_add(1);
+            }
+        }
+        stats
+    }
+
+    pub fn primary_profile<'a>(
+        &self,
+        profiles: &'a ServiceProfileSet,
+        stream_id: u64,
+    ) -> Option<&'a ServiceProfile> {
+        let entry = self.streams.get(&stream_id)?;
+        profiles
+            .profiles()
+            .iter()
+            .find(|profile| matches_profile(entry, profile))
+    }
+
     pub fn stats(&self) -> StreamViewStats {
         StreamViewStats {
             tracked_streams: self.streams.len(),
@@ -480,6 +530,13 @@ impl StreamViewState {
             return false;
         }
         if query.only_matched && entry.match_count == 0 {
+            return false;
+        }
+        if query
+            .profile
+            .as_ref()
+            .is_some_and(|profile| !matches_profile(entry, profile))
+        {
             return false;
         }
         if query
@@ -627,9 +684,10 @@ fn stream_id_hex(stream_id: u64) -> String {
 }
 
 impl StreamHideRule {
-    fn normalized(self) -> Self {
+    pub fn normalized(self) -> Self {
         match self {
             Self::Service(service) => Self::Service(service.to_ascii_lowercase()),
+            Self::PatternId(pattern_id) => Self::PatternId(pattern_id.trim().to_owned()),
             other => other,
         }
     }
@@ -646,7 +704,7 @@ impl StreamHideRule {
         }
     }
 
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         match self {
             Self::StreamId(stream_id) => format!("stream:{stream_id:016x}"),
             Self::Service(service) => format!("service:{service}"),
@@ -657,6 +715,44 @@ impl StreamHideRule {
             Self::PatternId(pattern_id) => format!("pattern:{pattern_id}"),
         }
     }
+}
+
+fn matches_profile(entry: &StreamViewEntry, profile: &ServiceProfile) -> bool {
+    if !profile.enabled {
+        return false;
+    }
+
+    if profile
+        .protocol
+        .is_some_and(|protocol| entry.protocol != protocol)
+    {
+        return false;
+    }
+
+    if profile.id == "matched" {
+        return entry.match_count != 0;
+    }
+
+    let service_matches = !profile.services.is_empty()
+        && profile
+            .services
+            .iter()
+            .any(|service| entry.service.name.eq_ignore_ascii_case(service));
+    let port_matches = !profile.ports.is_empty()
+        && profile
+            .ports
+            .iter()
+            .any(|port| entry.endpoint_a.port == *port || entry.endpoint_b.port == *port);
+    let content_matches = profile
+        .content_kind
+        .is_some_and(|kind| entry.content_kind == kind);
+    let pattern_matches = !profile.pattern_ids.is_empty()
+        && profile
+            .pattern_ids
+            .iter()
+            .any(|pattern_id| entry.pattern_ids.contains(pattern_id));
+
+    service_matches || port_matches || content_matches || pattern_matches
 }
 
 impl StreamViewStatus {
@@ -904,6 +1000,25 @@ mod tests {
         });
         assert_eq!(1, favorites.rows.len());
         assert_eq!(0x10, favorites.rows[0].stream_id);
+    }
+
+    #[test]
+    fn filters_streams_by_service_profile_before_pagination() {
+        let mut view = view();
+        view.observe_event(&stream_event(0x10, "dns", 53));
+        view.observe_event(&stream_event(0x20, "http", 8080));
+        view.observe_event(&stream_event(0x30, "tls", 443));
+        let profile = ServiceProfileSet::builtin().get("http").unwrap().clone();
+
+        let result = view.query(&StreamViewQuery {
+            profile: Some(profile),
+            limit: 1,
+            ..StreamViewQuery::default()
+        });
+
+        assert_eq!(1, result.rows.len());
+        assert_eq!(0x20, result.rows[0].stream_id);
+        assert_eq!(Some(2), result.next_cursor);
     }
 
     #[test]

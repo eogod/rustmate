@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     analyzers::Analyzer,
@@ -16,6 +16,8 @@ use crate::{
     pattern::{PatternEngine, PatternEngineConfig, PatternEngineStats},
     stream_content::{StreamContent, StreamContentConfig, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryConfig, StreamInventoryStats},
+    stream_message::{StreamMessageStats, StreamMessageStore},
+    stream_parser::{StreamParserConfig, StreamParserLayer, StreamParserStats},
     stream_slice::{
         StreamContentSlice, StreamSliceConfig, StreamSliceError, StreamSliceReader,
         StreamSliceRequest,
@@ -23,7 +25,7 @@ use crate::{
     stream_view::{StreamViewConfig, StreamViewState, StreamViewStats},
 };
 
-#[derive(Debug, Default, Clone, Copy, Serialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
 pub struct PipelineStats {
     pub workers: usize,
     pub batches: u64,
@@ -62,6 +64,23 @@ pub struct PipelineStats {
     pub content_truncated_streams: u64,
     pub content_updates: u64,
     pub content_merged_segments: u64,
+    pub message_active_streams: usize,
+    pub message_stored_messages: usize,
+    pub message_dropped_messages: u64,
+    pub message_observed_messages: u64,
+    pub message_http1_messages: u64,
+    pub message_parse_errors: u64,
+    pub parser_enabled: bool,
+    pub parser_stream_chunks: u64,
+    pub parser_stream_bytes: u64,
+    pub parser_emitted_messages: u64,
+    pub parser_dropped_messages: u64,
+    pub parser_active_states: usize,
+    pub parser_evicted_states: u64,
+    pub parser_http1_active_states: usize,
+    pub parser_http1_messages: u64,
+    pub parser_http1_parse_errors: u64,
+    pub parser_http1_dropped_chunks: u64,
     pub pattern_matches: u64,
     pub pattern_dropped_matches: u64,
     pub pattern_matched_streams: usize,
@@ -226,6 +245,63 @@ impl PipelineStats {
         self.view_evicted_streams = view_stats.evicted_streams;
         self.view_hide_rules = view_stats.hide_rules;
     }
+
+    pub(crate) fn set_stream_message_stats(&mut self, message_stats: StreamMessageStats) {
+        self.message_active_streams = message_stats.active_message_streams;
+        self.message_stored_messages = message_stats.stored_messages;
+        self.message_dropped_messages = message_stats.dropped_messages;
+        self.message_observed_messages = message_stats.observed_messages;
+        self.message_http1_messages = message_stats.http1_messages;
+        self.message_parse_errors = message_stats.parse_errors;
+    }
+
+    pub(crate) fn set_stream_parser_stats(&mut self, parser_stats: StreamParserStats) {
+        self.parser_enabled = parser_stats.parser_enabled;
+        self.parser_stream_chunks = parser_stats.parser_stream_chunks;
+        self.parser_stream_bytes = parser_stats.parser_stream_bytes;
+        self.parser_emitted_messages = parser_stats.parser_emitted_messages;
+        self.parser_dropped_messages = parser_stats.parser_dropped_messages;
+        self.parser_active_states = parser_stats.parser_active_states;
+        self.parser_evicted_states = parser_stats.parser_evicted_states;
+        self.parser_http1_active_states = parser_stats.http1_active_states;
+        self.parser_http1_messages = parser_stats.http1_messages;
+        self.parser_http1_parse_errors = parser_stats.http1_parse_errors;
+        self.parser_http1_dropped_chunks = parser_stats.http1_dropped_chunks;
+    }
+
+    pub(crate) fn add_stream_parser_stats(&mut self, parser_stats: StreamParserStats) {
+        self.parser_enabled |= parser_stats.parser_enabled;
+        self.parser_stream_chunks = self
+            .parser_stream_chunks
+            .saturating_add(parser_stats.parser_stream_chunks);
+        self.parser_stream_bytes = self
+            .parser_stream_bytes
+            .saturating_add(parser_stats.parser_stream_bytes);
+        self.parser_emitted_messages = self
+            .parser_emitted_messages
+            .saturating_add(parser_stats.parser_emitted_messages);
+        self.parser_dropped_messages = self
+            .parser_dropped_messages
+            .saturating_add(parser_stats.parser_dropped_messages);
+        self.parser_active_states = self
+            .parser_active_states
+            .saturating_add(parser_stats.parser_active_states);
+        self.parser_evicted_states = self
+            .parser_evicted_states
+            .saturating_add(parser_stats.parser_evicted_states);
+        self.parser_http1_active_states = self
+            .parser_http1_active_states
+            .saturating_add(parser_stats.http1_active_states);
+        self.parser_http1_messages = self
+            .parser_http1_messages
+            .saturating_add(parser_stats.http1_messages);
+        self.parser_http1_parse_errors = self
+            .parser_http1_parse_errors
+            .saturating_add(parser_stats.http1_parse_errors);
+        self.parser_http1_dropped_chunks = self
+            .parser_http1_dropped_chunks
+            .saturating_add(parser_stats.http1_dropped_chunks);
+    }
 }
 
 pub struct Pipeline {
@@ -236,6 +312,8 @@ pub struct Pipeline {
     flow_table: FlowTable,
     stream_inventory: StreamInventory,
     stream_content: StreamContent,
+    stream_parser: StreamParserLayer,
+    stream_messages: StreamMessageStore,
     live_content: Option<Arc<RwLock<StreamContent>>>,
     pattern_engine: PatternEngine,
     stream_view: StreamViewState,
@@ -254,6 +332,7 @@ pub struct PipelineConfig {
     pub max_tcp_out_of_order_segments_per_direction: usize,
     pub stream_inventory: StreamInventoryConfig,
     pub stream_content: StreamContentConfig,
+    pub stream_parser: StreamParserConfig,
     pub stream_view: StreamViewConfig,
     pub stream_slice: StreamSliceConfig,
 }
@@ -273,6 +352,8 @@ impl Pipeline {
             )),
             stream_inventory: StreamInventory::new(config.stream_inventory),
             stream_content: StreamContent::new(config.stream_content),
+            stream_parser: StreamParserLayer::new(config.stream_parser),
+            stream_messages: StreamMessageStore::default(),
             live_content: None,
             pattern_engine: PatternEngine::new(PatternEngineConfig::disabled()),
             stream_view: StreamViewState::new(config.stream_view),
@@ -321,10 +402,18 @@ impl Pipeline {
         .slice(request)
     }
 
-    pub fn into_api_parts(self) -> (StreamContent, StreamViewState, StreamSliceConfig) {
+    pub fn into_api_parts(
+        self,
+    ) -> (
+        StreamContent,
+        StreamViewState,
+        StreamMessageStore,
+        StreamSliceConfig,
+    ) {
         (
             self.stream_content,
             self.stream_view,
+            self.stream_messages,
             self.config.stream_slice,
         )
     }
@@ -391,9 +480,12 @@ impl Pipeline {
         stats.set_flow_table_stats(self.flow_table.stats());
         stats.set_stream_inventory_stats(self.stream_inventory.stats());
         stats.set_stream_content_stats(self.stream_content_stats());
+        stats.set_stream_parser_stats(self.stream_parser.stats());
         stats.set_pattern_stats(self.pattern_engine.stats());
         self.stream_view.observe_events(&self.events);
+        self.stream_messages.observe_events(&self.events);
         stats.set_stream_view_stats(self.stream_view.stats());
+        stats.set_stream_message_stats(self.stream_messages.stats());
         if let Some(live_api) = &self.live_api {
             live_api.publish_events(&self.events, *stats);
         }
@@ -420,6 +512,8 @@ impl Pipeline {
                     .and_then(|flow| flow.tcp.as_ref().map(|tcp| (flow, tcp)))
                 {
                     for chunk in &flow.1.stream_chunks {
+                        self.stream_parser
+                            .observe_stream(&packet, flow.0, chunk, &mut self.events);
                         for analyzer in &mut self.analyzers {
                             analyzer.analyze_stream(&packet, flow.0, chunk, &mut self.events);
                         }
@@ -486,6 +580,7 @@ mod tests {
         output::EventSink,
         packet::{LinkLayer, PacketTimestamp},
         pattern::{PatternDefinition, PatternEngineConfig},
+        stream_parser::StreamParserConfig,
         stream_slice::{
             StreamSliceConfig, StreamSliceMode, StreamSliceRequest, StreamSliceSegmentView,
         },
@@ -507,6 +602,7 @@ mod tests {
             max_tcp_out_of_order_segments_per_direction: 16,
             stream_inventory: test_stream_inventory_config(),
             stream_content: test_stream_content_config(),
+            stream_parser: StreamParserConfig::disabled(),
             stream_view: test_stream_view_config(),
             stream_slice: test_stream_slice_config(),
         });
@@ -667,6 +763,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn indexes_protocol_messages_in_pipeline_stats() {
+        let mut pipeline = test_pipeline();
+        pipeline.stream_parser = StreamParserLayer::default();
+
+        let stats = pipeline
+            .run_with_source(VecPacketSource::new(vec![tcp_packet(
+                100,
+                b"GET /messages HTTP/1.1\r\nHost: ctf.local\r\n\r\n",
+            )]))
+            .await
+            .unwrap();
+
+        assert_eq!(1, stats.message_active_streams);
+        assert_eq!(1, stats.message_observed_messages);
+        assert_eq!(1, stats.message_stored_messages);
+        assert_eq!(1, stats.message_http1_messages);
+        assert_eq!(0, stats.message_parse_errors);
+        assert_eq!(1, stats.parser_emitted_messages);
+        assert_eq!(1, stats.parser_http1_messages);
+    }
+
     struct StreamCollector {
         chunks: Arc<Mutex<Vec<Vec<u8>>>>,
     }
@@ -767,6 +885,7 @@ mod tests {
             max_tcp_out_of_order_segments_per_direction: 16,
             stream_inventory: test_stream_inventory_config(),
             stream_content: test_stream_content_config(),
+            stream_parser: StreamParserConfig::disabled(),
             stream_view: test_stream_view_config(),
             stream_slice: test_stream_slice_config(),
         })

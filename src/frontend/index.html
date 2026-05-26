@@ -27,9 +27,14 @@
       <main class="workspace">
         <section class="stream-pane">
           <div class="toolbar">
+            <select id="filter-profile" aria-label="Profile">
+              <option value="">all profiles</option>
+            </select>
             <input id="filter-service" placeholder="service" autocomplete="off" />
             <input id="filter-port" placeholder="port" inputmode="numeric" autocomplete="off" />
-            <button id="toggle-matched" type="button" aria-pressed="true">matched</button>
+            <button id="toggle-favorites" type="button" aria-pressed="false">favorites</button>
+            <button id="toggle-matched" type="button" aria-pressed="false">matched</button>
+            <button id="toggle-hidden" type="button" aria-pressed="false">hidden</button>
             <button id="reload-streams" type="button">reload</button>
           </div>
           <div class="table-wrap">
@@ -55,6 +60,9 @@
               <p id="stream-subtitle">Select a row to inspect content</p>
             </div>
             <div class="detail-actions">
+              <button id="favorite-stream" type="button" aria-pressed="false">favorite</button>
+              <button id="hide-stream" type="button" aria-pressed="false">hide</button>
+              <button id="hide-service" type="button">hide service</button>
               <select id="direction-select" aria-label="Direction">
                 <option value="a_to_b">a to b</option>
                 <option value="b_to_a">b to a</option>
@@ -66,9 +74,12 @@
               </select>
               <select id="transform-select" aria-label="Transform">
                 <option value="">raw bytes</option>
+                <option value="profile">profile transform</option>
+                <option value="http_chunked,http_gzip,url_decode">http v2 chain</option>
                 <option value="auto">auto transform</option>
                 <option value="url_decode">url decode</option>
                 <option value="gzip">gzip</option>
+                <option value="http_chunked">http chunked</option>
                 <option value="http_gzip">http gzip</option>
                 <option value="websocket_deflate">ws deflate</option>
               </select>
@@ -77,9 +88,18 @@
 
           <div class="content-tools">
             <button id="slice-prev" type="button">prev</button>
+            <button id="match-prev" type="button">prev match</button>
             <label>offset <input id="slice-start" value="0" inputmode="numeric" /></label>
             <label>bytes <input id="slice-len" value="65536" inputmode="numeric" /></label>
+            <button id="match-next" type="button">next match</button>
             <button id="slice-next" type="button">next</button>
+            <select id="copy-format" aria-label="Copy format">
+              <option value="view">view</option>
+              <option value="text">text</option>
+              <option value="decoded">decoded</option>
+              <option value="hex">hex</option>
+              <option value="base64">base64</option>
+            </select>
             <button id="copy-content" type="button">copy</button>
           </div>
 

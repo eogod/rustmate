@@ -1,0 +1,1244 @@
+use std::{
+    collections::{BTreeMap, HashSet},
+    hint::black_box,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use etherparse::PacketBuilder;
+use pcap::Linktype;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    analyzers::{dns::DnsAnalyzer, http::HttpAnalyzer, tls_meta::TlsMetaAnalyzer},
+    config::RunMode,
+    event::Event,
+    flow::FlowKey,
+    ingest::{PacketBatch, PacketSource},
+    output::EventSink,
+    packet::{DecodedPacket, LinkLayer, PacketTimestamp, RawPacket},
+    pipeline::{Pipeline, PipelineConfig, PipelineStats},
+    sharded_pipeline::{
+        ShardedPipeline, ShardedPipelineConfig, resolve_worker_count, shard_for_flow_key,
+    },
+    stream_content::StreamContentConfig,
+    stream_inventory::StreamInventoryConfig,
+    stream_parser::StreamParserConfig,
+    stream_slice::StreamSliceConfig,
+    stream_view::StreamViewConfig,
+};
+
+const DEFAULT_MAX_FLOWS: usize = 1_048_576;
+const DEFAULT_FLOW_IDLE_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_TCP_BUFFERED_BYTES_PER_FLOW: usize = 1 << 20;
+const DEFAULT_TCP_OUT_OF_ORDER_SEGMENTS: usize = 128;
+const DEFAULT_MAX_STREAM_CONTENT_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfFixtureKind {
+    HttpRequests,
+    OutOfOrderHttp,
+    HttpKeepAlive,
+    MixedServices,
+}
+
+impl PerfFixtureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HttpRequests => "http_requests",
+            Self::OutOfOrderHttp => "out_of_order_http",
+            Self::HttpKeepAlive => "http_keep_alive",
+            Self::MixedServices => "mixed_services",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PerfInput {
+    pub name: String,
+    pub source: PerfInputSource,
+    pub flows: Option<usize>,
+    pub messages_per_flow: Option<usize>,
+    packets: Arc<[RawPacket]>,
+    packet_count: usize,
+    byte_count: u64,
+}
+
+impl PerfInput {
+    pub fn synthetic(fixture: PerfFixtureKind, flows: usize, messages_per_flow: usize) -> Self {
+        let flows = flows.max(1);
+        let messages_per_flow = messages_per_flow.max(1);
+        let packets = generate_fixture(fixture, flows, messages_per_flow);
+        Self::from_packets(
+            fixture.as_str().to_owned(),
+            PerfInputSource::Synthetic { fixture },
+            Some(flows),
+            Some(messages_per_flow),
+            packets,
+        )
+    }
+
+    pub fn from_pcap(name: impl Into<String>, packets: Vec<RawPacket>) -> Self {
+        Self::from_packets(name.into(), PerfInputSource::Pcap, None, None, packets)
+    }
+
+    pub fn from_packets(
+        name: String,
+        source: PerfInputSource,
+        flows: Option<usize>,
+        messages_per_flow: Option<usize>,
+        packets: Vec<RawPacket>,
+    ) -> Self {
+        let packet_count = packets.len();
+        let byte_count = packets.iter().map(|packet| packet.data.len() as u64).sum();
+        Self {
+            name,
+            source,
+            flows,
+            messages_per_flow,
+            packets: Arc::from(packets.into_boxed_slice()),
+            packet_count,
+            byte_count,
+        }
+    }
+
+    pub fn packet_count(&self) -> usize {
+        self.packet_count
+    }
+
+    pub fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
+    pub fn diagnostics(&self, worker_count: usize) -> PerfRunDiagnostics {
+        let shard_count = worker_count.max(1);
+        let mut shards = (0..shard_count)
+            .map(|shard| ShardAccumulator {
+                shard,
+                packets: 0,
+                bytes: 0,
+                flows: HashSet::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut routed_packets = 0u64;
+        let mut fallback_packets = 0u64;
+        let mut all_flows = HashSet::new();
+
+        for (sequence, packet) in self.packets.iter().enumerate() {
+            let decoded = DecodedPacket::from_raw(packet);
+            let route = FlowKey::from_packet(&decoded).map(|(key, _)| key);
+            let shard = if let Some(flow_key) = route {
+                routed_packets = routed_packets.saturating_add(1);
+                all_flows.insert(flow_key);
+                let shard = shard_for_flow_key(&flow_key, shard_count);
+                if let Some(accumulator) = shards.get_mut(shard) {
+                    accumulator.flows.insert(flow_key);
+                }
+                shard
+            } else {
+                fallback_packets = fallback_packets.saturating_add(1);
+                sequence % shard_count
+            };
+
+            if let Some(accumulator) = shards.get_mut(shard) {
+                accumulator.packets = accumulator.packets.saturating_add(1);
+                accumulator.bytes = accumulator.bytes.saturating_add(packet.data.len() as u64);
+            }
+        }
+
+        let shards = shards
+            .into_iter()
+            .map(|shard| PerfShardLoad {
+                shard: shard.shard,
+                packets: shard.packets,
+                bytes: shard.bytes,
+                unique_flows: shard.flows.len(),
+            })
+            .collect::<Vec<_>>();
+
+        PerfRunDiagnostics {
+            shard_count,
+            routed_packets,
+            fallback_packets,
+            unique_flows: all_flows.len(),
+            packet_skew: skew(shards.iter().map(|shard| shard.packets)),
+            byte_skew: skew(shards.iter().map(|shard| shard.bytes)),
+            shards,
+        }
+    }
+
+    pub fn plan_workers(&self, config: PerfWorkerPlannerConfig) -> PerfWorkerPlan {
+        let available_workers = resolve_worker_count(0);
+        let max_workers = if config.max_workers == 0 {
+            available_workers
+        } else {
+            config.max_workers.min(available_workers).max(1)
+        };
+        let candidate_counts = worker_candidates(max_workers);
+        let mut candidates = Vec::with_capacity(candidate_counts.len());
+
+        for workers in candidate_counts {
+            let diagnostics = self.diagnostics(workers);
+            let packets_per_worker = self.packet_count / workers.max(1);
+            let flows_per_worker = diagnostics.unique_flows / workers.max(1);
+            let (eligible, reason) = worker_candidate_reason(
+                workers,
+                packets_per_worker,
+                flows_per_worker,
+                &diagnostics,
+                config,
+            );
+            candidates.push(PerfWorkerCandidate {
+                workers,
+                eligible,
+                reason,
+                diagnostics,
+            });
+        }
+
+        let selected_workers = candidates
+            .iter()
+            .filter(|candidate| candidate.eligible)
+            .map(|candidate| candidate.workers)
+            .max()
+            .unwrap_or(1);
+        let reason = candidates
+            .iter()
+            .find(|candidate| candidate.workers == selected_workers)
+            .map(|candidate| candidate.reason.clone())
+            .unwrap_or_else(|| "fallback to one worker".to_owned());
+
+        PerfWorkerPlan {
+            selected_workers,
+            available_workers,
+            max_workers,
+            reason,
+            candidates,
+        }
+    }
+}
+
+struct ShardAccumulator {
+    shard: usize,
+    packets: u64,
+    bytes: u64,
+    flows: HashSet<FlowKey>,
+}
+
+fn worker_candidates(max_workers: usize) -> Vec<usize> {
+    let mut candidates = Vec::new();
+    let mut workers = 1usize;
+    while workers < max_workers {
+        candidates.push(workers);
+        workers = workers.saturating_mul(2);
+    }
+    candidates.push(max_workers.max(1));
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+fn worker_candidate_reason(
+    workers: usize,
+    packets_per_worker: usize,
+    flows_per_worker: usize,
+    diagnostics: &PerfRunDiagnostics,
+    config: PerfWorkerPlannerConfig,
+) -> (bool, String) {
+    if workers == 1 {
+        return (true, "single worker is always valid".to_owned());
+    }
+    if packets_per_worker < config.min_packets_per_worker {
+        return (
+            false,
+            format!(
+                "too few packets per worker: {packets_per_worker} < {}",
+                config.min_packets_per_worker
+            ),
+        );
+    }
+    if flows_per_worker < config.min_flows_per_worker {
+        return (
+            false,
+            format!(
+                "too few routed flows per worker: {flows_per_worker} < {}",
+                config.min_flows_per_worker
+            ),
+        );
+    }
+    if diagnostics.packet_skew.max_over_average > config.max_packet_skew {
+        return (
+            false,
+            format!(
+                "packet skew too high: {:.2}x > {:.2}x",
+                diagnostics.packet_skew.max_over_average, config.max_packet_skew
+            ),
+        );
+    }
+    if diagnostics.byte_skew.max_over_average > config.max_byte_skew {
+        return (
+            false,
+            format!(
+                "byte skew too high: {:.2}x > {:.2}x",
+                diagnostics.byte_skew.max_over_average, config.max_byte_skew
+            ),
+        );
+    }
+
+    (
+        true,
+        format!(
+            "eligible: {packets_per_worker} packets/worker, {flows_per_worker} flows/worker, packet skew {:.2}x, byte skew {:.2}x",
+            diagnostics.packet_skew.max_over_average, diagnostics.byte_skew.max_over_average
+        ),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PerfInputSource {
+    Synthetic { fixture: PerfFixtureKind },
+    Pcap,
+}
+
+#[derive(Debug, Clone)]
+pub struct PerfHarnessConfig {
+    pub runs: usize,
+    pub warmups: usize,
+    pub worker_counts: Vec<usize>,
+    pub include_warmups: bool,
+    pub batch_size: usize,
+    pub worker_queue_depth: usize,
+    pub event_queue_depth: usize,
+    pub max_flows: usize,
+    pub stream_content_bytes: usize,
+    pub stream_content_bytes_per_stream: usize,
+    pub worker_planner: PerfWorkerPlannerConfig,
+}
+
+impl Default for PerfHarnessConfig {
+    fn default() -> Self {
+        Self {
+            runs: 3,
+            warmups: 1,
+            worker_counts: vec![1, 0],
+            include_warmups: false,
+            batch_size: 4096,
+            worker_queue_depth: 8192,
+            event_queue_depth: 8192,
+            max_flows: DEFAULT_MAX_FLOWS,
+            stream_content_bytes: DEFAULT_MAX_STREAM_CONTENT_BYTES,
+            stream_content_bytes_per_stream: DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM,
+            worker_planner: PerfWorkerPlannerConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfRunReport {
+    pub schema_version: u8,
+    pub input: PerfInputReport,
+    pub run: PerfRunMeta,
+    #[serde(default)]
+    pub diagnostics: PerfRunDiagnostics,
+    pub elapsed_ms: f64,
+    pub rates: PerfRates,
+    pub stats: PipelineStats,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfInputReport {
+    pub name: String,
+    pub source: PerfInputSource,
+    pub flows: Option<usize>,
+    pub messages_per_flow: Option<usize>,
+    pub packets: usize,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfRunMeta {
+    pub workers: usize,
+    pub requested_workers: usize,
+    pub run_index: usize,
+    pub warmup: bool,
+    pub batch_size: usize,
+    pub worker_queue_depth: usize,
+    pub event_queue_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct PerfRates {
+    pub packets_per_sec: f64,
+    pub bytes_per_sec: f64,
+    pub mb_per_sec: f64,
+    pub events_per_sec: f64,
+    pub stream_bytes_per_sec: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfRunDiagnostics {
+    pub shard_count: usize,
+    pub routed_packets: u64,
+    pub fallback_packets: u64,
+    pub unique_flows: usize,
+    pub packet_skew: PerfSkew,
+    pub byte_skew: PerfSkew,
+    pub shards: Vec<PerfShardLoad>,
+}
+
+impl Default for PerfRunDiagnostics {
+    fn default() -> Self {
+        Self {
+            shard_count: 1,
+            routed_packets: 0,
+            fallback_packets: 0,
+            unique_flows: 0,
+            packet_skew: PerfSkew::default(),
+            byte_skew: PerfSkew::default(),
+            shards: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct PerfSkew {
+    pub min: u64,
+    pub max: u64,
+    pub average: f64,
+    pub max_over_average: f64,
+    pub max_over_min: Option<f64>,
+}
+
+impl Default for PerfSkew {
+    fn default() -> Self {
+        Self {
+            min: 0,
+            max: 0,
+            average: 0.0,
+            max_over_average: 0.0,
+            max_over_min: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfShardLoad {
+    pub shard: usize,
+    pub packets: u64,
+    pub bytes: u64,
+    pub unique_flows: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfSuiteReport {
+    pub summary: PerfSuiteSummary,
+    pub runs: Vec<PerfRunReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<PerfBaselineComparison>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfSuiteSummary {
+    pub input: PerfInputReport,
+    #[serde(default)]
+    pub worker_plan: PerfWorkerPlan,
+    pub aggregates: Vec<PerfAggregate>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfAggregate {
+    pub workers: usize,
+    pub runs: usize,
+    pub packets_per_sec_min: f64,
+    pub packets_per_sec_avg: f64,
+    pub packets_per_sec_median: f64,
+    pub packets_per_sec_max: f64,
+    pub mb_per_sec_avg: f64,
+    pub elapsed_ms_avg: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PerfWorkerPlannerConfig {
+    pub max_workers: usize,
+    pub min_packets_per_worker: usize,
+    pub min_flows_per_worker: usize,
+    pub max_packet_skew: f64,
+    pub max_byte_skew: f64,
+}
+
+impl Default for PerfWorkerPlannerConfig {
+    fn default() -> Self {
+        Self {
+            max_workers: 0,
+            min_packets_per_worker: 4096,
+            min_flows_per_worker: 8,
+            max_packet_skew: 2.5,
+            max_byte_skew: 3.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfWorkerPlan {
+    pub selected_workers: usize,
+    pub available_workers: usize,
+    pub max_workers: usize,
+    pub reason: String,
+    pub candidates: Vec<PerfWorkerCandidate>,
+}
+
+impl Default for PerfWorkerPlan {
+    fn default() -> Self {
+        Self {
+            selected_workers: 1,
+            available_workers: 1,
+            max_workers: 1,
+            reason: "planner data unavailable".to_owned(),
+            candidates: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfWorkerCandidate {
+    pub workers: usize,
+    pub eligible: bool,
+    pub reason: String,
+    pub diagnostics: PerfRunDiagnostics,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfBaselineComparison {
+    pub metric: String,
+    pub max_regression_pct: f64,
+    pub current_input: PerfInputReport,
+    pub baseline_input: PerfInputReport,
+    pub failed: bool,
+    pub results: Vec<PerfBaselineResult>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PerfBaselineResult {
+    pub workers: usize,
+    pub status: PerfBaselineStatus,
+    pub baseline_value: Option<f64>,
+    pub current_value: Option<f64>,
+    pub delta_pct: Option<f64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfBaselineStatus {
+    Pass,
+    Regression,
+    MissingBaseline,
+}
+
+pub async fn run_perf_suite(
+    input: &PerfInput,
+    config: &PerfHarnessConfig,
+) -> Result<PerfSuiteReport> {
+    let mut reports = Vec::new();
+    let worker_counts = if config.worker_counts.is_empty() {
+        vec![1]
+    } else {
+        config.worker_counts.clone()
+    };
+    let total_runs = config.runs.max(1).saturating_add(config.warmups);
+
+    for requested_workers in worker_counts {
+        for index in 0..total_runs {
+            let warmup = index < config.warmups;
+            let report = run_once(input, config, requested_workers, index, warmup).await?;
+            if config.include_warmups || !warmup {
+                reports.push(report);
+            }
+        }
+    }
+
+    Ok(PerfSuiteReport {
+        summary: summarize(input, &reports, input.plan_workers(config.worker_planner)),
+        runs: reports,
+        comparison: None,
+    })
+}
+
+async fn run_once(
+    input: &PerfInput,
+    config: &PerfHarnessConfig,
+    requested_workers: usize,
+    run_index: usize,
+    warmup: bool,
+) -> Result<PerfRunReport> {
+    let workers = resolve_worker_count(requested_workers);
+    let packets = Arc::clone(&input.packets);
+    let diagnostics = input.diagnostics(workers);
+    let started = Instant::now();
+    let stats = if workers <= 1 {
+        run_single_thread(packets, config).await?
+    } else {
+        run_sharded(packets, config, workers).await?
+    };
+    let elapsed = started.elapsed();
+    Ok(report_from_stats(
+        input,
+        config,
+        PerfMeasurement {
+            requested_workers,
+            workers,
+            run_index,
+            warmup,
+            elapsed,
+            diagnostics,
+            stats,
+        },
+    ))
+}
+
+async fn run_single_thread(
+    packets: Arc<[RawPacket]>,
+    config: &PerfHarnessConfig,
+) -> Result<PipelineStats> {
+    let mut pipeline = Pipeline::new(pipeline_config(config));
+    register_analyzers(&mut pipeline);
+    pipeline.register_sink(Box::<CountingSink>::default());
+    pipeline
+        .run_with_source(ArcPacketSource::new(packets))
+        .await
+        .context("single-thread perf run failed")
+}
+
+async fn run_sharded(
+    packets: Arc<[RawPacket]>,
+    config: &PerfHarnessConfig,
+    workers: usize,
+) -> Result<PipelineStats> {
+    let mut pipeline = ShardedPipeline::new(ShardedPipelineConfig {
+        pipeline: pipeline_config(config),
+        worker_count: workers,
+        worker_queue_depth: config.worker_queue_depth.max(1),
+        event_queue_depth: config.event_queue_depth.max(1),
+    });
+    register_sharded_analyzers(&mut pipeline);
+    pipeline.register_sink(Box::<CountingSink>::default());
+    pipeline
+        .run_with_source(ArcPacketSource::new(packets))
+        .await
+        .context("sharded perf run failed")
+}
+
+struct PerfMeasurement {
+    requested_workers: usize,
+    workers: usize,
+    run_index: usize,
+    warmup: bool,
+    elapsed: Duration,
+    diagnostics: PerfRunDiagnostics,
+    stats: PipelineStats,
+}
+
+fn report_from_stats(
+    input: &PerfInput,
+    config: &PerfHarnessConfig,
+    measurement: PerfMeasurement,
+) -> PerfRunReport {
+    let elapsed_secs = measurement.elapsed.as_secs_f64().max(f64::EPSILON);
+    PerfRunReport {
+        schema_version: 1,
+        input: input_report(input),
+        run: PerfRunMeta {
+            workers: measurement.workers,
+            requested_workers: measurement.requested_workers,
+            run_index: measurement.run_index,
+            warmup: measurement.warmup,
+            batch_size: config.batch_size.max(1),
+            worker_queue_depth: config.worker_queue_depth.max(1),
+            event_queue_depth: config.event_queue_depth.max(1),
+        },
+        diagnostics: measurement.diagnostics,
+        elapsed_ms: elapsed_secs * 1000.0,
+        rates: PerfRates {
+            packets_per_sec: measurement.stats.packets as f64 / elapsed_secs,
+            bytes_per_sec: measurement.stats.bytes as f64 / elapsed_secs,
+            mb_per_sec: measurement.stats.bytes as f64 / elapsed_secs / 1_000_000.0,
+            events_per_sec: measurement.stats.events as f64 / elapsed_secs,
+            stream_bytes_per_sec: measurement.stats.tcp_stream_bytes as f64 / elapsed_secs,
+        },
+        stats: measurement.stats,
+    }
+}
+
+pub fn summarize(
+    input: &PerfInput,
+    reports: &[PerfRunReport],
+    worker_plan: PerfWorkerPlan,
+) -> PerfSuiteSummary {
+    let mut by_workers: BTreeMap<usize, Vec<&PerfRunReport>> = BTreeMap::new();
+    for report in reports.iter().filter(|report| !report.run.warmup) {
+        by_workers
+            .entry(report.run.workers)
+            .or_default()
+            .push(report);
+    }
+
+    let aggregates = by_workers
+        .into_iter()
+        .map(|(workers, reports)| aggregate(workers, &reports))
+        .collect();
+
+    PerfSuiteSummary {
+        input: input_report(input),
+        worker_plan,
+        aggregates,
+    }
+}
+
+fn aggregate(workers: usize, reports: &[&PerfRunReport]) -> PerfAggregate {
+    let mut packets_per_sec = reports
+        .iter()
+        .map(|report| report.rates.packets_per_sec)
+        .collect::<Vec<_>>();
+    packets_per_sec.sort_by(f64::total_cmp);
+    let runs = reports.len();
+    let packets_per_sec_avg = average(&packets_per_sec);
+    PerfAggregate {
+        workers,
+        runs,
+        packets_per_sec_min: packets_per_sec.first().copied().unwrap_or(0.0),
+        packets_per_sec_avg,
+        packets_per_sec_median: median(&packets_per_sec),
+        packets_per_sec_max: packets_per_sec.last().copied().unwrap_or(0.0),
+        mb_per_sec_avg: reports
+            .iter()
+            .map(|report| report.rates.mb_per_sec)
+            .sum::<f64>()
+            / runs.max(1) as f64,
+        elapsed_ms_avg: reports.iter().map(|report| report.elapsed_ms).sum::<f64>()
+            / runs.max(1) as f64,
+    }
+}
+
+pub fn compare_to_baseline(
+    current: &PerfSuiteReport,
+    baseline: &PerfSuiteReport,
+    max_regression_pct: f64,
+) -> PerfBaselineComparison {
+    let mut baseline_by_workers = BTreeMap::new();
+    for aggregate in &baseline.summary.aggregates {
+        baseline_by_workers.insert(aggregate.workers, aggregate);
+    }
+
+    let mut results = Vec::with_capacity(current.summary.aggregates.len());
+    for current_aggregate in &current.summary.aggregates {
+        let Some(baseline_aggregate) = baseline_by_workers.get(&current_aggregate.workers) else {
+            results.push(PerfBaselineResult {
+                workers: current_aggregate.workers,
+                status: PerfBaselineStatus::MissingBaseline,
+                baseline_value: None,
+                current_value: Some(current_aggregate.packets_per_sec_avg),
+                delta_pct: None,
+                message: "baseline has no aggregate for this worker count".to_owned(),
+            });
+            continue;
+        };
+
+        let baseline_value = baseline_aggregate.packets_per_sec_avg;
+        let current_value = current_aggregate.packets_per_sec_avg;
+        let delta_pct = if baseline_value > 0.0 {
+            Some((current_value - baseline_value) / baseline_value * 100.0)
+        } else {
+            None
+        };
+        let regression = delta_pct.is_some_and(|delta| delta < -max_regression_pct);
+        results.push(PerfBaselineResult {
+            workers: current_aggregate.workers,
+            status: if regression {
+                PerfBaselineStatus::Regression
+            } else {
+                PerfBaselineStatus::Pass
+            },
+            baseline_value: Some(baseline_value),
+            current_value: Some(current_value),
+            delta_pct,
+            message: match delta_pct {
+                Some(delta) => format!("{delta:.2}% vs baseline"),
+                None => "baseline value is zero; regression percentage unavailable".to_owned(),
+            },
+        });
+    }
+
+    let failed = results
+        .iter()
+        .any(|result| result.status == PerfBaselineStatus::Regression);
+    PerfBaselineComparison {
+        metric: "packets_per_sec_avg".to_owned(),
+        max_regression_pct,
+        current_input: current.summary.input.clone(),
+        baseline_input: baseline.summary.input.clone(),
+        failed,
+        results,
+    }
+}
+
+fn average(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len().max(1) as f64
+}
+
+fn median(sorted_values: &[f64]) -> f64 {
+    match sorted_values.len() {
+        0 => 0.0,
+        len if len % 2 == 1 => sorted_values[len / 2],
+        len => (sorted_values[len / 2 - 1] + sorted_values[len / 2]) / 2.0,
+    }
+}
+
+fn skew(values: impl Iterator<Item = u64>) -> PerfSkew {
+    let values = values.collect::<Vec<_>>();
+    let min = values.iter().copied().min().unwrap_or(0);
+    let max = values.iter().copied().max().unwrap_or(0);
+    let average = values.iter().sum::<u64>() as f64 / values.len().max(1) as f64;
+    PerfSkew {
+        min,
+        max,
+        average,
+        max_over_average: if average > 0.0 {
+            max as f64 / average
+        } else {
+            0.0
+        },
+        max_over_min: (min != 0).then_some(max as f64 / min as f64),
+    }
+}
+
+fn input_report(input: &PerfInput) -> PerfInputReport {
+    PerfInputReport {
+        name: input.name.clone(),
+        source: input.source,
+        flows: input.flows,
+        messages_per_flow: input.messages_per_flow,
+        packets: input.packet_count,
+        bytes: input.byte_count,
+    }
+}
+
+fn pipeline_config(config: &PerfHarnessConfig) -> PipelineConfig {
+    PipelineConfig {
+        mode: RunMode::Analyze,
+        batch_size: config.batch_size.max(1),
+        health_interval_ms: 0,
+        max_flows: config.max_flows.max(1),
+        flow_idle_timeout_ms: DEFAULT_FLOW_IDLE_TIMEOUT_MS,
+        max_tcp_buffered_bytes_per_flow: DEFAULT_TCP_BUFFERED_BYTES_PER_FLOW,
+        max_tcp_out_of_order_segments_per_direction: DEFAULT_TCP_OUT_OF_ORDER_SEGMENTS,
+        stream_inventory: StreamInventoryConfig {
+            enabled: true,
+            max_streams: config.max_flows.max(1),
+            idle_timeout_ms: DEFAULT_FLOW_IDLE_TIMEOUT_MS,
+            preview_bytes_per_direction: 256,
+            update_packet_interval: 64,
+            update_byte_interval: 64 * 1024,
+        },
+        stream_content: StreamContentConfig {
+            enabled: true,
+            max_streams: config.max_flows.max(1),
+            idle_timeout_ms: DEFAULT_FLOW_IDLE_TIMEOUT_MS,
+            max_total_bytes: config.stream_content_bytes.max(1),
+            max_bytes_per_stream: config.stream_content_bytes_per_stream.max(1),
+            max_segment_bytes: 64 * 1024,
+        },
+        stream_parser: StreamParserConfig::default(),
+        stream_view: StreamViewConfig {
+            enabled: true,
+            max_streams: config.max_flows.max(1),
+            max_matches_per_stream: 512,
+            max_query_limit: 1024,
+        },
+        stream_slice: StreamSliceConfig {
+            max_slice_bytes: 64 * 1024,
+            max_highlights: 8192,
+            hex_row_bytes: 16,
+            max_transform_bytes: 1024 * 1024,
+        },
+    }
+}
+
+fn register_analyzers(pipeline: &mut Pipeline) {
+    pipeline.register_analyzer(Box::new(HttpAnalyzer::new()));
+    pipeline.register_analyzer(Box::new(DnsAnalyzer::new()));
+    pipeline.register_analyzer(Box::new(TlsMetaAnalyzer::new()));
+}
+
+fn register_sharded_analyzers(pipeline: &mut ShardedPipeline) {
+    pipeline.register_analyzer_factory(|| Box::new(HttpAnalyzer::new()));
+    pipeline.register_analyzer_factory(|| Box::new(DnsAnalyzer::new()));
+    pipeline.register_analyzer_factory(|| Box::new(TlsMetaAnalyzer::new()));
+}
+
+#[derive(Default)]
+struct CountingSink {
+    events: u64,
+}
+
+impl EventSink for CountingSink {
+    fn write(&mut self, _event: &Event) -> Result<()> {
+        self.events = self.events.saturating_add(1);
+        Ok(())
+    }
+
+    fn write_batch(&mut self, events: &[Event]) -> Result<()> {
+        self.events = self.events.saturating_add(events.len() as u64);
+        black_box(self.events);
+        Ok(())
+    }
+}
+
+struct ArcPacketSource {
+    packets: Arc<[RawPacket]>,
+    cursor: usize,
+}
+
+impl ArcPacketSource {
+    fn new(packets: Arc<[RawPacket]>) -> Self {
+        Self { packets, cursor: 0 }
+    }
+}
+
+#[async_trait::async_trait]
+impl PacketSource for ArcPacketSource {
+    async fn next_batch(&mut self, batch: &mut PacketBatch) -> Result<usize> {
+        batch.clear();
+        while batch.len() < batch.capacity() {
+            let Some(packet) = self.packets.get(self.cursor) else {
+                break;
+            };
+            batch.push(packet.clone());
+            self.cursor += 1;
+        }
+        Ok(batch.len())
+    }
+}
+
+pub fn generate_fixture(
+    fixture: PerfFixtureKind,
+    flows: usize,
+    messages_per_flow: usize,
+) -> Vec<RawPacket> {
+    match fixture {
+        PerfFixtureKind::HttpRequests => http_request_fixture(flows),
+        PerfFixtureKind::OutOfOrderHttp => out_of_order_http_fixture(flows),
+        PerfFixtureKind::HttpKeepAlive => http_keep_alive_fixture(flows, messages_per_flow),
+        PerfFixtureKind::MixedServices => mixed_services_fixture(flows, messages_per_flow),
+    }
+}
+
+fn http_request_fixture(flows: usize) -> Vec<RawPacket> {
+    let mut packets = Vec::with_capacity(flows);
+    for flow in 0..flows {
+        let payload = format!("GET /item/{flow} HTTP/1.1\r\nHost: fixture.local\r\n\r\n");
+        packets.push(tcp_packet(
+            source_ip(flow),
+            source_port(flow),
+            [192, 0, 2, 80],
+            80,
+            1,
+            payload.as_bytes(),
+            flow as u64,
+        ));
+    }
+    packets
+}
+
+fn out_of_order_http_fixture(flows: usize) -> Vec<RawPacket> {
+    let mut packets = Vec::with_capacity(flows * 3);
+    for flow in 0..flows {
+        let source = source_ip(flow);
+        let source_port = source_port(flow);
+        let target = format!("item/{flow}");
+        let prefix = b"GET /";
+        let suffix = b" HTTP/1.1\r\nHost: stream.fixture\r\n\r\n";
+        let sequence = 10_000 + (flow as u32).wrapping_mul(128);
+
+        packets.push(tcp_packet(
+            source,
+            source_port,
+            [192, 0, 2, 80],
+            80,
+            sequence,
+            prefix,
+            (flow * 3) as u64,
+        ));
+        packets.push(tcp_packet(
+            source,
+            source_port,
+            [192, 0, 2, 80],
+            80,
+            sequence + prefix.len() as u32 + target.len() as u32,
+            suffix,
+            (flow * 3 + 1) as u64,
+        ));
+        packets.push(tcp_packet(
+            source,
+            source_port,
+            [192, 0, 2, 80],
+            80,
+            sequence + prefix.len() as u32,
+            target.as_bytes(),
+            (flow * 3 + 2) as u64,
+        ));
+    }
+    packets
+}
+
+fn http_keep_alive_fixture(flows: usize, messages_per_flow: usize) -> Vec<RawPacket> {
+    let mut packets = Vec::with_capacity(flows * messages_per_flow);
+    for flow in 0..flows {
+        let source = source_ip(flow);
+        let source_port = source_port(flow);
+        let mut sequence = 20_000 + (flow as u32).wrapping_mul(4096);
+        for message in 0..messages_per_flow {
+            let payload = format!(
+                "GET /flow/{flow}/message/{message} HTTP/1.1\r\nHost: keepalive.fixture\r\nConnection: keep-alive\r\n\r\n"
+            );
+            packets.push(tcp_packet(
+                source,
+                source_port,
+                [192, 0, 2, 80],
+                80,
+                sequence,
+                payload.as_bytes(),
+                (flow * messages_per_flow + message) as u64,
+            ));
+            sequence = sequence.wrapping_add(payload.len() as u32);
+        }
+    }
+    packets
+}
+
+fn mixed_services_fixture(flows: usize, messages_per_flow: usize) -> Vec<RawPacket> {
+    let mut packets = Vec::with_capacity(flows * messages_per_flow);
+    for flow in 0..flows {
+        for message in 0..messages_per_flow {
+            let ordinal = flow * messages_per_flow + message;
+            match ordinal % 3 {
+                0 => {
+                    let payload = format!(
+                        "GET /mixed/{flow}/{message} HTTP/1.1\r\nHost: mixed.fixture\r\n\r\n"
+                    );
+                    packets.push(tcp_packet(
+                        source_ip(flow),
+                        source_port(flow),
+                        [192, 0, 2, 80],
+                        80,
+                        30_000 + ordinal as u32 * 128,
+                        payload.as_bytes(),
+                        ordinal as u64,
+                    ));
+                }
+                1 => packets.push(udp_packet(
+                    source_ip(flow),
+                    source_port(flow),
+                    [192, 0, 2, 53],
+                    53,
+                    &dns_query_payload(ordinal as u16),
+                    ordinal as u64,
+                )),
+                _ => packets.push(tcp_packet(
+                    source_ip(flow),
+                    source_port(flow),
+                    [192, 0, 2, 44],
+                    443,
+                    40_000 + ordinal as u32 * 128,
+                    &tls_client_hello_like_payload(),
+                    ordinal as u64,
+                )),
+            }
+        }
+    }
+    packets
+}
+
+fn source_ip(flow: usize) -> [u8; 4] {
+    [
+        10,
+        ((flow >> 16) & 0xff) as u8,
+        ((flow >> 8) & 0xff) as u8,
+        ((flow & 0xff) as u8).max(1),
+    ]
+}
+
+fn source_port(flow: usize) -> u16 {
+    10_000 + (flow % 50_000) as u16
+}
+
+fn tcp_packet(
+    source: [u8; 4],
+    source_port: u16,
+    destination: [u8; 4],
+    destination_port: u16,
+    sequence: u32,
+    payload: &[u8],
+    timestamp: u64,
+) -> RawPacket {
+    let builder = PacketBuilder::ethernet2([1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2])
+        .ipv4(source, destination, 20)
+        .tcp(source_port, destination_port, sequence, 4096);
+    let mut data = Vec::with_capacity(builder.size(payload.len()));
+    builder.write(&mut data, payload).unwrap();
+    raw_packet(data, timestamp)
+}
+
+fn udp_packet(
+    source: [u8; 4],
+    source_port: u16,
+    destination: [u8; 4],
+    destination_port: u16,
+    payload: &[u8],
+    timestamp: u64,
+) -> RawPacket {
+    let builder = PacketBuilder::ethernet2([1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2])
+        .ipv4(source, destination, 20)
+        .udp(source_port, destination_port);
+    let mut data = Vec::with_capacity(builder.size(payload.len()));
+    builder.write(&mut data, payload).unwrap();
+    raw_packet(data, timestamp)
+}
+
+fn raw_packet(data: Vec<u8>, timestamp: u64) -> RawPacket {
+    RawPacket {
+        timestamp: PacketTimestamp {
+            sec: timestamp / 1_000_000,
+            usec: (timestamp % 1_000_000) as u32,
+        },
+        link_layer: LinkLayer::Ethernet,
+        linktype: Linktype::ETHERNET.0,
+        data,
+    }
+}
+
+fn dns_query_payload(id: u16) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(33);
+    payload.extend_from_slice(&id.to_be_bytes());
+    payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0x00, 0x00]);
+    payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    payload.push(7);
+    payload.extend_from_slice(b"fixture");
+    payload.push(5);
+    payload.extend_from_slice(b"local");
+    payload.push(0);
+    payload.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+    payload
+}
+
+fn tls_client_hello_like_payload() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(64);
+    payload.extend_from_slice(&[
+        0x16, 0x03, 0x01, 0x00, 0x2f, 0x01, 0x00, 0x00, 0x2b, 0x03, 0x03,
+    ]);
+    payload.extend_from_slice(&[0x11; 32]);
+    payload.extend_from_slice(&[0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+    payload
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::runtime::Builder;
+
+    use super::*;
+
+    #[test]
+    fn synthetic_fixture_generates_packets() {
+        let input = PerfInput::synthetic(PerfFixtureKind::MixedServices, 9, 2);
+
+        assert_eq!(18, input.packet_count());
+        assert!(input.byte_count() > 0);
+    }
+
+    #[test]
+    fn harness_runs_single_and_sharded() {
+        let runtime = Builder::new_current_thread().build().unwrap();
+        let input = PerfInput::synthetic(PerfFixtureKind::HttpRequests, 32, 1);
+        let config = PerfHarnessConfig {
+            runs: 1,
+            warmups: 0,
+            worker_counts: vec![1, 2],
+            batch_size: 16,
+            max_flows: 1024,
+            stream_content_bytes: 4 * 1024 * 1024,
+            ..PerfHarnessConfig::default()
+        };
+
+        let report = runtime.block_on(run_perf_suite(&input, &config)).unwrap();
+
+        assert_eq!(2, report.runs.len());
+        assert_eq!(2, report.summary.aggregates.len());
+        assert!(report.runs.iter().all(|run| run.stats.packets == 32));
+        assert!(
+            report
+                .runs
+                .iter()
+                .all(|run| run.diagnostics.unique_flows == 32)
+        );
+        assert!(
+            report
+                .runs
+                .iter()
+                .all(|run| run.diagnostics.fallback_packets == 0)
+        );
+    }
+
+    #[test]
+    fn worker_planner_caps_skewed_small_inputs() {
+        let input = PerfInput::synthetic(PerfFixtureKind::HttpRequests, 128, 1);
+        let plan = input.plan_workers(PerfWorkerPlannerConfig {
+            max_workers: 12,
+            min_packets_per_worker: 16,
+            min_flows_per_worker: 4,
+            max_packet_skew: 1.5,
+            max_byte_skew: 1.5,
+        });
+
+        assert!((1..=12).contains(&plan.selected_workers));
+        assert!(plan.candidates.iter().any(|candidate| !candidate.eligible));
+    }
+
+    #[test]
+    fn baseline_comparison_detects_regression() {
+        let input = PerfInput::synthetic(PerfFixtureKind::HttpRequests, 8, 1);
+        let mut baseline = minimal_suite(&input, 4, 1000.0);
+        let current = minimal_suite(&input, 4, 850.0);
+
+        let comparison = compare_to_baseline(&current, &baseline, 10.0);
+
+        assert!(comparison.failed);
+        assert_eq!(PerfBaselineStatus::Regression, comparison.results[0].status);
+        baseline.summary.aggregates[0].packets_per_sec_avg = 900.0;
+        let comparison = compare_to_baseline(&current, &baseline, 10.0);
+        assert!(!comparison.failed);
+    }
+
+    fn minimal_suite(input: &PerfInput, workers: usize, packets_per_sec: f64) -> PerfSuiteReport {
+        PerfSuiteReport {
+            summary: PerfSuiteSummary {
+                input: input_report(input),
+                worker_plan: PerfWorkerPlan::default(),
+                aggregates: vec![PerfAggregate {
+                    workers,
+                    runs: 1,
+                    packets_per_sec_min: packets_per_sec,
+                    packets_per_sec_avg: packets_per_sec,
+                    packets_per_sec_median: packets_per_sec,
+                    packets_per_sec_max: packets_per_sec,
+                    mb_per_sec_avg: 0.0,
+                    elapsed_ms_avg: 0.0,
+                }],
+            },
+            runs: Vec::new(),
+            comparison: None,
+        }
+    }
+}

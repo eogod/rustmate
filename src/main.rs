@@ -19,9 +19,11 @@ use rustmate::{
     output::jsonl::JsonlWriter,
     pattern::{PatternDefinition, PatternEngineConfig},
     pipeline::{Pipeline, PipelineConfig},
+    service_profile::ServiceProfileSet,
     sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, resolve_worker_count},
     stream_content::StreamContentConfig,
     stream_inventory::StreamInventoryConfig,
+    stream_parser::StreamParserConfig,
     stream_slice::StreamSliceConfig,
     stream_view::StreamViewConfig,
 };
@@ -70,6 +72,13 @@ async fn main() -> anyhow::Result<()> {
             max_bytes_per_stream: opts.max_stream_content_bytes_per_stream,
             max_segment_bytes: opts.stream_content_segment_bytes,
         },
+        stream_parser: StreamParserConfig {
+            enabled: !opts.disable_stream_parser,
+            max_http1_states: opts.max_http1_parser_states,
+            max_http1_header_bytes: opts.max_http1_header_bytes,
+            max_http1_buffer_bytes: opts.max_http1_buffer_bytes,
+            max_messages_per_chunk: opts.max_parser_messages_per_chunk,
+        },
         stream_view: StreamViewConfig {
             enabled: !opts.disable_stream_view,
             max_streams: opts.max_streams.max(1),
@@ -84,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         },
     };
     let pattern_config = build_pattern_config(&opts)?;
+    let service_profiles = load_service_profiles(opts.service_profile_file.as_deref())?;
     let worker_count = resolve_worker_count(opts.workers);
 
     let out_path = opts
@@ -99,8 +109,13 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pcap_path) = opts.pcap.as_deref() {
         tracing::info!("Reading pcap file: {}", pcap_path.display());
         let src = PcapFileSource::open(PathBuf::from(pcap_path))?;
-        let (live_api, api_server) =
-            start_live_api(api_listen, pipeline_config, opts.api_delta_capacity).await?;
+        let (live_api, api_server) = start_live_api(
+            api_listen,
+            pipeline_config,
+            opts.api_delta_capacity,
+            service_profiles.clone(),
+        )
+        .await?;
         let run = run_pipeline(
             src,
             pipeline_config,
@@ -138,8 +153,13 @@ async fn main() -> anyhow::Result<()> {
             max_packets: opts.max_packets,
             shutdown,
         })?;
-        let (live_api, api_server) =
-            start_live_api(api_listen, pipeline_config, opts.api_delta_capacity).await?;
+        let (live_api, api_server) = start_live_api(
+            api_listen,
+            pipeline_config,
+            opts.api_delta_capacity,
+            service_profiles,
+        )
+        .await?;
         let run = run_pipeline(
             src,
             pipeline_config,
@@ -219,18 +239,27 @@ async fn start_live_api(
     api_listen: Option<std::net::SocketAddr>,
     pipeline_config: PipelineConfig,
     delta_capacity: usize,
+    service_profiles: ServiceProfileSet,
 ) -> anyhow::Result<(Option<LiveApiHandle>, Option<ApiServer>)> {
     let Some(addr) = api_listen else {
         return Ok((None, None));
     };
 
-    let live_api = LiveApiHandle::new(
+    let live_api = LiveApiHandle::new_with_profiles(
         pipeline_config.stream_view,
         pipeline_config.stream_slice,
         delta_capacity,
+        service_profiles,
     );
     let server = spawn_live(live_api.clone(), addr).await?;
     Ok((Some(live_api), Some(server)))
+}
+
+fn load_service_profiles(path: Option<&Path>) -> anyhow::Result<ServiceProfileSet> {
+    match path {
+        Some(path) => ServiceProfileSet::from_json_file(path),
+        None => Ok(ServiceProfileSet::builtin()),
+    }
 }
 
 fn register_analyzers(pipeline: &mut Pipeline) {
@@ -356,6 +385,23 @@ fn log_completed(message: &str, stats: &rustmate::pipeline::PipelineStats, out_p
         content_truncated_streams = stats.content_truncated_streams,
         content_updates = stats.content_updates,
         content_merged_segments = stats.content_merged_segments,
+        message_active_streams = stats.message_active_streams,
+        message_stored_messages = stats.message_stored_messages,
+        message_dropped_messages = stats.message_dropped_messages,
+        message_observed_messages = stats.message_observed_messages,
+        message_http1_messages = stats.message_http1_messages,
+        message_parse_errors = stats.message_parse_errors,
+        parser_enabled = stats.parser_enabled,
+        parser_stream_chunks = stats.parser_stream_chunks,
+        parser_stream_bytes = stats.parser_stream_bytes,
+        parser_emitted_messages = stats.parser_emitted_messages,
+        parser_dropped_messages = stats.parser_dropped_messages,
+        parser_active_states = stats.parser_active_states,
+        parser_evicted_states = stats.parser_evicted_states,
+        parser_http1_active_states = stats.parser_http1_active_states,
+        parser_http1_messages = stats.parser_http1_messages,
+        parser_http1_parse_errors = stats.parser_http1_parse_errors,
+        parser_http1_dropped_chunks = stats.parser_http1_dropped_chunks,
         pattern_matches = stats.pattern_matches,
         pattern_dropped_matches = stats.pattern_dropped_matches,
         pattern_matched_streams = stats.pattern_matched_streams,

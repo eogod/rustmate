@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use pcap::Linktype;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct RawPacket {
@@ -63,7 +63,7 @@ enum PacketDecodeError {
     UnsupportedLinkLayer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportProtocol {
     Tcp,

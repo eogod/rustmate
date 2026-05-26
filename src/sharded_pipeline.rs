@@ -25,6 +25,8 @@ use crate::{
     pipeline::{PipelineConfig, PipelineStats},
     stream_content::{StreamContent, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryStats},
+    stream_message::StreamMessageStore,
+    stream_parser::{StreamParserLayer, StreamParserStats},
     stream_slice::{
         StreamContentSlice, StreamSliceConfig, StreamSliceError, StreamSliceReader,
         StreamSliceRequest,
@@ -46,6 +48,7 @@ pub struct ShardedPipeline {
     config: ShardedPipelineConfig,
     pattern_config: PatternEngineConfig,
     stream_view: StreamViewState,
+    stream_messages: StreamMessageStore,
     stream_content_shards: Vec<Option<StreamContent>>,
     live_api: Option<LiveApiHandle>,
     analyzer_factories: Vec<AnalyzerFactory>,
@@ -87,6 +90,7 @@ struct WorkerStats {
     flow_stats: FlowTableStats,
     stream_inventory_stats: StreamInventoryStats,
     stream_content_stats: StreamContentStats,
+    stream_parser_stats: StreamParserStats,
     pattern_stats: PatternEngineStats,
 }
 
@@ -104,6 +108,7 @@ struct WorkerPool {
 struct CoordinatorState<'a> {
     sinks: &'a mut [Box<dyn EventSink>],
     stream_view: &'a mut StreamViewState,
+    stream_messages: &'a mut StreamMessageStore,
     stream_content_shards: &'a mut [Option<StreamContent>],
     live_api: Option<&'a LiveApiHandle>,
     stats: &'a mut PipelineStats,
@@ -128,6 +133,7 @@ struct WorkerRuntime {
     flow_table: FlowTable,
     stream_inventory: StreamInventory,
     stream_content: StreamContent,
+    stream_parser: StreamParserLayer,
     pattern_engine: PatternEngine,
     analyzers: Vec<Box<dyn Analyzer>>,
     events: Vec<Event>,
@@ -155,6 +161,7 @@ impl ShardedPipeline {
             config,
             pattern_config: PatternEngineConfig::disabled(),
             stream_view: StreamViewState::new(config.pipeline.stream_view),
+            stream_messages: StreamMessageStore::default(),
             stream_content_shards,
             live_api: None,
             analyzer_factories: Vec::new(),
@@ -217,11 +224,13 @@ impl ShardedPipeline {
         self,
     ) -> (
         StreamViewState,
+        StreamMessageStore,
         Vec<Option<StreamContent>>,
         StreamSliceConfig,
     ) {
         (
             self.stream_view,
+            self.stream_messages,
             self.stream_content_shards,
             self.config.pipeline.stream_slice,
         )
@@ -256,6 +265,7 @@ impl ShardedPipeline {
                     if let Err(err) = pool.drain_available(&mut CoordinatorState {
                         sinks: &mut self.sinks,
                         stream_view: &mut self.stream_view,
+                        stream_messages: &mut self.stream_messages,
                         stream_content_shards: &mut self.stream_content_shards,
                         live_api: self.live_api.as_ref(),
                         stats: &mut stats,
@@ -309,6 +319,7 @@ impl ShardedPipeline {
                             &mut CoordinatorState {
                                 sinks: &mut self.sinks,
                                 stream_view: &mut self.stream_view,
+                                stream_messages: &mut self.stream_messages,
                                 stream_content_shards: &mut self.stream_content_shards,
                                 live_api: self.live_api.as_ref(),
                                 stats: &mut stats,
@@ -326,6 +337,7 @@ impl ShardedPipeline {
                     if let Err(err) = pool.drain_available(&mut CoordinatorState {
                         sinks: &mut self.sinks,
                         stream_view: &mut self.stream_view,
+                        stream_messages: &mut self.stream_messages,
                         stream_content_shards: &mut self.stream_content_shards,
                         live_api: self.live_api.as_ref(),
                         stats: &mut stats,
@@ -358,6 +370,7 @@ impl ShardedPipeline {
         let shutdown_result = pool.shutdown(&mut CoordinatorState {
             sinks: &mut self.sinks,
             stream_view: &mut self.stream_view,
+            stream_messages: &mut self.stream_messages,
             stream_content_shards: &mut self.stream_content_shards,
             live_api: self.live_api.as_ref(),
             stats: &mut stats,
@@ -377,6 +390,7 @@ impl ShardedPipeline {
 
         shutdown_result?;
         stats.set_stream_view_stats(self.stream_view.stats());
+        stats.set_stream_message_stats(self.stream_messages.stats());
         if let Some(source_stats) = source_stats_result.transpose()?.flatten() {
             stats.set_source_stats(source_stats);
         }
@@ -633,6 +647,7 @@ fn run_worker(
         flow_table: FlowTable::new(flow_config),
         stream_inventory: StreamInventory::new(config.stream_inventory),
         stream_content: StreamContent::new(config.stream_content),
+        stream_parser: StreamParserLayer::new(config.stream_parser),
         pattern_engine: PatternEngine::new(pattern_config),
         analyzers: analyzer_factories
             .iter()
@@ -676,6 +691,7 @@ fn run_worker(
     runtime.stats.flow_stats = runtime.flow_table.stats();
     runtime.stats.stream_inventory_stats = runtime.stream_inventory.stats();
     runtime.stats.stream_content_stats = runtime.stream_content.stats();
+    runtime.stats.stream_parser_stats = runtime.stream_parser.stats();
     runtime.stats.pattern_stats = runtime.pattern_engine.stats();
     let report = WorkerReport {
         stats: runtime.stats,
@@ -720,6 +736,8 @@ impl WorkerRuntime {
                     .and_then(|flow| flow.tcp.as_ref().map(|tcp| (flow, tcp)))
                 {
                     for chunk in &tcp.stream_chunks {
+                        self.stream_parser
+                            .observe_stream(&packet, flow, chunk, &mut self.events);
                         for analyzer in &mut self.analyzers {
                             analyzer.analyze_stream(&packet, flow, chunk, &mut self.events);
                         }
@@ -772,6 +790,7 @@ fn add_worker_stats(stats: &mut PipelineStats, worker_stats: &WorkerStats) {
     stats.add_flow_table_stats(worker_stats.flow_stats);
     stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
     stats.add_stream_content_stats(worker_stats.stream_content_stats);
+    stats.add_stream_parser_stats(worker_stats.stream_parser_stats);
     stats.add_pattern_stats(worker_stats.pattern_stats);
 }
 
@@ -793,9 +812,13 @@ fn store_worker_content(
 fn write_events(events: Vec<Event>, coordinator: &mut CoordinatorState<'_>) -> Result<()> {
     coordinator.stats.events = coordinator.stats.events.saturating_add(events.len() as u64);
     coordinator.stream_view.observe_events(&events);
+    coordinator.stream_messages.observe_events(&events);
     coordinator
         .stats
         .set_stream_view_stats(coordinator.stream_view.stats());
+    coordinator
+        .stats
+        .set_stream_message_stats(coordinator.stream_messages.stats());
     if let Some(live_api) = coordinator.live_api {
         live_api.publish_events(&events, *coordinator.stats);
     }
@@ -1080,6 +1103,7 @@ mod tests {
         pattern::{PatternDefinition, PatternEngineConfig},
         stream_content::StreamContentConfig,
         stream_inventory::StreamInventoryConfig,
+        stream_parser::StreamParserConfig,
         stream_slice::{
             StreamSliceConfig, StreamSliceCopyFormat, StreamSliceMode, StreamSliceRequest,
         },
@@ -1369,6 +1393,7 @@ mod tests {
                 max_tcp_out_of_order_segments_per_direction: 16,
                 stream_inventory: test_stream_inventory_config(),
                 stream_content: test_stream_content_config(),
+                stream_parser: StreamParserConfig::disabled(),
                 stream_view: test_stream_view_config(),
                 stream_slice: test_stream_slice_config(),
             },
@@ -1499,6 +1524,7 @@ mod tests {
                 max_tcp_out_of_order_segments_per_direction: 16,
                 stream_inventory: test_stream_inventory_config(),
                 stream_content: test_stream_content_config(),
+                stream_parser: StreamParserConfig::disabled(),
                 stream_view: test_stream_view_config(),
                 stream_slice: test_stream_slice_config(),
             },
