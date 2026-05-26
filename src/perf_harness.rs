@@ -1192,7 +1192,27 @@ mod tests {
     }
 
     #[test]
-    fn worker_planner_caps_skewed_small_inputs() {
+    fn worker_planner_rejects_small_multi_worker_inputs() {
+        let (eligible, reason) = worker_candidate_reason(
+            4,
+            8,
+            4,
+            &PerfRunDiagnostics::default(),
+            PerfWorkerPlannerConfig {
+                max_workers: 12,
+                min_packets_per_worker: 16,
+                min_flows_per_worker: 4,
+                max_packet_skew: 1.5,
+                max_byte_skew: 1.5,
+            },
+        );
+
+        assert!(!eligible);
+        assert_eq!("too few packets per worker: 8 < 16", reason);
+    }
+
+    #[test]
+    fn worker_planner_keeps_selected_worker_within_resolved_cap() {
         let input = PerfInput::synthetic(PerfFixtureKind::HttpRequests, 128, 1);
         let plan = input.plan_workers(PerfWorkerPlannerConfig {
             max_workers: 12,
@@ -1202,8 +1222,7 @@ mod tests {
             max_byte_skew: 1.5,
         });
 
-        assert!((1..=12).contains(&plan.selected_workers));
-        assert!(plan.candidates.iter().any(|candidate| !candidate.eligible));
+        assert!((1..=plan.max_workers).contains(&plan.selected_workers));
     }
 
     #[test]
