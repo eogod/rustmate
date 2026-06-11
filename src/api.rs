@@ -18,6 +18,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use crate::{
     event::Event,
     flow::{FlowDirection, FlowKey},
+    health::{PipelineQueueSnapshot, ShardPressureSnapshot, ShardedQueueSnapshot},
     packet::TransportProtocol,
     pipeline::PipelineStats,
     service_profile::{ServiceProfile, ServiceProfileSet, ServiceProfileStats},
@@ -147,6 +148,7 @@ struct LiveApiState {
 
 struct LiveApiCore {
     stats: PipelineStats,
+    queue: Option<ShardedQueueSnapshot>,
     view: StreamViewState,
     messages: StreamMessageStore,
     run_status: ApiRunStatus,
@@ -183,6 +185,7 @@ impl LiveApiHandle {
             inner: Arc::new(LiveApiState {
                 core: RwLock::new(LiveApiCore {
                     stats: PipelineStats::default(),
+                    queue: None,
                     view: StreamViewState::new(view_config),
                     messages: StreamMessageStore::default(),
                     run_status: ApiRunStatus::Running,
@@ -261,6 +264,14 @@ impl LiveApiHandle {
         self.append_deltas(vec![LiveDeltaPayload::Stats { stats }]);
     }
 
+    pub fn publish_queue(&self, queue: ShardedQueueSnapshot) {
+        let Ok(mut core) = self.inner.core.write() else {
+            tracing::warn!("Live API core lock is poisoned");
+            return;
+        };
+        core.queue = Some(queue);
+    }
+
     pub fn mark_completed(&self, stats: PipelineStats) {
         self.mark_status(ApiRunStatus::Completed, stats);
     }
@@ -318,6 +329,9 @@ impl LiveApiHandle {
             status: "ok",
             run_status: core.run_status,
             stats: core.stats,
+            queue_summary: core.queue.as_ref().map(ShardedQueueSnapshot::summarize),
+            shard_pressure: core.queue.as_ref().map(ShardedQueueSnapshot::pressure),
+            queue: core.queue.clone(),
             view: core.view.stats(),
             content_shards,
             active_content_shards,
@@ -805,6 +819,9 @@ async fn health(State(state): State<ApiState>) -> Result<Json<HealthResponse>, A
                 status: "ok",
                 run_status: ApiRunStatus::Completed,
                 stats: snapshot.stats,
+                queue_summary: None,
+                shard_pressure: None,
+                queue: None,
                 view: snapshot.view.stats(),
                 content_shards,
                 active_content_shards,
@@ -1130,6 +1147,12 @@ pub struct HealthResponse {
     status: &'static str,
     run_status: ApiRunStatus,
     stats: PipelineStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_summary: Option<PipelineQueueSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shard_pressure: Option<ShardPressureSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue: Option<ShardedQueueSnapshot>,
     view: StreamViewStats,
     content_shards: usize,
     active_content_shards: usize,
@@ -1624,6 +1647,7 @@ fn parse_direction(raw: &str) -> Result<FlowDirection, ApiError> {
 fn parse_message_protocol(raw: &str) -> Result<StreamMessageProtocol, ApiError> {
     match normalized_token(raw).as_str() {
         "http" | "http1" | "http_1" | "http/1" | "http/1.1" => Ok(StreamMessageProtocol::Http1),
+        "dns" => Ok(StreamMessageProtocol::Dns),
         _ => Err(ApiError::bad_request(format!(
             "invalid message protocol: {raw}"
         ))),
@@ -1726,6 +1750,7 @@ fn json_scalar_to_string(value: &serde_json::Value) -> Result<String, ApiError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::health::{ShardedQueueSnapshot, WorkerQueueSnapshot};
     use crate::stream_view::StreamViewConfig;
 
     #[test]
@@ -1864,5 +1889,68 @@ mod tests {
         assert_eq!(ApiRunStatus::Running, health.run_status);
         assert_eq!(1, health.content_shards);
         assert_eq!(1, health.active_content_shards);
+    }
+
+    #[test]
+    fn live_health_reports_shard_queue_telemetry() {
+        let live = LiveApiHandle::new(
+            StreamViewConfig::disabled(),
+            StreamSliceConfig::default(),
+            16,
+        );
+
+        live.publish_queue(ShardedQueueSnapshot {
+            output_queue_len: 2,
+            output_queue_capacity: 16,
+            workers: vec![
+                WorkerQueueSnapshot {
+                    id: 0,
+                    len: 1,
+                    capacity: 8,
+                    routed_packets: 100,
+                    routed_bytes: 1_000,
+                    flow_routed_packets: 95,
+                    fallback_packets: 5,
+                    fallback_non_ip_packets: 2,
+                    fallback_malformed_packets: 3,
+                    ..WorkerQueueSnapshot::default()
+                },
+                WorkerQueueSnapshot {
+                    id: 1,
+                    len: 4,
+                    capacity: 8,
+                    routed_packets: 300,
+                    routed_bytes: 7_000,
+                    flow_routed_packets: 290,
+                    fallback_packets: 10,
+                    fallback_non_ip_packets: 4,
+                    fallback_malformed_packets: 6,
+                    ..WorkerQueueSnapshot::default()
+                },
+            ],
+        });
+
+        let health = live.health().unwrap();
+        let queue = health.queue.unwrap();
+        let summary = health.queue_summary.unwrap();
+        let pressure = health.shard_pressure.unwrap();
+
+        assert_eq!(2, queue.output_queue_len);
+        assert_eq!(2, queue.workers.len());
+        assert_eq!(4, summary.max_worker_queue_len);
+        assert_eq!(Some(1), summary.busiest_worker);
+        assert_eq!(300, summary.busiest_worker_packets);
+        assert_eq!(7_000, summary.busiest_worker_bytes);
+        assert_eq!(15, summary.fallback_routed_packets);
+        assert_eq!(6, summary.fallback_non_ip_packets);
+        assert_eq!(9, summary.fallback_malformed_packets);
+        assert_eq!(1500, summary.worker_packet_skew_ratio_milli);
+        assert_eq!(1750, summary.worker_byte_skew_ratio_milli);
+        assert_eq!(
+            serde_json::json!("watch"),
+            serde_json::to_value(pressure.state).unwrap()
+        );
+        assert_eq!(Some(1), pressure.busiest_shard);
+        assert_eq!(15, pressure.fallback_packets);
     }
 }

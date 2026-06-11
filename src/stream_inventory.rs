@@ -5,7 +5,10 @@ use serde_json::{Value, json};
 use crate::{
     event::Event,
     flow::{Endpoint, FlowDirection, FlowKey, FlowObservation, StreamChunk, TcpSequenceStatus},
-    packet::{DecodedPacket, PacketTimestamp, TransportProtocol},
+    packet::{DecodedPacket, PacketTimestamp},
+    protocol_detection::{
+        ProtocolDetection, ProtocolDetectionSource, ProtocolServiceSide, detect_payload,
+    },
 };
 
 const DEFAULT_EVICTION_INTERVAL_PACKETS: u64 = 16_384;
@@ -107,27 +110,45 @@ enum ContentKind {
     Mixed,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ServiceGuess {
     name: &'static str,
-    side: ServiceSide,
+    side: ProtocolServiceSide,
     confidence: u8,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ServiceSide {
-    A,
-    B,
-    Unknown,
+    source: ProtocolDetectionSource,
+    evidence: &'static str,
 }
 
 impl Default for ServiceGuess {
     fn default() -> Self {
+        Self::from_detection(ProtocolDetection::unknown())
+    }
+}
+
+impl ServiceGuess {
+    fn from_detection(detection: ProtocolDetection) -> Self {
         Self {
-            name: "unknown",
-            side: ServiceSide::Unknown,
-            confidence: 0,
+            name: detection.service,
+            side: detection.side,
+            confidence: detection.confidence,
+            source: detection.source,
+            evidence: detection.evidence,
         }
+    }
+
+    fn observe_payload(&mut self, key: FlowKey, direction: FlowDirection, bytes: &[u8]) {
+        let Some(detection) = detect_payload(key, direction, bytes) else {
+            return;
+        };
+        let merged = ProtocolDetection {
+            service: self.name,
+            side: self.side,
+            confidence: self.confidence,
+            source: self.source,
+            evidence: self.evidence,
+        }
+        .merge(detection);
+        *self = Self::from_detection(merged);
     }
 }
 
@@ -173,6 +194,7 @@ impl StreamInventory {
             };
             let previous_status = record.status;
             let previous_kind = record.content_kind();
+            let previous_service = record.service;
 
             record.observe_packet(packet, flow.direction);
             if let Some(tcp) = flow.tcp.as_ref() {
@@ -191,8 +213,9 @@ impl StreamInventory {
 
             let closed_now =
                 previous_status != StreamStatus::Closed && record.status == StreamStatus::Closed;
-            let force_update =
-                previous_status != record.status || previous_kind != record.content_kind();
+            let force_update = previous_status != record.status
+                || previous_kind != record.content_kind()
+                || previous_service != record.service;
             let event = if created {
                 record.mark_emitted();
                 Some(("stream_open", record.fields()))
@@ -359,6 +382,7 @@ impl StreamRecord {
             return;
         }
 
+        self.service.observe_payload(self.key, direction, bytes);
         self.stream_bytes = self.stream_bytes.saturating_add(bytes.len() as u64);
         self.stream_chunks = self.stream_chunks.saturating_add(1);
 
@@ -413,6 +437,8 @@ impl StreamRecord {
                 "name": self.service.name,
                 "side": self.service.side.as_str(),
                 "confidence": self.service.confidence,
+                "source": self.service.source.as_str(),
+                "evidence": self.service.evidence,
             },
             "status": self.status.as_str(),
             "content_kind": self.content_kind().as_str(),
@@ -514,16 +540,6 @@ impl ContentKind {
     }
 }
 
-impl ServiceSide {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::A => "a",
-            Self::B => "b",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
 fn endpoint_fields(endpoint: Endpoint) -> Value {
     json!({
         "addr": endpoint.addr,
@@ -532,45 +548,7 @@ fn endpoint_fields(endpoint: Endpoint) -> Value {
 }
 
 fn infer_service(key: FlowKey) -> ServiceGuess {
-    known_service(key.protocol, key.a.port)
-        .map(|(name, confidence)| ServiceGuess {
-            name,
-            side: ServiceSide::A,
-            confidence,
-        })
-        .or_else(|| {
-            known_service(key.protocol, key.b.port).map(|(name, confidence)| ServiceGuess {
-                name,
-                side: ServiceSide::B,
-                confidence,
-            })
-        })
-        .unwrap_or_default()
-}
-
-fn known_service(protocol: TransportProtocol, port: u16) -> Option<(&'static str, u8)> {
-    match (protocol, port) {
-        (TransportProtocol::Tcp, 20 | 21) => Some(("ftp", 90)),
-        (TransportProtocol::Tcp, 22) => Some(("ssh", 95)),
-        (TransportProtocol::Udp, 67 | 68) => Some(("dhcp", 85)),
-        (TransportProtocol::Tcp | TransportProtocol::Udp, 53) => Some(("dns", 95)),
-        (TransportProtocol::Udp, 123) => Some(("ntp", 85)),
-        (TransportProtocol::Tcp, 80 | 8080 | 8000 | 8008 | 8888) => Some(("http", 90)),
-        (TransportProtocol::Tcp, 110 | 995) => Some(("pop3", 85)),
-        (TransportProtocol::Tcp, 143 | 993) => Some(("imap", 85)),
-        (TransportProtocol::Tcp, 443 | 8443) => Some(("tls", 90)),
-        (TransportProtocol::Udp, 443 | 8443) => Some(("quic", 80)),
-        (TransportProtocol::Tcp, 465 | 587 | 25) => Some(("smtp", 85)),
-        (TransportProtocol::Udp, 1900) => Some(("ssdp", 85)),
-        (TransportProtocol::Tcp, 3306) => Some(("mysql", 90)),
-        (TransportProtocol::Tcp, 3389) => Some(("rdp", 90)),
-        (TransportProtocol::Tcp, 5432) => Some(("postgres", 90)),
-        (TransportProtocol::Udp, 5353) => Some(("mdns", 85)),
-        (TransportProtocol::Tcp, 6379) => Some(("redis", 90)),
-        (TransportProtocol::Tcp | TransportProtocol::Udp, 11211) => Some(("memcached", 85)),
-        (TransportProtocol::Tcp, 27017) => Some(("mongodb", 85)),
-        _ => None,
-    }
+    ServiceGuess::from_detection(ProtocolDetection::from_port(key))
 }
 
 fn combine_content_kind(a: ContentKind, b: ContentKind) -> ContentKind {
@@ -624,7 +602,7 @@ mod tests {
 
     use crate::{
         flow::{FlowRoute, FlowTable, FlowTableConfig},
-        packet::{DecodedPacket, LinkLayer, PacketTimestamp, RawPacket},
+        packet::{DecodedPacket, LinkLayer, PacketTimestamp, RawPacket, TransportProtocol},
     };
 
     use super::*;
@@ -705,6 +683,57 @@ mod tests {
 
         assert_eq!("binary", events[0].fields["content_kind"]);
         assert!(events[0].fields["directions"]["a_to_b"]["preview_text"].is_null());
+    }
+
+    #[test]
+    fn detects_http_on_nonstandard_port_from_payload() {
+        let mut inventory = inventory(config());
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+
+        feed(
+            &mut inventory,
+            &mut flow_table,
+            &tcp_packet(
+                1,
+                49_000,
+                31_337,
+                b"GET /flag HTTP/1.1\r\nHost: ctf.local\r\n\r\n",
+            ),
+            &mut events,
+        );
+
+        assert_eq!("http", events[0].fields["service"]["name"]);
+        assert_eq!("b", events[0].fields["service"]["side"]);
+        assert_eq!("payload", events[0].fields["service"]["source"]);
+        assert_eq!("http_request", events[0].fields["service"]["evidence"]);
+    }
+
+    #[test]
+    fn detects_websocket_upgrade_above_http_port_guess() {
+        let mut inventory = inventory(config());
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+
+        feed(
+            &mut inventory,
+            &mut flow_table,
+            &tcp_packet(
+                1,
+                49_000,
+                80,
+                b"GET /ws HTTP/1.1\r\nHost: ctf.local\r\nUpgrade: websocket\r\n\r\n",
+            ),
+            &mut events,
+        );
+
+        assert_eq!("websocket", events[0].fields["service"]["name"]);
+        assert_eq!("b", events[0].fields["service"]["side"]);
+        assert_eq!("payload", events[0].fields["service"]["source"]);
+        assert_eq!(
+            "http_websocket_upgrade",
+            events[0].fields["service"]["evidence"]
+        );
     }
 
     #[test]

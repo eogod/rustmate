@@ -30,6 +30,7 @@ pub const DEFAULT_MAX_STREAM_SLICE_HIGHLIGHTS: usize = 4096;
 pub const DEFAULT_STREAM_SLICE_HEX_ROW_BYTES: usize = 16;
 pub const DEFAULT_MAX_STREAM_TRANSFORM_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_HTTP1_PARSER_STATES: usize = 131_072;
+pub const DEFAULT_MAX_DNS_PARSER_STATES: usize = 131_072;
 pub const DEFAULT_MAX_HTTP1_HEADER_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_HTTP1_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_PARSER_MESSAGES_PER_CHUNK: usize = 512;
@@ -38,7 +39,7 @@ pub const DEFAULT_CAPTURE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 pub const DEFAULT_CAPTURE_READ_TIMEOUT_MS: usize = 100;
 pub const DEFAULT_HEALTH_INTERVAL_MS: u64 = 1_000;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
     Analyze,
@@ -88,6 +89,7 @@ pub struct Config {
     pub max_stream_transform_bytes: usize,
     pub stream_parser_enabled: bool,
     pub max_http1_parser_states: usize,
+    pub max_dns_parser_states: usize,
     pub max_http1_header_bytes: usize,
     pub max_http1_buffer_bytes: usize,
     pub max_parser_messages_per_chunk: usize,
@@ -133,6 +135,7 @@ impl Default for Config {
             max_stream_transform_bytes: DEFAULT_MAX_STREAM_TRANSFORM_BYTES,
             stream_parser_enabled: true,
             max_http1_parser_states: DEFAULT_MAX_HTTP1_PARSER_STATES,
+            max_dns_parser_states: DEFAULT_MAX_DNS_PARSER_STATES,
             max_http1_header_bytes: DEFAULT_MAX_HTTP1_HEADER_BYTES,
             max_http1_buffer_bytes: DEFAULT_MAX_HTTP1_BUFFER_BYTES,
             max_parser_messages_per_chunk: DEFAULT_MAX_PARSER_MESSAGES_PER_CHUNK,

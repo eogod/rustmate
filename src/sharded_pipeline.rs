@@ -1,7 +1,4 @@
 use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
     thread::{self, JoinHandle},
     time::Duration,
@@ -16,13 +13,14 @@ use crate::{
     api::LiveApiHandle,
     config::RunMode,
     event::Event,
-    flow::{Endpoint, FlowKey, FlowRoute, FlowTable, FlowTableConfig, FlowTableStats},
-    health::{PipelineHealthReporter, ShardedQueueSnapshot, WorkerQueueSnapshot},
+    flow::{FlowKey, FlowRoute, FlowTable, FlowTableConfig, FlowTableStats},
+    health::{PipelineHealthReporter, ShardedQueueSnapshot},
     ingest::{PacketBatch, PacketSource},
     output::EventSink,
-    packet::{DecodedPacket, LinkLayer, RawPacket, TransportProtocol},
+    packet::{DecodedPacket, PacketDecodeCounters, RawPacket},
     pattern::{PatternEngine, PatternEngineConfig, PatternEngineStats},
     pipeline::{PipelineConfig, PipelineStats},
+    shard::{ShardCoordinator, ShardCoordinatorConfig, ShardLoadMetrics, ShardQueueLoad},
     stream_content::{StreamContent, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryStats},
     stream_message::StreamMessageStore,
@@ -33,6 +31,8 @@ use crate::{
     },
     stream_view::{StreamPatternMatch, StreamViewState},
 };
+
+pub use crate::shard::shard_for_flow_key;
 
 type AnalyzerFactory = Arc<dyn Fn() -> Box<dyn Analyzer> + Send + Sync + 'static>;
 
@@ -86,7 +86,7 @@ struct WorkerReport {
 #[derive(Debug, Default)]
 struct WorkerStats {
     id: usize,
-    decode_errors: u64,
+    packet_decode: PacketDecodeCounters,
     flow_stats: FlowTableStats,
     stream_inventory_stats: StreamInventoryStats,
     stream_content_stats: StreamContentStats,
@@ -138,13 +138,6 @@ struct WorkerRuntime {
     analyzers: Vec<Box<dyn Analyzer>>,
     events: Vec<Event>,
     stats: WorkerStats,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PacketRoute {
-    shard: usize,
-    fallback: bool,
-    flow_route: Option<FlowRoute>,
 }
 
 impl ShardedPipeline {
@@ -245,7 +238,10 @@ impl ShardedPipeline {
             ..PipelineStats::default()
         };
         let mut batch = PacketBatch::with_capacity(self.config.pipeline.batch_size.max(1));
-        let mut packet_sequence = 0u64;
+        let mut shard_coordinator = ShardCoordinator::new(ShardCoordinatorConfig::new(
+            self.config.worker_count,
+            self.config.pipeline.mode,
+        ));
         let mut pool = WorkerPool::start(
             self.config,
             self.pattern_config.clone(),
@@ -255,7 +251,6 @@ impl ShardedPipeline {
             live_api.set_sharded_content(pool.content_slice_handle());
             live_api.publish_stats(stats);
         }
-        let mut worker_packets = vec![0u64; self.config.worker_count];
         let mut health = PipelineHealthReporter::new(self.config.pipeline.health_interval_ms);
         let mut run_error = None;
 
@@ -274,12 +269,17 @@ impl ShardedPipeline {
                         break;
                     }
 
-                    let queue = pool.queue_snapshot(&worker_packets);
-                    if let Err(err) =
-                        health.maybe_report(&mut stats, Some(&queue), || source.stats())
-                    {
-                        run_error = Some(err);
-                        break;
+                    apply_shard_metrics(&mut stats, shard_coordinator.metrics());
+                    let queue = pool.queue_snapshot(shard_coordinator.metrics());
+                    apply_queue_metrics(&mut stats, &queue);
+                    publish_queue_snapshot(self.live_api.as_ref(), &queue);
+                    match health.maybe_report(&mut stats, Some(&queue), || source.stats()) {
+                        Ok(true) => publish_queue_stats(self.live_api.as_ref(), stats),
+                        Ok(false) => {}
+                        Err(err) => {
+                            run_error = Some(err);
+                            break;
+                        }
                     }
 
                     if source.is_finished() {
@@ -294,19 +294,7 @@ impl ShardedPipeline {
                     stats.bytes = stats.bytes.saturating_add(batch_bytes as u64);
 
                     for raw in batch.drain() {
-                        let route = route_packet(
-                            &raw,
-                            self.config.pipeline.mode,
-                            packet_sequence,
-                            self.config.worker_count,
-                        );
-                        packet_sequence = packet_sequence.saturating_add(1);
-                        stats.fallback_routed_packets = stats
-                            .fallback_routed_packets
-                            .saturating_add(u64::from(route.fallback));
-                        if let Some(worker_packets) = worker_packets.get_mut(route.shard) {
-                            *worker_packets = worker_packets.saturating_add(1);
-                        }
+                        let route = shard_coordinator.route_packet(&raw);
 
                         let packet = RoutedPacket {
                             raw,
@@ -346,12 +334,17 @@ impl ShardedPipeline {
                         break;
                     }
 
-                    let queue = pool.queue_snapshot(&worker_packets);
-                    if let Err(err) =
-                        health.maybe_report(&mut stats, Some(&queue), || source.stats())
-                    {
-                        run_error = Some(err);
-                        break;
+                    apply_shard_metrics(&mut stats, shard_coordinator.metrics());
+                    let queue = pool.queue_snapshot(shard_coordinator.metrics());
+                    apply_queue_metrics(&mut stats, &queue);
+                    publish_queue_snapshot(self.live_api.as_ref(), &queue);
+                    match health.maybe_report(&mut stats, Some(&queue), || source.stats()) {
+                        Ok(true) => publish_queue_stats(self.live_api.as_ref(), stats),
+                        Ok(false) => {}
+                        Err(err) => {
+                            run_error = Some(err);
+                            break;
+                        }
                     }
                 }
                 Err(err) => {
@@ -366,6 +359,7 @@ impl ShardedPipeline {
         } else {
             None
         };
+        apply_shard_metrics(&mut stats, shard_coordinator.metrics());
 
         let shutdown_result = pool.shutdown(&mut CoordinatorState {
             sinks: &mut self.sinks,
@@ -389,6 +383,10 @@ impl ShardedPipeline {
         }
 
         shutdown_result?;
+        apply_shard_metrics(&mut stats, shard_coordinator.metrics());
+        let final_queue = final_queue_snapshot(self.config, shard_coordinator.metrics());
+        apply_queue_metrics(&mut stats, &final_queue);
+        publish_queue_snapshot(self.live_api.as_ref(), &final_queue);
         stats.set_stream_view_stats(self.stream_view.stats());
         stats.set_stream_message_stats(self.stream_messages.stats());
         if let Some(source_stats) = source_stats_result.transpose()?.flatten() {
@@ -508,21 +506,16 @@ impl WorkerPool {
         }
     }
 
-    fn queue_snapshot(&self, routed_packets: &[u64]) -> ShardedQueueSnapshot {
-        ShardedQueueSnapshot {
-            workers: self
-                .workers
-                .iter()
-                .map(|worker| WorkerQueueSnapshot {
-                    id: worker.id,
-                    len: worker.sender.len(),
-                    capacity: worker.sender.capacity().unwrap_or(0),
-                    routed_packets: routed_packets.get(worker.id).copied().unwrap_or_default(),
-                })
-                .collect(),
-            output_queue_len: self.output_rx.len(),
-            output_queue_capacity: self.output_rx.capacity().unwrap_or(0),
-        }
+    fn queue_snapshot(&self, metrics: &ShardLoadMetrics) -> ShardedQueueSnapshot {
+        metrics.queue_snapshot(
+            self.workers.iter().map(|worker| ShardQueueLoad {
+                shard: worker.id,
+                len: worker.sender.len(),
+                capacity: worker.sender.capacity().unwrap_or(0),
+            }),
+            self.output_rx.len(),
+            self.output_rx.capacity().unwrap_or(0),
+        )
     }
 
     fn shutdown(self, coordinator: &mut CoordinatorState<'_>) -> Result<()> {
@@ -710,8 +703,9 @@ impl WorkerRuntime {
             RunMode::Dump => self.events.push(Event::packet_dump(raw)),
             RunMode::Analyze => {
                 let packet = DecodedPacket::from_raw(raw);
-                if packet.decode_error().is_some() {
-                    self.stats.decode_errors = self.stats.decode_errors.saturating_add(1);
+                let decode_status = packet.decode_status();
+                self.stats.packet_decode.observe(decode_status);
+                if decode_status.is_decode_error() {
                     return;
                 }
 
@@ -727,6 +721,16 @@ impl WorkerRuntime {
                             &packet,
                             &self.stream_content,
                             &update,
+                            &mut self.events,
+                        );
+                    }
+                    if flow.tcp.is_none()
+                        && let Some(transport) = packet.transport_payload()
+                    {
+                        self.stream_parser.observe_datagram(
+                            &packet,
+                            flow,
+                            transport.bytes,
                             &mut self.events,
                         );
                     }
@@ -784,9 +788,7 @@ fn write_worker_message(
 }
 
 fn add_worker_stats(stats: &mut PipelineStats, worker_stats: &WorkerStats) {
-    stats.decode_errors = stats
-        .decode_errors
-        .saturating_add(worker_stats.decode_errors);
+    stats.add_packet_decode_counters(worker_stats.packet_decode);
     stats.add_flow_table_stats(worker_stats.flow_stats);
     stats.add_stream_inventory_stats(worker_stats.stream_inventory_stats);
     stats.add_stream_content_stats(worker_stats.stream_content_stats);
@@ -807,6 +809,68 @@ fn store_worker_content(
             "Worker content shard index is out of range"
         );
     }
+}
+
+fn apply_shard_metrics(stats: &mut PipelineStats, metrics: &ShardLoadMetrics) {
+    let snapshot = metrics.snapshot();
+    stats.fallback_routed_packets = snapshot.fallback_packets;
+    stats.fallback_unsupported_link_packets = snapshot.fallback_unsupported_link_packets;
+    stats.fallback_non_ip_packets = snapshot.fallback_non_ip_packets;
+    stats.fallback_malformed_packets = snapshot.fallback_malformed_packets;
+    stats.fallback_fragmented_packets = snapshot.fallback_fragmented_packets;
+    stats.fallback_unsupported_transport_packets = snapshot.fallback_unsupported_transport_packets;
+    stats.busiest_shard = snapshot.busiest_shard;
+    stats.busiest_shard_packets = snapshot.busiest_shard_packets;
+    stats.busiest_shard_bytes = snapshot.busiest_shard_bytes;
+    stats.shard_packet_skew_ratio_milli = snapshot.packet_skew_ratio_milli;
+    stats.shard_byte_skew_ratio_milli = snapshot.byte_skew_ratio_milli;
+}
+
+fn apply_queue_metrics(stats: &mut PipelineStats, queue: &ShardedQueueSnapshot) {
+    let summary = queue.summarize();
+    stats.output_queue_len = summary.output_queue_len;
+    stats.output_queue_capacity = summary.output_queue_capacity;
+    stats.worker_queue_max_len = summary.max_worker_queue_len;
+    stats.worker_queue_max_capacity = summary.max_worker_queue_capacity;
+    stats.busiest_worker = summary.busiest_worker;
+    stats.busiest_worker_packets = summary.busiest_worker_packets;
+    stats.busiest_worker_bytes = summary.busiest_worker_bytes;
+    stats.worker_fallback_routed_packets = summary.fallback_routed_packets;
+    stats.worker_fallback_unsupported_link_packets = summary.fallback_unsupported_link_packets;
+    stats.worker_fallback_non_ip_packets = summary.fallback_non_ip_packets;
+    stats.worker_fallback_malformed_packets = summary.fallback_malformed_packets;
+    stats.worker_fallback_fragmented_packets = summary.fallback_fragmented_packets;
+    stats.worker_fallback_unsupported_transport_packets =
+        summary.fallback_unsupported_transport_packets;
+    stats.worker_packet_skew_ratio_milli = summary.worker_packet_skew_ratio_milli;
+    stats.worker_byte_skew_ratio_milli = summary.worker_byte_skew_ratio_milli;
+}
+
+fn publish_queue_snapshot(live_api: Option<&LiveApiHandle>, queue: &ShardedQueueSnapshot) {
+    if let Some(live_api) = live_api {
+        live_api.publish_queue(queue.clone());
+    }
+}
+
+fn publish_queue_stats(live_api: Option<&LiveApiHandle>, stats: PipelineStats) {
+    if let Some(live_api) = live_api {
+        live_api.publish_stats(stats);
+    }
+}
+
+fn final_queue_snapshot(
+    config: ShardedPipelineConfig,
+    metrics: &ShardLoadMetrics,
+) -> ShardedQueueSnapshot {
+    metrics.queue_snapshot(
+        (0..config.worker_count).map(|shard| ShardQueueLoad {
+            shard,
+            len: 0,
+            capacity: config.worker_queue_depth,
+        }),
+        0,
+        config.event_queue_depth,
+    )
 }
 
 fn write_events(events: Vec<Event>, coordinator: &mut CoordinatorState<'_>) -> Result<()> {
@@ -845,224 +909,6 @@ pub fn resolve_worker_count(worker_count: usize) -> usize {
     }
 }
 
-fn route_packet(raw: &RawPacket, mode: RunMode, sequence: u64, worker_count: usize) -> PacketRoute {
-    if worker_count <= 1 || matches!(mode, RunMode::Dump) {
-        return PacketRoute {
-            shard: 0,
-            fallback: false,
-            flow_route: None,
-        };
-    }
-
-    let Some(flow_route) = flow_route_from_raw(raw) else {
-        return PacketRoute {
-            shard: fallback_shard(sequence, worker_count),
-            fallback: true,
-            flow_route: None,
-        };
-    };
-
-    PacketRoute {
-        shard: hash_to_shard(&flow_route.key, worker_count),
-        fallback: false,
-        flow_route: Some(flow_route),
-    }
-}
-
-// Tiny parser for the dispatcher. Workers still do the full decode once analyzers need it.
-fn flow_route_from_raw(raw: &RawPacket) -> Option<FlowRoute> {
-    match raw.link_layer {
-        LinkLayer::Ethernet => {
-            let (ethertype, payload_offset) = ethernet_payload(&raw.data)?;
-            route_ip_by_ethertype(&raw.data, payload_offset, ethertype)
-        }
-        LinkLayer::LinuxSll => {
-            if raw.data.len() < 16 {
-                return None;
-            }
-            let ethertype = read_u16(&raw.data, 14)?;
-            route_ip_by_ethertype(&raw.data, 16, ethertype)
-        }
-        LinkLayer::RawIp => route_raw_ip(&raw.data, 0),
-        LinkLayer::BsdLoopback => route_raw_ip(&raw.data, 4),
-        LinkLayer::Unsupported => None,
-    }
-}
-
-fn ethernet_payload(data: &[u8]) -> Option<(u16, usize)> {
-    if data.len() < 14 {
-        return None;
-    }
-
-    let mut ethertype = read_u16(data, 12)?;
-    let mut offset = 14;
-    for _ in 0..2 {
-        if !matches!(ethertype, 0x8100 | 0x88a8 | 0x9100) {
-            break;
-        }
-        if data.len() < offset + 4 {
-            return None;
-        }
-        ethertype = read_u16(data, offset + 2)?;
-        offset += 4;
-    }
-
-    Some((ethertype, offset))
-}
-
-fn route_ip_by_ethertype(data: &[u8], offset: usize, ethertype: u16) -> Option<FlowRoute> {
-    match ethertype {
-        0x0800 => route_ipv4(data, offset),
-        0x86dd => route_ipv6(data, offset),
-        _ => None,
-    }
-}
-
-fn route_raw_ip(data: &[u8], offset: usize) -> Option<FlowRoute> {
-    let version = data.get(offset)? >> 4;
-    match version {
-        4 => route_ipv4(data, offset),
-        6 => route_ipv6(data, offset),
-        _ => None,
-    }
-}
-
-fn route_ipv4(data: &[u8], offset: usize) -> Option<FlowRoute> {
-    if data.len() < offset + 20 {
-        return None;
-    }
-
-    let version = data[offset] >> 4;
-    let header_len = usize::from(data[offset] & 0x0f) * 4;
-    if version != 4 || header_len < 20 || data.len() < offset + header_len {
-        return None;
-    }
-
-    let total_len = usize::from(read_u16(data, offset + 2)?);
-    if total_len < header_len {
-        return None;
-    }
-
-    let fragment = read_u16(data, offset + 6)?;
-    if fragment & 0x1fff != 0 {
-        return None;
-    }
-
-    let protocol = data[offset + 9];
-    let source = IpAddr::V4(Ipv4Addr::new(
-        data[offset + 12],
-        data[offset + 13],
-        data[offset + 14],
-        data[offset + 15],
-    ));
-    let destination = IpAddr::V4(Ipv4Addr::new(
-        data[offset + 16],
-        data[offset + 17],
-        data[offset + 18],
-        data[offset + 19],
-    ));
-
-    route_transport(data, offset + header_len, protocol, source, destination)
-}
-
-fn route_ipv6(data: &[u8], offset: usize) -> Option<FlowRoute> {
-    if data.len() < offset + 40 || data[offset] >> 4 != 6 {
-        return None;
-    }
-
-    let source_bytes: [u8; 16] = data.get(offset + 8..offset + 24)?.try_into().ok()?;
-    let destination_bytes: [u8; 16] = data.get(offset + 24..offset + 40)?.try_into().ok()?;
-    let source = IpAddr::V6(Ipv6Addr::from(source_bytes));
-    let destination = IpAddr::V6(Ipv6Addr::from(destination_bytes));
-
-    route_ipv6_transport(data, offset + 40, data[offset + 6], source, destination)
-}
-
-fn route_ipv6_transport(
-    data: &[u8],
-    mut offset: usize,
-    mut next_header: u8,
-    source: IpAddr,
-    destination: IpAddr,
-) -> Option<FlowRoute> {
-    for _ in 0..8 {
-        match next_header {
-            6 | 17 => return route_transport(data, offset, next_header, source, destination),
-            0 | 43 | 60 => {
-                if data.len() < offset + 2 {
-                    return None;
-                }
-                next_header = data[offset];
-                offset = offset.saturating_add((usize::from(data[offset + 1]) + 1) * 8);
-            }
-            44 => {
-                if data.len() < offset + 8 {
-                    return None;
-                }
-                let fragment = read_u16(data, offset + 2)?;
-                if fragment & 0xfff8 != 0 {
-                    return None;
-                }
-                next_header = data[offset];
-                offset = offset.saturating_add(8);
-            }
-            51 => {
-                if data.len() < offset + 2 {
-                    return None;
-                }
-                next_header = data[offset];
-                offset = offset.saturating_add((usize::from(data[offset + 1]) + 2) * 4);
-            }
-            _ => return None,
-        }
-    }
-
-    None
-}
-
-fn route_transport(
-    data: &[u8],
-    offset: usize,
-    protocol: u8,
-    source_addr: IpAddr,
-    destination_addr: IpAddr,
-) -> Option<FlowRoute> {
-    let protocol = match protocol {
-        6 => TransportProtocol::Tcp,
-        17 => TransportProtocol::Udp,
-        _ => return None,
-    };
-    let source_port = read_u16(data, offset)?;
-    let destination_port = read_u16(data, offset + 2)?;
-
-    Some(FlowRoute::new(
-        protocol,
-        Endpoint {
-            addr: source_addr,
-            port: source_port,
-        },
-        Endpoint {
-            addr: destination_addr,
-            port: destination_port,
-        },
-    ))
-}
-
-fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([
-        *data.get(offset)?,
-        *data.get(offset + 1)?,
-    ]))
-}
-
-fn fallback_shard(sequence: u64, worker_count: usize) -> usize {
-    (sequence as usize) % worker_count
-}
-
-pub fn shard_for_flow_key(key: &FlowKey, worker_count: usize) -> usize {
-    hash_to_shard(key, worker_count.max(1))
-}
-
 fn flow_table_config(config: ShardedPipelineConfig) -> FlowTableConfig {
     FlowTableConfig::new(
         max_flows_per_worker(config.pipeline.max_flows, config.worker_count),
@@ -1074,12 +920,6 @@ fn flow_table_config(config: ShardedPipelineConfig) -> FlowTableConfig {
 
 fn max_flows_per_worker(max_flows: usize, worker_count: usize) -> usize {
     max_flows.max(1).div_ceil(worker_count.max(1))
-}
-
-fn hash_to_shard<T: Hash>(value: &T, worker_count: usize) -> usize {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    (hasher.finish() as usize) % worker_count
 }
 
 #[cfg(test)]
@@ -1101,6 +941,7 @@ mod tests {
         output::EventSink,
         packet::{LinkLayer, PacketTimestamp},
         pattern::{PatternDefinition, PatternEngineConfig},
+        shard::{flow_route_from_raw, route_packet},
         stream_content::StreamContentConfig,
         stream_inventory::StreamInventoryConfig,
         stream_parser::StreamParserConfig,
@@ -1289,8 +1130,8 @@ mod tests {
         let forward_route = route_packet(&forward, RunMode::Analyze, 0, 8);
         let reverse_route = route_packet(&reverse, RunMode::Analyze, 1, 8);
 
-        assert!(!forward_route.fallback);
-        assert!(!reverse_route.fallback);
+        assert!(!forward_route.is_fallback());
+        assert!(!reverse_route.is_fallback());
         assert!(forward_route.flow_route.is_some());
         assert!(reverse_route.flow_route.is_some());
         assert_eq!(forward_route.shard, reverse_route.shard);
@@ -1345,7 +1186,26 @@ mod tests {
         let stats = pipeline.run_with_source(source).await.unwrap();
 
         assert_eq!(1, stats.fallback_routed_packets);
+        assert_eq!(1, stats.fallback_unsupported_link_packets);
+        assert_eq!(0, stats.fallback_malformed_packets);
         assert_eq!(1, stats.decode_errors);
+        assert_eq!(1, stats.packet_decode.packet_unsupported_link_packets);
+        assert_eq!(0, stats.packet_decode.packet_malformed_packets);
+        assert_eq!(Some(0), stats.busiest_shard);
+        assert_eq!(1, stats.busiest_shard_packets);
+        assert_eq!(22, stats.busiest_shard_bytes);
+        assert_eq!(4000, stats.shard_packet_skew_ratio_milli);
+        assert_eq!(4000, stats.shard_byte_skew_ratio_milli);
+        assert_eq!(Some(0), stats.busiest_worker);
+        assert_eq!(1, stats.busiest_worker_packets);
+        assert_eq!(22, stats.busiest_worker_bytes);
+        assert_eq!(1, stats.worker_fallback_routed_packets);
+        assert_eq!(1, stats.worker_fallback_unsupported_link_packets);
+        assert_eq!(0, stats.worker_fallback_malformed_packets);
+        assert_eq!(4000, stats.worker_packet_skew_ratio_milli);
+        assert_eq!(4000, stats.worker_byte_skew_ratio_milli);
+        assert_eq!(0, stats.worker_queue_max_len);
+        assert_eq!(8, stats.worker_queue_max_capacity);
     }
 
     #[tokio::test]

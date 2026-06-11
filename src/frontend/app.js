@@ -18,6 +18,7 @@ const state = {
   pendingMatchScroll: false,
   loadingStreams: false,
   polling: false,
+  lastHealthRefresh: 0,
 };
 
 const el = {
@@ -25,7 +26,15 @@ const el = {
   streams: document.getElementById("stat-streams"),
   matches: document.getElementById("stat-matches"),
   packets: document.getElementById("stat-packets"),
+  decode: document.getElementById("stat-decode"),
   drops: document.getElementById("stat-drops"),
+  queue: document.getElementById("stat-queue"),
+  hotShard: document.getElementById("stat-hot-shard"),
+  skew: document.getElementById("stat-skew"),
+  fallback: document.getElementById("stat-fallback"),
+  shardPressureState: document.getElementById("shard-pressure-state"),
+  shardPressureSummary: document.getElementById("shard-pressure-summary"),
+  shardDiagnostics: document.getElementById("shard-diagnostics"),
   tableWrap: document.querySelector(".table-wrap"),
   rows: document.getElementById("stream-rows"),
   profile: document.getElementById("filter-profile"),
@@ -80,8 +89,16 @@ function query(params) {
 }
 
 async function loadHealth() {
+  await refreshHealthTelemetry({ force: true });
+}
+
+async function refreshHealthTelemetry(options = {}) {
+  const now = Date.now();
+  if (!options.force && now - state.lastHealthRefresh < 1000) return;
+  state.lastHealthRefresh = now;
   const health = await api("/api/health");
   updateStats(health);
+  updateShardDiagnostics(health);
   state.deltaCursor = Math.max(state.deltaCursor, health.latest_delta_cursor || 0);
 }
 
@@ -110,12 +127,64 @@ function profileCountForCurrentToggles(stats) {
 
 function updateStats(healthOrDelta) {
   const stats = healthOrDelta.stats || {};
+  const queue = healthOrDelta.queue_summary || {};
   const view = healthOrDelta.view || {};
   el.status.textContent = `${healthOrDelta.run_status || "running"} / cursor ${healthOrDelta.latest_delta_cursor ?? state.deltaCursor}`;
   el.streams.textContent = formatNumber(view.tracked_streams ?? stats.view_tracked_streams ?? 0);
   el.matches.textContent = formatNumber(stats.pattern_matches ?? 0);
   el.packets.textContent = formatNumber(stats.packets ?? 0);
+  updateDecodeStats(stats);
   el.drops.textContent = formatNumber((stats.source_dropped_packets ?? 0) + (stats.source_interface_dropped_packets ?? 0));
+  const workerQueueLen = firstPositive(stats.worker_queue_max_len, queue.max_worker_queue_len);
+  const workerQueueCap = firstPositive(stats.worker_queue_max_capacity, queue.max_worker_queue_capacity);
+  const outputQueueLen = firstPositive(stats.output_queue_len, queue.output_queue_len);
+  const outputQueueCap = firstPositive(stats.output_queue_capacity, queue.output_queue_capacity);
+  const busiestShard = stats.busiest_shard ?? stats.busiest_worker ?? queue.busiest_worker;
+  const busiestBytes = firstPositive(stats.busiest_shard_bytes, stats.busiest_worker_bytes, queue.busiest_worker_bytes);
+  const packetSkew = firstPositive(
+    stats.shard_packet_skew_ratio_milli,
+    stats.worker_packet_skew_ratio_milli,
+    queue.worker_packet_skew_ratio_milli,
+  );
+  const byteSkew = firstPositive(
+    stats.shard_byte_skew_ratio_milli,
+    stats.worker_byte_skew_ratio_milli,
+    queue.worker_byte_skew_ratio_milli,
+  );
+  const fallback = firstPositive(
+    stats.fallback_routed_packets,
+    stats.worker_fallback_routed_packets,
+    queue.fallback_routed_packets,
+  );
+  const malformedFallback = firstPositive(
+    stats.fallback_malformed_packets,
+    stats.worker_fallback_malformed_packets,
+    queue.fallback_malformed_packets,
+  );
+
+  el.queue.textContent = `${formatNumber(workerQueueLen)}/${formatNumber(workerQueueCap)} · ${formatNumber(outputQueueLen)}/${formatNumber(outputQueueCap)}`;
+  el.hotShard.textContent = busiestShard === undefined || busiestShard === null
+    ? "-"
+    : `${busiestShard} / ${formatBytes(busiestBytes)}`;
+  el.skew.textContent = `${formatMilliRatio(packetSkew)} / ${formatMilliRatio(byteSkew)}`;
+  el.fallback.textContent = malformedFallback > 0
+    ? `${formatNumber(fallback)} / bad ${formatNumber(malformedFallback)}`
+    : formatNumber(fallback);
+}
+
+function updateDecodeStats(stats) {
+  const parsed = Number(stats.packet_parsed_packets || 0);
+  const nonIp = Number(stats.packet_non_ip_packets || 0);
+  const fragmented = Number(stats.packet_fragmented_packets || 0);
+  const unsupportedTransport = Number(stats.packet_unsupported_transport_packets || 0);
+  const bad = Number(stats.packet_malformed_packets || 0)
+    + Number(stats.packet_unsupported_link_packets || 0);
+  const parts = [`ok ${formatNumber(parsed)}`];
+  if (nonIp) parts.push(`ni ${formatNumber(nonIp)}`);
+  if (fragmented) parts.push(`frag ${formatNumber(fragmented)}`);
+  if (unsupportedTransport) parts.push(`other ${formatNumber(unsupportedTransport)}`);
+  if (bad) parts.push(`bad ${formatNumber(bad)}`);
+  el.decode.textContent = parts.join(" / ");
 }
 
 async function reloadStreams() {
@@ -197,7 +266,7 @@ function rowElement(row, rowIndex) {
   tr.addEventListener("click", () => selectStream(id));
   tr.innerHTML = `
     <td title="${id}">${shortId(id)}</td>
-    <td>${escapeHtml(row.service?.name || "unknown")}</td>
+    <td title="${escapeHtml(serviceEvidence(row.service))}">${escapeHtml(row.service?.name || "unknown")}</td>
     <td>${escapeHtml(row.content_kind || "unknown")}</td>
     <td>${formatNumber(row.stream_bytes || row.payload_bytes || 0)}</td>
     <td>${formatNumber(row.match_count || 0)}</td>
@@ -226,7 +295,7 @@ async function selectStream(id, options = {}) {
   const row = detail.row;
   state.streams.set(streamId(row), row);
   el.title.textContent = shortId(id);
-  el.subtitle.textContent = `${row.protocol} ${endpoint(row.endpoint_a)} -> ${endpoint(row.endpoint_b)} / ${row.service?.name || "unknown"}`;
+  el.subtitle.textContent = `${row.protocol} ${endpoint(row.endpoint_a)} -> ${endpoint(row.endpoint_b)} / ${serviceSummary(row.service)}`;
   updateStateButtons(row);
   state.matches = detail.matches || [];
   if (!state.matches.length) {
@@ -406,6 +475,7 @@ async function pollDeltas() {
       }
       state.deltaCursor = result.next_cursor ?? state.deltaCursor;
       el.status.textContent = `${result.run_status || "running"} / cursor ${state.deltaCursor}`;
+      await refreshHealthTelemetry();
     } catch (error) {
       el.status.textContent = error.message;
       await sleep(1000);
@@ -446,6 +516,49 @@ function applyDelta(delta) {
       selectStream(state.selectedId, { preserveScroll: true }).catch(showError);
     }
   }
+}
+
+function updateShardDiagnostics(health) {
+  const pressure = health.shard_pressure || {};
+  const queue = health.queue || {};
+  const summary = health.queue_summary || {};
+  const workers = queue.workers || [];
+  const stateName = pressure.state || "idle";
+  const busiest = pressure.busiest_shard ?? summary.busiest_worker;
+  const warnings = pressure.warnings || [];
+  const warningText = warnings.length ? ` / ${warnings.map(formatWarning).join(", ")}` : "";
+
+  el.shardPressureState.textContent = stateName;
+  el.shardPressureState.dataset.state = stateName;
+  el.shardPressureSummary.textContent = workers.length
+    ? `${workers.length} shards / hot ${busiest ?? "-"} / pkt ${formatMilliRatio(pressure.packet_skew_ratio_milli ?? summary.worker_packet_skew_ratio_milli)} / byte ${formatMilliRatio(pressure.byte_skew_ratio_milli ?? summary.worker_byte_skew_ratio_milli)}${warningText}`
+    : "no shard telemetry";
+
+  if (!workers.length) {
+    const tr = document.createElement("tr");
+    tr.className = "empty-row";
+    tr.innerHTML = '<td colspan="5">No shard telemetry.</td>';
+    el.shardDiagnostics.replaceChildren(tr);
+    return;
+  }
+
+  el.shardDiagnostics.replaceChildren(...workers.map(worker => shardRow(worker, busiest)));
+}
+
+function shardRow(worker, busiest) {
+  const tr = document.createElement("tr");
+  const queueFill = ratio(worker.len, worker.capacity);
+  const fallback = Number(worker.fallback_packets || 0);
+  const malformed = Number(worker.fallback_malformed_packets || 0);
+  tr.className = worker.id === busiest ? "hot-shard" : "";
+  tr.innerHTML = `
+    <td>${formatNumber(worker.id)}</td>
+    <td class="${queueFill >= 0.60 ? "queue-warn" : ""}">${formatNumber(worker.len)}/${formatNumber(worker.capacity)}</td>
+    <td>${formatNumber(worker.routed_packets)}</td>
+    <td>${formatBytes(worker.routed_bytes)}</td>
+    <td>${fallbackBreakdown(fallback, malformed)}</td>
+  `;
+  return tr;
 }
 
 function rowPassesCurrentFilters(row) {
@@ -766,6 +879,58 @@ function endpoint(endpointValue) {
 
 function formatNumber(value) {
   return Number(value || 0).toLocaleString("en-US");
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes < 1024) return `${formatNumber(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let scaled = bytes / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && scaled >= 1024; index += 1) {
+    scaled /= 1024;
+    unit = units[index];
+  }
+  return `${scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(2)} ${unit}`;
+}
+
+function formatMilliRatio(value) {
+  return `${(Number(value || 0) / 1000).toFixed(2)}x`;
+}
+
+function formatWarning(value) {
+  return String(value || "").replaceAll("_", " ");
+}
+
+function fallbackBreakdown(fallback, malformed) {
+  if (malformed > 0) return `${formatNumber(fallback)} / bad ${formatNumber(malformed)}`;
+  return formatNumber(fallback);
+}
+
+function serviceSummary(service) {
+  if (!service) return "unknown";
+  const source = service.source ? ` ${service.source}` : "";
+  const evidence = service.evidence ? ` ${service.evidence}` : "";
+  return `${service.name || "unknown"}${source}${evidence} ${formatNumber(service.confidence || 0)}%`;
+}
+
+function serviceEvidence(service) {
+  if (!service) return "unknown";
+  return serviceSummary(service);
+}
+
+function ratio(part, total) {
+  const denominator = Number(total || 0);
+  if (denominator <= 0) return 0;
+  return Number(part || 0) / denominator;
+}
+
+function firstPositive(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0) return number;
+  }
+  return 0;
 }
 
 function numberValue(value, fallback) {

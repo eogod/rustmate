@@ -146,6 +146,10 @@ pub struct StreamViewService {
     pub name: String,
     pub side: String,
     pub confidence: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -845,6 +849,8 @@ fn service_field(fields: &Value, name: &str) -> Option<StreamViewService> {
         name: string_field(service, "name")?.to_owned(),
         side: string_field(service, "side")?.to_owned(),
         confidence: u8_field(service, "confidence")?,
+        source: string_field(service, "source").map(ToOwned::to_owned),
+        evidence: string_field(service, "evidence").map(ToOwned::to_owned),
     })
 }
 

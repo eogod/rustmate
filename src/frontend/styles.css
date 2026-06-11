@@ -78,6 +78,7 @@ select {
   position: sticky;
   top: 0;
   z-index: 10;
+  min-width: 0;
 }
 
 .brand {
@@ -124,15 +125,35 @@ h2 {
 
 .stats-strip {
   display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 16px;
+  justify-content: flex-end;
+  gap: 4px 14px;
+  min-width: 0;
   color: var(--muted);
-  white-space: nowrap;
+  line-height: 1.2;
+  overflow: hidden;
+}
+
+.stats-strip span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
 }
 
 .stats-strip b {
   color: var(--ink);
   font-family: var(--mono);
+}
+
+#stat-decode {
+  display: inline-block;
+  max-width: min(28vw, 260px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  white-space: nowrap;
 }
 
 .workspace {
@@ -253,7 +274,7 @@ td:first-child {
 
 .detail-pane {
   display: grid;
-  grid-template-rows: auto auto 1fr;
+  grid-template-rows: auto auto auto 1fr;
   background: var(--panel);
 }
 
@@ -295,6 +316,79 @@ td:first-child {
 
 .content-tools select {
   width: 104px;
+}
+
+.diagnostics-panel {
+  min-width: 0;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+
+.diagnostics-head {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px 0;
+}
+
+#shard-pressure-state {
+  min-width: 72px;
+  height: 22px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+#shard-pressure-state[data-state="healthy"] {
+  border-color: #7fb79d;
+  background: #e8f5ee;
+  color: #0f5c43;
+}
+
+#shard-pressure-state[data-state="watch"] {
+  border-color: #d4b56b;
+  background: #fff7dc;
+  color: #7a5300;
+}
+
+#shard-pressure-state[data-state="hot"],
+#shard-pressure-state[data-state="saturated"] {
+  border-color: #d18c7a;
+  background: #ffece6;
+  color: #8a2f1f;
+}
+
+.shard-table-wrap {
+  max-height: 136px;
+  overflow: auto;
+  padding: 4px 12px 8px;
+}
+
+.shard-table {
+  font-size: 12px;
+}
+
+.shard-table th,
+.shard-table td {
+  height: 26px;
+  padding: 0 8px;
+}
+
+.shard-table td {
+  font-family: var(--mono);
+}
+
+.shard-table tr.hot-shard {
+  background: #fff7dc;
+}
+
+.shard-table .queue-warn {
+  color: var(--warn);
 }
 
 .content-grid {

@@ -5,8 +5,8 @@ use clap::{Parser, ValueEnum};
 use rustmate::{
     ingest::{PacketBatch, PacketSource, PcapFileSource},
     perf_harness::{
-        PerfFixtureKind, PerfHarnessConfig, PerfInput, PerfSuiteReport, PerfWorkerPlannerConfig,
-        compare_to_baseline, run_perf_suite,
+        PerfFixtureKind, PerfHarnessConfig, PerfInput, PerfSuiteReport, PerfWorkerPlan,
+        PerfWorkerPlannerConfig, compare_to_baseline, run_perf_suite,
     },
 };
 use tokio::runtime::Builder;
@@ -77,13 +77,21 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     adaptive_max_workers: usize,
 
-    /// Adaptive planner minimum packet budget per selected worker.
+    /// Adaptive planner soft minimum packet target per selected worker.
     #[arg(long, default_value_t = 4096)]
     adaptive_min_packets_per_worker: usize,
 
     /// Adaptive planner minimum routed-flow budget per selected worker.
     #[arg(long, default_value_t = 8)]
     adaptive_min_flows_per_worker: usize,
+
+    /// Adaptive planner preferred packet budget before adding more workers.
+    #[arg(long, default_value_t = 16_384)]
+    adaptive_preferred_packets_per_worker: usize,
+
+    /// Adaptive planner preferred byte budget before adding more workers. 0 disables this signal.
+    #[arg(long, default_value_t = 1_000_000)]
+    adaptive_preferred_bytes_per_worker: u64,
 
     /// Adaptive planner maximum allowed packet skew, max/average.
     #[arg(long, default_value_t = 2.5)]
@@ -92,6 +100,18 @@ struct Args {
     /// Adaptive planner maximum allowed byte skew, max/average.
     #[arg(long, default_value_t = 3.0)]
     adaptive_max_byte_skew: f64,
+
+    /// Adaptive planner maximum allowed routed-flow skew, max/average.
+    #[arg(long, default_value_t = 4.0)]
+    adaptive_max_flow_skew: f64,
+
+    /// Adaptive planner maximum fallback-routed packet ratio.
+    #[arg(long, default_value_t = 1.0)]
+    adaptive_max_fallback_ratio: f64,
+
+    /// Allow non power-of-two worker counts to score normally.
+    #[arg(long, default_value_t = true)]
+    adaptive_prefer_power_of_two: bool,
 
     /// Compare current report to a previous JSON report.
     #[arg(long)]
@@ -163,8 +183,13 @@ fn main() -> Result<()> {
         max_workers: args.adaptive_max_workers,
         min_packets_per_worker: args.adaptive_min_packets_per_worker,
         min_flows_per_worker: args.adaptive_min_flows_per_worker,
+        preferred_packets_per_worker: args.adaptive_preferred_packets_per_worker,
+        preferred_bytes_per_worker: args.adaptive_preferred_bytes_per_worker,
         max_packet_skew: args.adaptive_max_packet_skew,
         max_byte_skew: args.adaptive_max_byte_skew,
+        max_flow_skew: args.adaptive_max_flow_skew,
+        max_fallback_ratio: args.adaptive_max_fallback_ratio,
+        prefer_power_of_two: args.adaptive_prefer_power_of_two,
     };
     let worker_plan = input.plan_workers(worker_planner);
     let worker_counts = expand_worker_specs(&args.workers, worker_plan.selected_workers);
@@ -192,6 +217,7 @@ fn main() -> Result<()> {
         "adaptive workers={} ({})",
         worker_plan.selected_workers, worker_plan.reason
     );
+    print_worker_plan(&worker_plan);
     let mut report = runtime.block_on(run_perf_suite(&input, &config))?;
     if let Some(path) = args.baseline.as_deref() {
         let baseline = read_report(path)?;
@@ -314,6 +340,39 @@ fn print_summary(report: &PerfSuiteReport) {
             format_rate(aggregate.elapsed_ms_avg),
             format!("{skew:.2}x")
         );
+    }
+}
+
+fn print_worker_plan(plan: &PerfWorkerPlan) {
+    eprintln!(
+        "adaptive planner v{} available={} max={} selected_score={:.2}",
+        plan.planner_version, plan.available_workers, plan.max_workers, plan.selected_score
+    );
+    for note in &plan.decision_notes {
+        eprintln!("  decision: {note}");
+    }
+    eprintln!(
+        "candidate workers  score  state  pkt/w    bytes/w    flows/w   pkt skew  byte skew  flow skew  fallback"
+    );
+    for candidate in &plan.candidates {
+        eprintln!(
+            "candidate {:>7} {:>6.2} {:>6} {:>7} {:>10} {:>8} {:>9} {:>10} {:>10} {:>9}",
+            candidate.workers,
+            candidate.score,
+            if candidate.eligible { "ok" } else { "skip" },
+            candidate.packets_per_worker,
+            candidate.bytes_per_worker,
+            candidate.flows_per_worker,
+            format!("{:.2}x", candidate.diagnostics.packet_skew.max_over_average),
+            format!("{:.2}x", candidate.diagnostics.byte_skew.max_over_average),
+            format!("{:.2}x", candidate.diagnostics.flow_skew.max_over_average),
+            format!("{:.2}%", candidate.fallback_ratio * 100.0),
+        );
+        if !candidate.rejections.is_empty() {
+            eprintln!("  reject: {}", candidate.rejections.join("; "));
+        } else if !candidate.warnings.is_empty() {
+            eprintln!("  warn: {}", candidate.warnings.join("; "));
+        }
     }
 }
 

@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    net::{Ipv4Addr, Ipv6Addr},
+};
 
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
@@ -9,6 +12,7 @@ use crate::{
     event::Event,
     flow::{FlowDirection, FlowKey, FlowObservation, StreamChunk},
     packet::DecodedPacket,
+    protocol_detection::detect_payload,
 };
 
 const ANALYZER_NAME: &str = "protocol_message";
@@ -19,6 +23,10 @@ const DEFAULT_MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_HTTP_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_HTTP_PARSER_STATES: usize = DEFAULT_MAX_STREAMS * 2;
 const MAX_STORED_HTTP_HEADERS: usize = 128;
+const DEFAULT_MAX_DNS_PARSER_STATES: usize = DEFAULT_MAX_STREAMS * 2;
+const MAX_STORED_DNS_QUESTIONS: usize = 16;
+const MAX_STORED_DNS_RECORDS: usize = 32;
+const MAX_DNS_NAME_JUMPS: usize = 16;
 
 const HTTP_SIGNATURES: [&[u8]; 10] = [
     b"GET", b"POST", b"PUT", b"DELETE", b"PATCH", b"HEAD", b"OPTIONS", b"TRACE", b"CONNECT",
@@ -49,6 +57,7 @@ pub struct StreamMessageStats {
     pub dropped_messages: u64,
     pub observed_messages: u64,
     pub http1_messages: u64,
+    pub dns_messages: u64,
     pub parse_errors: u64,
 }
 
@@ -56,6 +65,7 @@ pub struct StreamMessageStats {
 #[serde(rename_all = "snake_case")]
 pub enum StreamMessageProtocol {
     Http1,
+    Dns,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +105,7 @@ pub struct StreamMessage {
     pub header_bytes: u64,
     pub body_bytes: u64,
     pub http: Option<Http1MessageInfo>,
+    pub dns: Option<DnsMessageInfo>,
     pub error: Option<String>,
 }
 
@@ -108,10 +119,16 @@ impl StreamMessage {
 
     fn event_type(&self) -> &'static str {
         match (self.protocol, self.kind, self.status) {
-            (_, _, StreamMessageStatus::ParseError) => "http1_parse_error",
+            (StreamMessageProtocol::Http1, _, StreamMessageStatus::ParseError) => {
+                "http1_parse_error"
+            }
+            (StreamMessageProtocol::Dns, _, StreamMessageStatus::ParseError) => "dns_parse_error",
             (StreamMessageProtocol::Http1, StreamMessageKind::Request, _) => "http1_request",
             (StreamMessageProtocol::Http1, StreamMessageKind::Response, _) => "http1_response",
             (StreamMessageProtocol::Http1, StreamMessageKind::Unknown, _) => "http1_message",
+            (StreamMessageProtocol::Dns, StreamMessageKind::Request, _) => "dns_query",
+            (StreamMessageProtocol::Dns, StreamMessageKind::Response, _) => "dns_response",
+            (StreamMessageProtocol::Dns, StreamMessageKind::Unknown, _) => "dns_message",
         }
     }
 }
@@ -145,6 +162,40 @@ pub struct Http1MessageInfo {
 pub struct Http1Header {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsMessageInfo {
+    pub transaction_id: u16,
+    pub opcode: u8,
+    pub rcode: u8,
+    pub query: bool,
+    pub authoritative: bool,
+    pub truncated: bool,
+    pub recursion_desired: bool,
+    pub recursion_available: bool,
+    pub questions: Vec<DnsQuestion>,
+    pub answers: Vec<DnsResourceRecord>,
+    pub authorities: Vec<DnsResourceRecord>,
+    pub additionals: Vec<DnsResourceRecord>,
+    pub questions_truncated: bool,
+    pub records_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsQuestion {
+    pub name: String,
+    pub qtype: String,
+    pub qclass: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsResourceRecord {
+    pub name: String,
+    pub rr_type: String,
+    pub class: String,
+    pub ttl: u32,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +279,9 @@ impl StreamMessageStore {
         self.stats.observed_messages = self.stats.observed_messages.saturating_add(1);
         if message.protocol == StreamMessageProtocol::Http1 {
             self.stats.http1_messages = self.stats.http1_messages.saturating_add(1);
+        }
+        if message.protocol == StreamMessageProtocol::Dns {
+            self.stats.dns_messages = self.stats.dns_messages.saturating_add(1);
         }
         if message.status == StreamMessageStatus::ParseError {
             self.stats.parse_errors = self.stats.parse_errors.saturating_add(1);
@@ -323,11 +377,16 @@ impl StreamMessageQuery {
 pub struct ProtocolMessageAnalyzer {
     http1: AHashMap<Http1StreamKey, Http1DirectionState>,
     http1_order: VecDeque<Http1StreamKey>,
+    dns: AHashMap<DnsStreamKey, DnsDirectionState>,
+    dns_order: VecDeque<DnsStreamKey>,
     max_http1_states: usize,
+    max_dns_states: usize,
     max_header_bytes: usize,
     max_buffer_bytes: usize,
     evicted_http1_states: u64,
+    evicted_dns_states: u64,
     dropped_http1_chunks: u64,
+    dropped_dns_datagrams: u64,
 }
 
 impl Default for ProtocolMessageAnalyzer {
@@ -335,11 +394,16 @@ impl Default for ProtocolMessageAnalyzer {
         Self {
             http1: AHashMap::new(),
             http1_order: VecDeque::new(),
+            dns: AHashMap::new(),
+            dns_order: VecDeque::new(),
             max_http1_states: DEFAULT_MAX_HTTP_PARSER_STATES,
+            max_dns_states: DEFAULT_MAX_DNS_PARSER_STATES,
             max_header_bytes: DEFAULT_MAX_HTTP_HEADER_BYTES,
             max_buffer_bytes: DEFAULT_MAX_HTTP_BUFFER_BYTES,
             evicted_http1_states: 0,
+            evicted_dns_states: 0,
             dropped_http1_chunks: 0,
+            dropped_dns_datagrams: 0,
         }
     }
 }
@@ -351,11 +415,13 @@ impl ProtocolMessageAnalyzer {
 
     pub fn with_limits(
         max_http1_states: usize,
+        max_dns_states: usize,
         max_header_bytes: usize,
         max_buffer_bytes: usize,
     ) -> Self {
         Self {
             max_http1_states: max_http1_states.max(1),
+            max_dns_states: max_dns_states.max(1),
             max_header_bytes: max_header_bytes.max(1),
             max_buffer_bytes: max_buffer_bytes.max(1),
             ..Self::default()
@@ -372,6 +438,16 @@ impl ProtocolMessageAnalyzer {
         self.emit_messages(packet, flow, chunk, events);
     }
 
+    pub fn analyze_datagram_packet(
+        &mut self,
+        packet: &DecodedPacket<'_>,
+        flow: &FlowObservation<'_>,
+        payload: &[u8],
+        events: &mut Vec<Event>,
+    ) {
+        self.emit_dns_datagram(packet, flow, payload, events);
+    }
+
     pub fn http1_active_states(&self) -> usize {
         self.http1.len()
     }
@@ -382,6 +458,18 @@ impl ProtocolMessageAnalyzer {
 
     pub fn http1_dropped_chunks(&self) -> u64 {
         self.dropped_http1_chunks
+    }
+
+    pub fn dns_active_states(&self) -> usize {
+        self.dns.len()
+    }
+
+    pub fn dns_evicted_states(&self) -> u64 {
+        self.evicted_dns_states
+    }
+
+    pub fn dns_dropped_datagrams(&self) -> u64 {
+        self.dropped_dns_datagrams
     }
 
     fn emit_messages(
@@ -419,6 +507,41 @@ impl ProtocolMessageAnalyzer {
                 json!(message),
             ));
         }
+    }
+
+    fn emit_dns_datagram(
+        &mut self,
+        packet: &DecodedPacket<'_>,
+        flow: &FlowObservation<'_>,
+        payload: &[u8],
+        events: &mut Vec<Event>,
+    ) {
+        let Some(detection) = detect_payload(flow.key, flow.direction, payload) else {
+            return;
+        };
+        if !matches!(detection.service, "dns" | "mdns" | "llmnr" | "netbios") {
+            return;
+        }
+        if !looks_like_dns_datagram(payload) {
+            return;
+        }
+        let key = DnsStreamKey {
+            flow: flow.key,
+            direction: flow.direction,
+        };
+        let Some(state) = self.dns_state(key) else {
+            self.dropped_dns_datagrams = self.dropped_dns_datagrams.saturating_add(1);
+            return;
+        };
+        let message = state.parse_datagram(flow.key.stable_id(), flow.direction, payload);
+        let length = message.wire_bytes.min(usize::MAX as u64) as usize;
+        events.push(Event::from_packet(
+            ANALYZER_NAME,
+            message.event_type(),
+            packet,
+            length,
+            json!(message),
+        ));
     }
 }
 
@@ -459,10 +582,35 @@ impl ProtocolMessageAnalyzer {
 
         self.http1.get_mut(&key)
     }
+
+    fn dns_state(&mut self, key: DnsStreamKey) -> Option<&mut DnsDirectionState> {
+        if !self.dns.contains_key(&key) {
+            while self.dns.len() >= self.max_dns_states {
+                let Some(evicted) = self.dns_order.pop_front() else {
+                    break;
+                };
+                self.dns.remove(&evicted);
+                self.evicted_dns_states = self.evicted_dns_states.saturating_add(1);
+            }
+            if self.dns.len() >= self.max_dns_states {
+                return None;
+            }
+            self.dns.insert(key, DnsDirectionState::default());
+            self.dns_order.push_back(key);
+        }
+
+        self.dns.get_mut(&key)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Http1StreamKey {
+    flow: FlowKey,
+    direction: FlowDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DnsStreamKey {
     flow: FlowKey,
     direction: FlowDirection,
 }
@@ -476,12 +624,455 @@ struct Http1DirectionState {
     pending: Option<PendingContentLengthMessage>,
 }
 
+#[derive(Debug, Default)]
+struct DnsDirectionState {
+    next_logical: u64,
+    next_ordinal: u64,
+}
+
+impl DnsDirectionState {
+    fn parse_datagram(
+        &mut self,
+        stream_id: u64,
+        direction: FlowDirection,
+        bytes: &[u8],
+    ) -> StreamMessage {
+        let logical_start = self.next_logical;
+        let logical_end = logical_start.saturating_add(bytes.len() as u64);
+        self.next_logical = logical_end;
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = self.next_ordinal.saturating_add(1);
+
+        match parse_dns_message(bytes) {
+            Ok(dns) => dns_stream_message(
+                stream_id,
+                direction,
+                ordinal,
+                logical_start,
+                logical_end,
+                dns,
+            ),
+            Err(error) => dns_parse_error(
+                stream_id,
+                direction,
+                ordinal,
+                logical_start,
+                logical_end,
+                error,
+            ),
+        }
+    }
+}
+
+struct DnsCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> DnsCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_u16(&mut self) -> Result<u16, &'static str> {
+        let value = read_u16_at(self.bytes, self.offset)?;
+        self.offset = self.offset.saturating_add(2);
+        Ok(value)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, &'static str> {
+        let value = read_u32_at(self.bytes, self.offset)?;
+        self.offset = self.offset.saturating_add(4);
+        Ok(value)
+    }
+
+    fn read_name(&mut self) -> Result<String, &'static str> {
+        let (name, next_offset) = read_dns_name(self.bytes, self.offset)?;
+        self.offset = next_offset;
+        Ok(name)
+    }
+
+    fn skip(&mut self, count: usize) -> Result<(), &'static str> {
+        if self.bytes.len() < self.offset.saturating_add(count) {
+            return Err("dns field is truncated");
+        }
+        self.offset = self.offset.saturating_add(count);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Http1ParseContext {
     stream_id: u64,
     direction: FlowDirection,
     max_header_bytes: usize,
     max_buffer_bytes: usize,
+}
+
+fn parse_dns_message(bytes: &[u8]) -> Result<DnsMessageInfo, &'static str> {
+    if bytes.len() < 12 {
+        return Err("dns message is shorter than header");
+    }
+
+    let mut cursor = DnsCursor::new(bytes);
+    let transaction_id = cursor.read_u16()?;
+    let flags = cursor.read_u16()?;
+    let question_count = cursor.read_u16()? as usize;
+    let answer_count = cursor.read_u16()? as usize;
+    let authority_count = cursor.read_u16()? as usize;
+    let additional_count = cursor.read_u16()? as usize;
+
+    let mut questions = Vec::with_capacity(question_count.min(MAX_STORED_DNS_QUESTIONS));
+    let mut questions_truncated = false;
+    for index in 0..question_count {
+        let question = parse_dns_question(&mut cursor)?;
+        if index < MAX_STORED_DNS_QUESTIONS {
+            questions.push(question);
+        } else {
+            questions_truncated = true;
+        }
+    }
+
+    let (answers, answers_truncated) = parse_dns_records(&mut cursor, answer_count)?;
+    let (authorities, authorities_truncated) = parse_dns_records(&mut cursor, authority_count)?;
+    let (additionals, additionals_truncated) = parse_dns_records(&mut cursor, additional_count)?;
+
+    Ok(DnsMessageInfo {
+        transaction_id,
+        opcode: ((flags >> 11) & 0x0f) as u8,
+        rcode: (flags & 0x0f) as u8,
+        query: flags & 0x8000 == 0,
+        authoritative: flags & 0x0400 != 0,
+        truncated: flags & 0x0200 != 0,
+        recursion_desired: flags & 0x0100 != 0,
+        recursion_available: flags & 0x0080 != 0,
+        questions,
+        answers,
+        authorities,
+        additionals,
+        questions_truncated,
+        records_truncated: answers_truncated || authorities_truncated || additionals_truncated,
+    })
+}
+
+fn parse_dns_question(cursor: &mut DnsCursor<'_>) -> Result<DnsQuestion, &'static str> {
+    let name = cursor.read_name()?;
+    let qtype = cursor.read_u16()?;
+    let qclass = cursor.read_u16()?;
+    Ok(DnsQuestion {
+        name,
+        qtype: dns_type_name(qtype).to_owned(),
+        qclass: dns_class_name(qclass).to_owned(),
+    })
+}
+
+fn parse_dns_records(
+    cursor: &mut DnsCursor<'_>,
+    count: usize,
+) -> Result<(Vec<DnsResourceRecord>, bool), &'static str> {
+    let mut records = Vec::with_capacity(count.min(MAX_STORED_DNS_RECORDS));
+    let mut truncated = false;
+    for index in 0..count {
+        let record = parse_dns_record(cursor)?;
+        if index < MAX_STORED_DNS_RECORDS {
+            records.push(record);
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((records, truncated))
+}
+
+fn parse_dns_record(cursor: &mut DnsCursor<'_>) -> Result<DnsResourceRecord, &'static str> {
+    let name = cursor.read_name()?;
+    let rr_type = cursor.read_u16()?;
+    let class = cursor.read_u16()?;
+    let ttl = cursor.read_u32()?;
+    let rdlen = cursor.read_u16()? as usize;
+    let rdata_offset = cursor.offset;
+    cursor.skip(rdlen)?;
+    let rdata = cursor
+        .bytes
+        .get(rdata_offset..rdata_offset.saturating_add(rdlen))
+        .ok_or("dns record data is truncated")?;
+
+    Ok(DnsResourceRecord {
+        name,
+        rr_type: dns_type_name(rr_type).to_owned(),
+        class: dns_class_name(class).to_owned(),
+        ttl,
+        data: dns_record_data(cursor.bytes, rdata_offset, rr_type, rdata),
+    })
+}
+
+fn dns_record_data(message: &[u8], rdata_offset: usize, rr_type: u16, rdata: &[u8]) -> String {
+    match rr_type {
+        1 if rdata.len() == 4 => Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]).to_string(),
+        2 | 5 | 12 => read_dns_name(message, rdata_offset)
+            .map_or_else(|_| format_dns_hex(rdata), |(name, _)| name),
+        6 => dns_soa_data(message, rdata_offset, rdata).unwrap_or_else(|| format_dns_hex(rdata)),
+        15 => dns_mx_data(message, rdata_offset, rdata).unwrap_or_else(|| format_dns_hex(rdata)),
+        16 => dns_txt_data(rdata),
+        28 if rdata.len() == 16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(rdata);
+            Ipv6Addr::from(octets).to_string()
+        }
+        33 => dns_srv_data(message, rdata_offset, rdata).unwrap_or_else(|| format_dns_hex(rdata)),
+        _ => format_dns_hex(rdata),
+    }
+}
+
+fn dns_mx_data(message: &[u8], offset: usize, rdata: &[u8]) -> Option<String> {
+    if rdata.len() < 3 {
+        return None;
+    }
+    let preference = read_u16_at(rdata, 0).ok()?;
+    let (exchange, _) = read_dns_name(message, offset + 2).ok()?;
+    Some(format!("{preference} {exchange}"))
+}
+
+fn dns_srv_data(message: &[u8], offset: usize, rdata: &[u8]) -> Option<String> {
+    if rdata.len() < 7 {
+        return None;
+    }
+    let priority = read_u16_at(rdata, 0).ok()?;
+    let weight = read_u16_at(rdata, 2).ok()?;
+    let port = read_u16_at(rdata, 4).ok()?;
+    let (target, _) = read_dns_name(message, offset + 6).ok()?;
+    Some(format!("{priority} {weight} {port} {target}"))
+}
+
+fn dns_soa_data(message: &[u8], offset: usize, rdata: &[u8]) -> Option<String> {
+    let (mname, after_mname) = read_dns_name(message, offset).ok()?;
+    let (rname, after_rname) = read_dns_name(message, after_mname).ok()?;
+    let relative = after_rname.checked_sub(offset)?;
+    if rdata.len() < relative.saturating_add(20) {
+        return None;
+    }
+    let serial = read_u32_at(message, after_rname).ok()?;
+    Some(format!("{mname} {rname} serial={serial}"))
+}
+
+fn dns_txt_data(rdata: &[u8]) -> String {
+    let mut offset = 0usize;
+    let mut parts = Vec::new();
+    while offset < rdata.len() {
+        let len = usize::from(rdata[offset]);
+        offset += 1;
+        if rdata.len() < offset.saturating_add(len) {
+            return format_dns_hex(rdata);
+        }
+        let text = String::from_utf8_lossy(&rdata[offset..offset + len]).to_string();
+        parts.push(text);
+        offset += len;
+    }
+    parts.join("")
+}
+
+fn read_dns_name(message: &[u8], offset: usize) -> Result<(String, usize), &'static str> {
+    let mut labels = Vec::new();
+    let mut cursor = offset;
+    let mut next_offset = None;
+    let mut jumps = 0usize;
+
+    loop {
+        let Some(&len) = message.get(cursor) else {
+            return Err("dns name is truncated");
+        };
+        if len & 0xc0 == 0xc0 {
+            let Some(&next) = message.get(cursor + 1) else {
+                return Err("dns compression pointer is truncated");
+            };
+            let pointer = (((u16::from(len) & 0x3f) << 8) | u16::from(next)) as usize;
+            if pointer >= message.len() {
+                return Err("dns compression pointer is out of range");
+            }
+            next_offset.get_or_insert(cursor + 2);
+            cursor = pointer;
+            jumps = jumps.saturating_add(1);
+            if jumps > MAX_DNS_NAME_JUMPS {
+                return Err("dns compression pointer loop");
+            }
+            continue;
+        }
+        if len & 0xc0 != 0 {
+            return Err("dns label uses an unsupported compression form");
+        }
+        cursor += 1;
+        if len == 0 {
+            let end = next_offset.unwrap_or(cursor);
+            let name = if labels.is_empty() {
+                ".".to_owned()
+            } else {
+                labels.join(".")
+            };
+            return Ok((name, end));
+        }
+        let len = usize::from(len);
+        if len > 63 || message.len() < cursor.saturating_add(len) {
+            return Err("dns label is truncated");
+        }
+        labels.push(String::from_utf8_lossy(&message[cursor..cursor + len]).to_string());
+        cursor += len;
+    }
+}
+
+fn dns_type_name(value: u16) -> &'static str {
+    match value {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        6 => "SOA",
+        12 => "PTR",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        33 => "SRV",
+        41 => "OPT",
+        255 => "ANY",
+        _ => "UNKNOWN",
+    }
+}
+
+fn dns_class_name(value: u16) -> &'static str {
+    match value {
+        1 => "IN",
+        3 => "CH",
+        4 => "HS",
+        255 => "ANY",
+        _ => "UNKNOWN",
+    }
+}
+
+fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16, &'static str> {
+    Ok(u16::from_be_bytes([
+        *bytes.get(offset).ok_or("dns u16 is truncated")?,
+        *bytes.get(offset + 1).ok_or("dns u16 is truncated")?,
+    ]))
+}
+
+fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, &'static str> {
+    Ok(u32::from_be_bytes([
+        *bytes.get(offset).ok_or("dns u32 is truncated")?,
+        *bytes.get(offset + 1).ok_or("dns u32 is truncated")?,
+        *bytes.get(offset + 2).ok_or("dns u32 is truncated")?,
+        *bytes.get(offset + 3).ok_or("dns u32 is truncated")?,
+    ]))
+}
+
+fn format_dns_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn looks_like_dns_datagram(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 {
+        return false;
+    }
+    let questions = u16::from_be_bytes([bytes[4], bytes[5]]);
+    let answers = u16::from_be_bytes([bytes[6], bytes[7]]);
+    let opcode = (bytes[2] >> 3) & 0x0f;
+    opcode <= 5 && questions != 0 && questions <= 64 && answers <= 512
+}
+
+fn dns_stream_message(
+    stream_id: u64,
+    direction: FlowDirection,
+    ordinal: u64,
+    logical_start: u64,
+    logical_end: u64,
+    dns: DnsMessageInfo,
+) -> StreamMessage {
+    let kind = if dns.query {
+        StreamMessageKind::Request
+    } else {
+        StreamMessageKind::Response
+    };
+    let summary = dns_summary(&dns);
+    StreamMessage {
+        stream_id,
+        stream_id_hex: format!("{stream_id:016x}"),
+        message_id: stable_message_id(stream_id, direction, ordinal),
+        protocol: StreamMessageProtocol::Dns,
+        kind,
+        status: StreamMessageStatus::Complete,
+        direction,
+        ordinal,
+        summary,
+        logical_start,
+        logical_end,
+        header_start: Some(logical_start),
+        header_end: Some(logical_start.saturating_add(12)),
+        body_start: Some(logical_start.saturating_add(12)),
+        body_end: Some(logical_end),
+        wire_bytes: logical_end.saturating_sub(logical_start),
+        header_bytes: 12,
+        body_bytes: logical_end.saturating_sub(logical_start).saturating_sub(12),
+        http: None,
+        dns: Some(dns),
+        error: None,
+    }
+}
+
+fn dns_parse_error(
+    stream_id: u64,
+    direction: FlowDirection,
+    ordinal: u64,
+    logical_start: u64,
+    logical_end: u64,
+    error: impl Into<String>,
+) -> StreamMessage {
+    StreamMessage {
+        stream_id,
+        stream_id_hex: format!("{stream_id:016x}"),
+        message_id: stable_message_id(stream_id, direction, ordinal),
+        protocol: StreamMessageProtocol::Dns,
+        kind: StreamMessageKind::Unknown,
+        status: StreamMessageStatus::ParseError,
+        direction,
+        ordinal,
+        summary: "DNS parse error".to_owned(),
+        logical_start,
+        logical_end,
+        header_start: Some(logical_start),
+        header_end: Some(logical_end),
+        body_start: None,
+        body_end: None,
+        wire_bytes: logical_end.saturating_sub(logical_start),
+        header_bytes: logical_end.saturating_sub(logical_start),
+        body_bytes: 0,
+        http: None,
+        dns: None,
+        error: Some(error.into()),
+    }
+}
+
+fn dns_summary(dns: &DnsMessageInfo) -> String {
+    let prefix = if dns.query {
+        "DNS query"
+    } else {
+        "DNS response"
+    };
+    let question = dns
+        .questions
+        .first()
+        .map(|question| format!("{} {}", question.qtype, question.name))
+        .unwrap_or_else(|| "no question".to_owned());
+    if dns.query {
+        format!("{prefix} {question}")
+    } else {
+        format!(
+            "{prefix} {question} rcode={} answers={}",
+            dns.rcode,
+            dns.answers.len()
+        )
+    }
 }
 
 impl Http1DirectionState {
@@ -730,6 +1321,7 @@ impl Http1DirectionState {
             header_bytes: end.saturating_sub(start),
             body_bytes: 0,
             http: None,
+            dns: None,
             error: Some(reason.into()),
         }
     }
@@ -793,6 +1385,7 @@ impl PendingContentLengthMessage {
             header_bytes: self.header_end.saturating_sub(self.logical_start),
             body_bytes: self.body_len,
             http: Some(self.http),
+            dns: None,
             error: None,
         }
     }
@@ -849,6 +1442,7 @@ fn build_message(
         header_bytes: body_start.saturating_sub(logical_start),
         body_bytes: body_len,
         http: Some(head.info),
+        dns: None,
         error: None,
     }
 }
@@ -1244,6 +1838,47 @@ mod tests {
     }
 
     #[test]
+    fn emits_dns_query_from_udp_datagram() {
+        let mut analyzer = ProtocolMessageAnalyzer::new();
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+        let raw = udp_packet(49_000, 53, &dns_query_packet());
+
+        feed_datagram(&mut analyzer, &mut flow_table, &raw, &mut events);
+
+        assert_eq!(1, events.len());
+        assert_eq!("dns_query", events[0].event_type);
+        let message = StreamMessage::from_event(&events[0]).unwrap();
+        assert_eq!(StreamMessageProtocol::Dns, message.protocol);
+        assert_eq!(StreamMessageKind::Request, message.kind);
+        assert_eq!("DNS query A example.com", message.summary);
+        let dns = message.dns.as_ref().unwrap();
+        assert_eq!(0x1234, dns.transaction_id);
+        assert_eq!("example.com", dns.questions[0].name);
+        assert_eq!("A", dns.questions[0].qtype);
+    }
+
+    #[test]
+    fn emits_dns_response_with_compressed_answer_name() {
+        let mut analyzer = ProtocolMessageAnalyzer::new();
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+        let raw = udp_packet(53, 49_000, &dns_response_packet());
+
+        feed_datagram(&mut analyzer, &mut flow_table, &raw, &mut events);
+
+        assert_eq!(1, events.len());
+        assert_eq!("dns_response", events[0].event_type);
+        let message = StreamMessage::from_event(&events[0]).unwrap();
+        assert_eq!(StreamMessageKind::Response, message.kind);
+        let dns = message.dns.as_ref().unwrap();
+        assert!(!dns.query);
+        assert_eq!("example.com", dns.questions[0].name);
+        assert_eq!("A", dns.answers[0].rr_type);
+        assert_eq!("93.184.216.34", dns.answers[0].data);
+    }
+
+    #[test]
     fn filters_store_messages_by_kind_and_direction() {
         let mut store = StreamMessageStore::default();
         let mut request = sample_message(1, FlowDirection::AToB, 0, StreamMessageKind::Request);
@@ -1265,6 +1900,29 @@ mod tests {
         assert_eq!("GET /a", result.messages[0].summary);
     }
 
+    #[test]
+    fn filters_store_messages_by_dns_protocol() {
+        let mut store = StreamMessageStore::default();
+        store.insert(sample_message(
+            1,
+            FlowDirection::AToB,
+            0,
+            StreamMessageKind::Request,
+        ));
+        store.insert(sample_dns_message(1, FlowDirection::AToB, 1));
+
+        let result = store.query(
+            1,
+            &StreamMessageQuery {
+                protocol: Some(StreamMessageProtocol::Dns),
+                ..StreamMessageQuery::default()
+            },
+        );
+
+        assert_eq!(1, result.total);
+        assert_eq!(StreamMessageProtocol::Dns, result.messages[0].protocol);
+    }
+
     fn feed(
         analyzer: &mut ProtocolMessageAnalyzer,
         flow_table: &mut FlowTable,
@@ -1277,6 +1935,18 @@ mod tests {
         for chunk in &tcp.stream_chunks {
             analyzer.analyze_stream(&packet, &flow, chunk, events);
         }
+    }
+
+    fn feed_datagram(
+        analyzer: &mut ProtocolMessageAnalyzer,
+        flow_table: &mut FlowTable,
+        raw: &RawPacket,
+        events: &mut Vec<Event>,
+    ) {
+        let packet = DecodedPacket::from_raw(raw);
+        let flow = flow_table.observe(&packet).unwrap();
+        let payload = packet.transport_payload().unwrap();
+        analyzer.analyze_datagram_packet(&packet, &flow, payload.bytes, events);
     }
 
     fn flow_table() -> FlowTable {
@@ -1295,6 +1965,46 @@ mod tests {
             linktype: Linktype::ETHERNET.0,
             data,
         }
+    }
+
+    fn udp_packet(source_port: u16, destination_port: u16, payload: &[u8]) -> RawPacket {
+        let builder = PacketBuilder::ethernet2([1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2])
+            .ipv4([10, 0, 0, 1], [10, 0, 0, 2], 20)
+            .udp(source_port, destination_port);
+        let mut data = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut data, payload).unwrap();
+        RawPacket {
+            timestamp: PacketTimestamp { sec: 10, usec: 20 },
+            link_layer: LinkLayer::Ethernet,
+            linktype: Linktype::ETHERNET.0,
+            data,
+        }
+    }
+
+    fn dns_query_packet() -> Vec<u8> {
+        let mut bytes = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        bytes.extend_from_slice(&[7]);
+        bytes.extend_from_slice(b"example");
+        bytes.extend_from_slice(&[3]);
+        bytes.extend_from_slice(b"com");
+        bytes.extend_from_slice(&[0, 0, 1, 0, 1]);
+        bytes
+    }
+
+    fn dns_response_packet() -> Vec<u8> {
+        let mut bytes = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        bytes.extend_from_slice(&[7]);
+        bytes.extend_from_slice(b"example");
+        bytes.extend_from_slice(&[3]);
+        bytes.extend_from_slice(b"com");
+        bytes.extend_from_slice(&[0, 0, 1, 0, 1]);
+        bytes.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        bytes.extend_from_slice(&[93, 184, 216, 34]);
+        bytes
     }
 
     fn sample_message(
@@ -1323,6 +2033,52 @@ mod tests {
             header_bytes: 10,
             body_bytes: 0,
             http: None,
+            dns: None,
+            error: None,
+        }
+    }
+
+    fn sample_dns_message(stream_id: u64, direction: FlowDirection, ordinal: u64) -> StreamMessage {
+        StreamMessage {
+            stream_id,
+            stream_id_hex: format!("{stream_id:016x}"),
+            message_id: stable_message_id(stream_id, direction, ordinal),
+            protocol: StreamMessageProtocol::Dns,
+            kind: StreamMessageKind::Request,
+            status: StreamMessageStatus::Complete,
+            direction,
+            ordinal,
+            summary: "DNS query A example.com".to_owned(),
+            logical_start: 0,
+            logical_end: 29,
+            header_start: Some(0),
+            header_end: Some(12),
+            body_start: Some(12),
+            body_end: Some(29),
+            wire_bytes: 29,
+            header_bytes: 12,
+            body_bytes: 17,
+            http: None,
+            dns: Some(DnsMessageInfo {
+                transaction_id: 0x1234,
+                opcode: 0,
+                rcode: 0,
+                query: true,
+                authoritative: false,
+                truncated: false,
+                recursion_desired: true,
+                recursion_available: false,
+                questions: vec![DnsQuestion {
+                    name: "example.com".to_owned(),
+                    qtype: "A".to_owned(),
+                    qclass: "IN".to_owned(),
+                }],
+                answers: Vec::new(),
+                authorities: Vec::new(),
+                additionals: Vec::new(),
+                questions_truncated: false,
+                records_truncated: false,
+            }),
             error: None,
         }
     }

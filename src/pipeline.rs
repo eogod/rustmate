@@ -12,7 +12,7 @@ use crate::{
     health::PipelineHealthReporter,
     ingest::{PacketBatch, PacketSource, PacketSourceStats},
     output::EventSink,
-    packet::{DecodedPacket, RawPacket},
+    packet::{DecodedPacket, PacketDecodeCounters, PacketDecodeStatus, RawPacket},
     pattern::{PatternEngine, PatternEngineConfig, PatternEngineStats},
     stream_content::{StreamContent, StreamContentConfig, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryConfig, StreamInventoryStats},
@@ -33,7 +33,34 @@ pub struct PipelineStats {
     pub bytes: u64,
     pub events: u64,
     pub decode_errors: u64,
+    #[serde(flatten)]
+    pub packet_decode: PacketDecodeCounters,
     pub fallback_routed_packets: u64,
+    pub fallback_unsupported_link_packets: u64,
+    pub fallback_non_ip_packets: u64,
+    pub fallback_malformed_packets: u64,
+    pub fallback_fragmented_packets: u64,
+    pub fallback_unsupported_transport_packets: u64,
+    pub busiest_shard: Option<usize>,
+    pub busiest_shard_packets: u64,
+    pub busiest_shard_bytes: u64,
+    pub shard_packet_skew_ratio_milli: u64,
+    pub shard_byte_skew_ratio_milli: u64,
+    pub output_queue_len: usize,
+    pub output_queue_capacity: usize,
+    pub worker_queue_max_len: usize,
+    pub worker_queue_max_capacity: usize,
+    pub busiest_worker: Option<usize>,
+    pub busiest_worker_packets: u64,
+    pub busiest_worker_bytes: u64,
+    pub worker_fallback_routed_packets: u64,
+    pub worker_fallback_unsupported_link_packets: u64,
+    pub worker_fallback_non_ip_packets: u64,
+    pub worker_fallback_malformed_packets: u64,
+    pub worker_fallback_fragmented_packets: u64,
+    pub worker_fallback_unsupported_transport_packets: u64,
+    pub worker_packet_skew_ratio_milli: u64,
+    pub worker_byte_skew_ratio_milli: u64,
     pub source_received_packets: u64,
     pub source_dropped_packets: u64,
     pub source_interface_dropped_packets: u64,
@@ -43,11 +70,25 @@ pub struct PipelineStats {
     pub dropped_new_flows: u64,
     pub tcp_stream_chunks: u64,
     pub tcp_stream_bytes: u64,
+    pub tcp_current_stream_chunks: u64,
+    pub tcp_current_stream_bytes: u64,
+    pub tcp_buffered_stream_chunks: u64,
+    pub tcp_buffered_stream_bytes: u64,
+    pub tcp_overlap_trimmed_stream_chunks: u64,
+    pub tcp_overlap_trimmed_stream_bytes: u64,
     pub tcp_gaps: u64,
     pub tcp_retransmissions: u64,
     pub tcp_overlaps: u64,
     pub tcp_out_of_order_buffered: u64,
+    pub tcp_out_of_order_buffered_bytes: u64,
     pub tcp_out_of_order_dropped: u64,
+    pub tcp_out_of_order_dropped_bytes: u64,
+    pub tcp_retransmitted_bytes: u64,
+    pub tcp_overlap_trimmed_bytes: u64,
+    pub tcp_reassembly_buffered_bytes_peak: usize,
+    pub tcp_midstream_starts: u64,
+    pub tcp_syns: u64,
+    pub tcp_fins: u64,
     pub tcp_resets: u64,
     pub inventory_active_streams: usize,
     pub inventory_created_streams: u64,
@@ -69,6 +110,7 @@ pub struct PipelineStats {
     pub message_dropped_messages: u64,
     pub message_observed_messages: u64,
     pub message_http1_messages: u64,
+    pub message_dns_messages: u64,
     pub message_parse_errors: u64,
     pub parser_enabled: bool,
     pub parser_stream_chunks: u64,
@@ -81,6 +123,10 @@ pub struct PipelineStats {
     pub parser_http1_messages: u64,
     pub parser_http1_parse_errors: u64,
     pub parser_http1_dropped_chunks: u64,
+    pub parser_dns_active_states: usize,
+    pub parser_dns_messages: u64,
+    pub parser_dns_parse_errors: u64,
+    pub parser_dns_dropped_datagrams: u64,
     pub pattern_matches: u64,
     pub pattern_dropped_matches: u64,
     pub pattern_matched_streams: usize,
@@ -96,6 +142,20 @@ pub struct PipelineStats {
 }
 
 impl PipelineStats {
+    pub(crate) fn observe_packet_decode_status(&mut self, status: PacketDecodeStatus) {
+        self.packet_decode.observe(status);
+        if status.is_decode_error() {
+            self.decode_errors = self.decode_errors.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn add_packet_decode_counters(&mut self, counters: PacketDecodeCounters) {
+        self.packet_decode.add(counters);
+        self.decode_errors = self
+            .decode_errors
+            .saturating_add(counters.decode_error_packets());
+    }
+
     pub(crate) fn set_flow_table_stats(&mut self, flow_stats: FlowTableStats) {
         self.active_flows = flow_stats.active_flows;
         self.created_flows = flow_stats.created_flows;
@@ -103,11 +163,25 @@ impl PipelineStats {
         self.dropped_new_flows = flow_stats.dropped_new_flows;
         self.tcp_stream_chunks = flow_stats.tcp_stream_chunks;
         self.tcp_stream_bytes = flow_stats.tcp_stream_bytes;
+        self.tcp_current_stream_chunks = flow_stats.tcp_current_stream_chunks;
+        self.tcp_current_stream_bytes = flow_stats.tcp_current_stream_bytes;
+        self.tcp_buffered_stream_chunks = flow_stats.tcp_buffered_stream_chunks;
+        self.tcp_buffered_stream_bytes = flow_stats.tcp_buffered_stream_bytes;
+        self.tcp_overlap_trimmed_stream_chunks = flow_stats.tcp_overlap_trimmed_stream_chunks;
+        self.tcp_overlap_trimmed_stream_bytes = flow_stats.tcp_overlap_trimmed_stream_bytes;
         self.tcp_gaps = flow_stats.tcp_gaps;
         self.tcp_retransmissions = flow_stats.tcp_retransmissions;
         self.tcp_overlaps = flow_stats.tcp_overlaps;
         self.tcp_out_of_order_buffered = flow_stats.tcp_out_of_order_buffered;
+        self.tcp_out_of_order_buffered_bytes = flow_stats.tcp_out_of_order_buffered_bytes;
         self.tcp_out_of_order_dropped = flow_stats.tcp_out_of_order_dropped;
+        self.tcp_out_of_order_dropped_bytes = flow_stats.tcp_out_of_order_dropped_bytes;
+        self.tcp_retransmitted_bytes = flow_stats.tcp_retransmitted_bytes;
+        self.tcp_overlap_trimmed_bytes = flow_stats.tcp_overlap_trimmed_bytes;
+        self.tcp_reassembly_buffered_bytes_peak = flow_stats.tcp_reassembly_buffered_bytes_peak;
+        self.tcp_midstream_starts = flow_stats.tcp_midstream_starts;
+        self.tcp_syns = flow_stats.tcp_syns;
+        self.tcp_fins = flow_stats.tcp_fins;
         self.tcp_resets = flow_stats.tcp_resets;
     }
 
@@ -124,6 +198,24 @@ impl PipelineStats {
         self.tcp_stream_bytes = self
             .tcp_stream_bytes
             .saturating_add(flow_stats.tcp_stream_bytes);
+        self.tcp_current_stream_chunks = self
+            .tcp_current_stream_chunks
+            .saturating_add(flow_stats.tcp_current_stream_chunks);
+        self.tcp_current_stream_bytes = self
+            .tcp_current_stream_bytes
+            .saturating_add(flow_stats.tcp_current_stream_bytes);
+        self.tcp_buffered_stream_chunks = self
+            .tcp_buffered_stream_chunks
+            .saturating_add(flow_stats.tcp_buffered_stream_chunks);
+        self.tcp_buffered_stream_bytes = self
+            .tcp_buffered_stream_bytes
+            .saturating_add(flow_stats.tcp_buffered_stream_bytes);
+        self.tcp_overlap_trimmed_stream_chunks = self
+            .tcp_overlap_trimmed_stream_chunks
+            .saturating_add(flow_stats.tcp_overlap_trimmed_stream_chunks);
+        self.tcp_overlap_trimmed_stream_bytes = self
+            .tcp_overlap_trimmed_stream_bytes
+            .saturating_add(flow_stats.tcp_overlap_trimmed_stream_bytes);
         self.tcp_gaps = self.tcp_gaps.saturating_add(flow_stats.tcp_gaps);
         self.tcp_retransmissions = self
             .tcp_retransmissions
@@ -132,9 +224,29 @@ impl PipelineStats {
         self.tcp_out_of_order_buffered = self
             .tcp_out_of_order_buffered
             .saturating_add(flow_stats.tcp_out_of_order_buffered);
+        self.tcp_out_of_order_buffered_bytes = self
+            .tcp_out_of_order_buffered_bytes
+            .saturating_add(flow_stats.tcp_out_of_order_buffered_bytes);
         self.tcp_out_of_order_dropped = self
             .tcp_out_of_order_dropped
             .saturating_add(flow_stats.tcp_out_of_order_dropped);
+        self.tcp_out_of_order_dropped_bytes = self
+            .tcp_out_of_order_dropped_bytes
+            .saturating_add(flow_stats.tcp_out_of_order_dropped_bytes);
+        self.tcp_retransmitted_bytes = self
+            .tcp_retransmitted_bytes
+            .saturating_add(flow_stats.tcp_retransmitted_bytes);
+        self.tcp_overlap_trimmed_bytes = self
+            .tcp_overlap_trimmed_bytes
+            .saturating_add(flow_stats.tcp_overlap_trimmed_bytes);
+        self.tcp_reassembly_buffered_bytes_peak = self
+            .tcp_reassembly_buffered_bytes_peak
+            .max(flow_stats.tcp_reassembly_buffered_bytes_peak);
+        self.tcp_midstream_starts = self
+            .tcp_midstream_starts
+            .saturating_add(flow_stats.tcp_midstream_starts);
+        self.tcp_syns = self.tcp_syns.saturating_add(flow_stats.tcp_syns);
+        self.tcp_fins = self.tcp_fins.saturating_add(flow_stats.tcp_fins);
         self.tcp_resets = self.tcp_resets.saturating_add(flow_stats.tcp_resets);
     }
 
@@ -252,6 +364,7 @@ impl PipelineStats {
         self.message_dropped_messages = message_stats.dropped_messages;
         self.message_observed_messages = message_stats.observed_messages;
         self.message_http1_messages = message_stats.http1_messages;
+        self.message_dns_messages = message_stats.dns_messages;
         self.message_parse_errors = message_stats.parse_errors;
     }
 
@@ -267,6 +380,10 @@ impl PipelineStats {
         self.parser_http1_messages = parser_stats.http1_messages;
         self.parser_http1_parse_errors = parser_stats.http1_parse_errors;
         self.parser_http1_dropped_chunks = parser_stats.http1_dropped_chunks;
+        self.parser_dns_active_states = parser_stats.dns_active_states;
+        self.parser_dns_messages = parser_stats.dns_messages;
+        self.parser_dns_parse_errors = parser_stats.dns_parse_errors;
+        self.parser_dns_dropped_datagrams = parser_stats.dns_dropped_datagrams;
     }
 
     pub(crate) fn add_stream_parser_stats(&mut self, parser_stats: StreamParserStats) {
@@ -301,6 +418,18 @@ impl PipelineStats {
         self.parser_http1_dropped_chunks = self
             .parser_http1_dropped_chunks
             .saturating_add(parser_stats.http1_dropped_chunks);
+        self.parser_dns_active_states = self
+            .parser_dns_active_states
+            .saturating_add(parser_stats.dns_active_states);
+        self.parser_dns_messages = self
+            .parser_dns_messages
+            .saturating_add(parser_stats.dns_messages);
+        self.parser_dns_parse_errors = self
+            .parser_dns_parse_errors
+            .saturating_add(parser_stats.dns_parse_errors);
+        self.parser_dns_dropped_datagrams = self
+            .parser_dns_dropped_datagrams
+            .saturating_add(parser_stats.dns_dropped_datagrams);
     }
 }
 
@@ -496,8 +625,9 @@ impl Pipeline {
             RunMode::Dump => self.events.push(Event::packet_dump(raw)),
             RunMode::Analyze => {
                 let packet = DecodedPacket::from_raw(raw);
-                if packet.decode_error().is_some() {
-                    stats.decode_errors += 1;
+                let decode_status = packet.decode_status();
+                stats.observe_packet_decode_status(decode_status);
+                if decode_status.is_decode_error() {
                     return;
                 }
 
@@ -506,6 +636,16 @@ impl Pipeline {
                     self.stream_inventory
                         .observe_flow(&packet, flow, &mut self.events);
                     self.observe_stream_content(&packet, flow);
+                    if flow.tcp.is_none()
+                        && let Some(transport) = packet.transport_payload()
+                    {
+                        self.stream_parser.observe_datagram(
+                            &packet,
+                            flow,
+                            transport.bytes,
+                            &mut self.events,
+                        );
+                    }
                 }
                 if let Some(flow) = flow
                     .as_ref()
@@ -785,6 +925,31 @@ mod tests {
         assert_eq!(1, stats.parser_http1_messages);
     }
 
+    #[tokio::test]
+    async fn indexes_dns_messages_in_pipeline_stats() {
+        let mut pipeline = test_pipeline();
+        pipeline.stream_parser = StreamParserLayer::default();
+
+        let stats = pipeline
+            .run_with_source(VecPacketSource::new(vec![udp_packet(
+                49_000,
+                53,
+                &dns_query_packet(),
+            )]))
+            .await
+            .unwrap();
+
+        assert_eq!(1, stats.message_active_streams);
+        assert_eq!(1, stats.message_observed_messages);
+        assert_eq!(1, stats.message_stored_messages);
+        assert_eq!(1, stats.message_dns_messages);
+        assert_eq!(0, stats.message_parse_errors);
+        assert_eq!(1, stats.parser_emitted_messages);
+        assert_eq!(1, stats.parser_dns_messages);
+        assert_eq!(0, stats.parser_dns_parse_errors);
+        assert_eq!(1, stats.parser_dns_active_states);
+    }
+
     struct StreamCollector {
         chunks: Arc<Mutex<Vec<Vec<u8>>>>,
     }
@@ -957,5 +1122,31 @@ mod tests {
             linktype: Linktype::ETHERNET.0,
             data,
         }
+    }
+
+    fn udp_packet(source_port: u16, destination_port: u16, payload: &[u8]) -> RawPacket {
+        let builder = PacketBuilder::ethernet2([1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2])
+            .ipv4([10, 0, 0, 1], [10, 0, 0, 2], 20)
+            .udp(source_port, destination_port);
+        let mut data = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut data, payload).unwrap();
+        RawPacket {
+            timestamp: PacketTimestamp { sec: 1, usec: 0 },
+            link_layer: LinkLayer::Ethernet,
+            linktype: Linktype::ETHERNET.0,
+            data,
+        }
+    }
+
+    fn dns_query_packet() -> Vec<u8> {
+        let mut bytes = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        bytes.extend_from_slice(&[7]);
+        bytes.extend_from_slice(b"example");
+        bytes.extend_from_slice(&[3]);
+        bytes.extend_from_slice(b"com");
+        bytes.extend_from_slice(&[0, 0, 1, 0, 1]);
+        bytes
     }
 }

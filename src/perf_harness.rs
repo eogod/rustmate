@@ -17,11 +17,10 @@ use crate::{
     flow::FlowKey,
     ingest::{PacketBatch, PacketSource},
     output::EventSink,
-    packet::{DecodedPacket, LinkLayer, PacketTimestamp, RawPacket},
+    packet::{LinkLayer, PacketTimestamp, RawPacket},
     pipeline::{Pipeline, PipelineConfig, PipelineStats},
-    sharded_pipeline::{
-        ShardedPipeline, ShardedPipelineConfig, resolve_worker_count, shard_for_flow_key,
-    },
+    shard::{ShardCoordinator, ShardCoordinatorConfig, flow_route_from_raw},
+    sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, resolve_worker_count},
     stream_content::StreamContentConfig,
     stream_inventory::StreamInventoryConfig,
     stream_parser::StreamParserConfig,
@@ -35,6 +34,7 @@ const DEFAULT_TCP_BUFFERED_BYTES_PER_FLOW: usize = 1 << 20;
 const DEFAULT_TCP_OUT_OF_ORDER_SEGMENTS: usize = 128;
 const DEFAULT_MAX_STREAM_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM: usize = 8 * 1024 * 1024;
+const WORKER_SELECTION_SCORE_BAND: f64 = 0.05;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +115,8 @@ impl PerfInput {
 
     pub fn diagnostics(&self, worker_count: usize) -> PerfRunDiagnostics {
         let shard_count = worker_count.max(1);
+        let mut coordinator =
+            ShardCoordinator::new(ShardCoordinatorConfig::new(shard_count, RunMode::Analyze));
         let mut shards = (0..shard_count)
             .map(|shard| ShardAccumulator {
                 shard,
@@ -127,21 +129,23 @@ impl PerfInput {
         let mut fallback_packets = 0u64;
         let mut all_flows = HashSet::new();
 
-        for (sequence, packet) in self.packets.iter().enumerate() {
-            let decoded = DecodedPacket::from_raw(packet);
-            let route = FlowKey::from_packet(&decoded).map(|(key, _)| key);
-            let shard = if let Some(flow_key) = route {
+        for packet in self.packets.iter() {
+            let route = coordinator.route_packet(packet);
+            let shard = route.shard;
+            let flow_route = route.flow_route.or_else(|| {
+                (shard_count == 1)
+                    .then(|| flow_route_from_raw(packet))
+                    .flatten()
+            });
+            if let Some(flow_route) = flow_route {
                 routed_packets = routed_packets.saturating_add(1);
-                all_flows.insert(flow_key);
-                let shard = shard_for_flow_key(&flow_key, shard_count);
+                all_flows.insert(flow_route.key);
                 if let Some(accumulator) = shards.get_mut(shard) {
-                    accumulator.flows.insert(flow_key);
+                    accumulator.flows.insert(flow_route.key);
                 }
-                shard
-            } else {
+            } else if route.is_fallback() {
                 fallback_packets = fallback_packets.saturating_add(1);
-                sequence % shard_count
-            };
+            }
 
             if let Some(accumulator) = shards.get_mut(shard) {
                 accumulator.packets = accumulator.packets.saturating_add(1);
@@ -159,18 +163,28 @@ impl PerfInput {
             })
             .collect::<Vec<_>>();
 
+        let route_snapshot = coordinator.metrics().snapshot();
+
         PerfRunDiagnostics {
             shard_count,
             routed_packets,
             fallback_packets,
+            fallback_unsupported_link_packets: route_snapshot.fallback_unsupported_link_packets,
+            fallback_non_ip_packets: route_snapshot.fallback_non_ip_packets,
+            fallback_malformed_packets: route_snapshot.fallback_malformed_packets,
+            fallback_fragmented_packets: route_snapshot.fallback_fragmented_packets,
+            fallback_unsupported_transport_packets: route_snapshot
+                .fallback_unsupported_transport_packets,
             unique_flows: all_flows.len(),
             packet_skew: skew(shards.iter().map(|shard| shard.packets)),
             byte_skew: skew(shards.iter().map(|shard| shard.bytes)),
+            flow_skew: skew(shards.iter().map(|shard| shard.unique_flows as u64)),
             shards,
         }
     }
 
     pub fn plan_workers(&self, config: PerfWorkerPlannerConfig) -> PerfWorkerPlan {
+        const PLANNER_VERSION: u32 = 2;
         let available_workers = resolve_worker_count(0);
         let max_workers = if config.max_workers == 0 {
             available_workers
@@ -182,40 +196,31 @@ impl PerfInput {
 
         for workers in candidate_counts {
             let diagnostics = self.diagnostics(workers);
-            let packets_per_worker = self.packet_count / workers.max(1);
-            let flows_per_worker = diagnostics.unique_flows / workers.max(1);
-            let (eligible, reason) = worker_candidate_reason(
+            candidates.push(evaluate_worker_candidate(
                 workers,
-                packets_per_worker,
-                flows_per_worker,
-                &diagnostics,
-                config,
-            );
-            candidates.push(PerfWorkerCandidate {
-                workers,
-                eligible,
-                reason,
+                self.packet_count,
+                self.byte_count,
                 diagnostics,
-            });
+                config,
+            ));
         }
 
-        let selected_workers = candidates
-            .iter()
-            .filter(|candidate| candidate.eligible)
-            .map(|candidate| candidate.workers)
-            .max()
-            .unwrap_or(1);
-        let reason = candidates
-            .iter()
-            .find(|candidate| candidate.workers == selected_workers)
+        let selected = select_worker_candidate(&candidates, config);
+        let selected_workers = selected.map_or(1, |candidate| candidate.workers);
+        let selected_score = selected.map_or(0.0, |candidate| candidate.score);
+        let reason = selected
             .map(|candidate| candidate.reason.clone())
             .unwrap_or_else(|| "fallback to one worker".to_owned());
+        let decision_notes = worker_plan_decision_notes(selected, &candidates);
 
         PerfWorkerPlan {
+            planner_version: PLANNER_VERSION,
             selected_workers,
             available_workers,
             max_workers,
+            selected_score,
             reason,
+            decision_notes,
             candidates,
         }
     }
@@ -241,60 +246,297 @@ fn worker_candidates(max_workers: usize) -> Vec<usize> {
     candidates
 }
 
-fn worker_candidate_reason(
+fn evaluate_worker_candidate(
     workers: usize,
-    packets_per_worker: usize,
-    flows_per_worker: usize,
-    diagnostics: &PerfRunDiagnostics,
+    packet_count: usize,
+    byte_count: u64,
+    diagnostics: PerfRunDiagnostics,
     config: PerfWorkerPlannerConfig,
-) -> (bool, String) {
+) -> PerfWorkerCandidate {
+    let packets_per_worker = average_per_worker_usize(packet_count, workers);
+    let bytes_per_worker = average_per_worker_u64(byte_count, workers);
+    let flows_per_worker = average_per_worker_usize(diagnostics.unique_flows, workers);
+    let fallback_ratio = ratio(diagnostics.fallback_packets, packet_count as u64);
+    let is_power_of_two = workers.is_power_of_two();
+    let mut rejections = Vec::new();
+    let mut warnings = Vec::new();
+
     if workers == 1 {
-        return (true, "single worker is always valid".to_owned());
-    }
-    if packets_per_worker < config.min_packets_per_worker {
-        return (
-            false,
-            format!(
-                "too few packets per worker: {packets_per_worker} < {}",
+        warnings.push("single worker baseline; no shard parallelism".to_owned());
+    } else {
+        if packets_per_worker < config.min_packets_per_worker {
+            warnings.push(format!(
+                "below minimum packet target: {packets_per_worker} < {}",
                 config.min_packets_per_worker
-            ),
-        );
-    }
-    if flows_per_worker < config.min_flows_per_worker {
-        return (
-            false,
-            format!(
+            ));
+        }
+        if flows_per_worker < config.min_flows_per_worker {
+            rejections.push(format!(
                 "too few routed flows per worker: {flows_per_worker} < {}",
                 config.min_flows_per_worker
-            ),
-        );
-    }
-    if diagnostics.packet_skew.max_over_average > config.max_packet_skew {
-        return (
-            false,
-            format!(
+            ));
+        }
+        if diagnostics.packet_skew.max_over_average > config.max_packet_skew {
+            rejections.push(format!(
                 "packet skew too high: {:.2}x > {:.2}x",
                 diagnostics.packet_skew.max_over_average, config.max_packet_skew
-            ),
-        );
-    }
-    if diagnostics.byte_skew.max_over_average > config.max_byte_skew {
-        return (
-            false,
-            format!(
+            ));
+        }
+        if diagnostics.byte_skew.max_over_average > config.max_byte_skew {
+            rejections.push(format!(
                 "byte skew too high: {:.2}x > {:.2}x",
                 diagnostics.byte_skew.max_over_average, config.max_byte_skew
-            ),
-        );
+            ));
+        }
+        if diagnostics.flow_skew.max_over_average > config.max_flow_skew {
+            rejections.push(format!(
+                "flow skew too high: {:.2}x > {:.2}x",
+                diagnostics.flow_skew.max_over_average, config.max_flow_skew
+            ));
+        }
+        if fallback_ratio > config.max_fallback_ratio {
+            rejections.push(format!(
+                "fallback route ratio too high: {:.2}% > {:.2}%",
+                fallback_ratio * 100.0,
+                config.max_fallback_ratio * 100.0
+            ));
+        }
+        if packets_per_worker >= config.min_packets_per_worker
+            && packets_per_worker < config.preferred_packets_per_worker
+        {
+            warnings.push(format!(
+                "below preferred packet budget: {packets_per_worker} < {}",
+                config.preferred_packets_per_worker
+            ));
+        }
+        if config.preferred_bytes_per_worker != 0
+            && bytes_per_worker < config.preferred_bytes_per_worker
+        {
+            warnings.push(format!(
+                "below preferred byte budget: {bytes_per_worker} < {}",
+                config.preferred_bytes_per_worker
+            ));
+        }
+        if config.prefer_power_of_two && !is_power_of_two {
+            warnings.push("non power-of-two worker count uses slower modulo routing".to_owned());
+        }
+        if fallback_ratio > 0.05 {
+            warnings.push(format!(
+                "fallback routing is {:.2}% of packets",
+                fallback_ratio * 100.0
+            ));
+        }
     }
 
-    (
-        true,
+    let eligible = rejections.is_empty();
+    let score = if eligible && workers == 1 {
+        0.50
+    } else if eligible {
+        worker_candidate_score(
+            workers,
+            packets_per_worker,
+            bytes_per_worker,
+            fallback_ratio,
+            is_power_of_two,
+            &diagnostics,
+            config,
+        )
+    } else {
+        0.0
+    };
+    let reason = if eligible {
         format!(
-            "eligible: {packets_per_worker} packets/worker, {flows_per_worker} flows/worker, packet skew {:.2}x, byte skew {:.2}x",
-            diagnostics.packet_skew.max_over_average, diagnostics.byte_skew.max_over_average
-        ),
-    )
+            "score {:.2}: {packets_per_worker} packets/worker, {bytes_per_worker} bytes/worker, {flows_per_worker} flows/worker, packet skew {:.2}x, byte skew {:.2}x, flow skew {:.2}x{}",
+            score,
+            diagnostics.packet_skew.max_over_average,
+            diagnostics.byte_skew.max_over_average,
+            diagnostics.flow_skew.max_over_average,
+            warning_suffix(&warnings)
+        )
+    } else {
+        rejections.join("; ")
+    };
+
+    PerfWorkerCandidate {
+        workers,
+        eligible,
+        score,
+        reason,
+        packets_per_worker,
+        bytes_per_worker,
+        flows_per_worker,
+        fallback_ratio,
+        is_power_of_two,
+        warnings,
+        rejections,
+        diagnostics,
+    }
+}
+
+fn select_worker_candidate(
+    candidates: &[PerfWorkerCandidate],
+    config: PerfWorkerPlannerConfig,
+) -> Option<&PerfWorkerCandidate> {
+    let best_score = candidates
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .map(|candidate| candidate.score)
+        .max_by(f64::total_cmp)?;
+    let score_floor = best_score * (1.0 - WORKER_SELECTION_SCORE_BAND);
+    let in_selection_band =
+        |candidate: &&PerfWorkerCandidate| candidate.eligible && candidate.score >= score_floor;
+
+    if config.prefer_power_of_two
+        && let Some(candidate) = candidates
+            .iter()
+            .filter(in_selection_band)
+            .filter(|candidate| candidate.is_power_of_two)
+            .max_by_key(|candidate| candidate.workers)
+    {
+        return Some(candidate);
+    }
+
+    candidates
+        .iter()
+        .filter(in_selection_band)
+        .max_by_key(|candidate| candidate.workers)
+}
+
+fn worker_plan_decision_notes(
+    selected: Option<&PerfWorkerCandidate>,
+    candidates: &[PerfWorkerCandidate],
+) -> Vec<String> {
+    let Some(selected) = selected else {
+        return vec!["no eligible worker candidate; falling back to one worker".to_owned()];
+    };
+
+    let mut notes = vec![format!(
+        "selected {} workers at score {:.2}",
+        selected.workers, selected.score
+    )];
+
+    if let Some(best_score) = candidates
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .map(|candidate| candidate.score)
+        .max_by(f64::total_cmp)
+    {
+        notes.push(format!(
+            "selection band floor {:.2} from best score {:.2}",
+            best_score * (1.0 - WORKER_SELECTION_SCORE_BAND),
+            best_score
+        ));
+    }
+
+    if let Some(larger) = candidates
+        .iter()
+        .find(|candidate| candidate.workers > selected.workers)
+    {
+        if larger.eligible {
+            notes.push(format!(
+                "{} workers stayed out: score {:.2} vs selected {:.2}",
+                larger.workers, larger.score, selected.score
+            ));
+        } else {
+            notes.push(format!(
+                "{} workers skipped: {}",
+                larger.workers,
+                larger.rejections.join("; ")
+            ));
+        }
+    }
+
+    if selected.warnings.is_empty() {
+        notes.push("selected candidate has no planner warnings".to_owned());
+    } else {
+        notes.push(format!(
+            "selected warnings: {}",
+            selected.warnings.join("; ")
+        ));
+    }
+
+    notes
+}
+
+fn worker_candidate_score(
+    workers: usize,
+    packets_per_worker: usize,
+    bytes_per_worker: u64,
+    fallback_ratio: f64,
+    is_power_of_two: bool,
+    diagnostics: &PerfRunDiagnostics,
+    config: PerfWorkerPlannerConfig,
+) -> f64 {
+    let packet_budget = saturation(
+        packets_per_worker as f64,
+        config.preferred_packets_per_worker,
+    );
+    let byte_budget = if config.preferred_bytes_per_worker == 0 {
+        1.0
+    } else {
+        saturation(bytes_per_worker as f64, config.preferred_bytes_per_worker)
+    };
+    let work_budget = (packet_budget * 0.70 + byte_budget * 0.30).clamp(0.10, 1.0);
+    let packet_balance = balance_factor(diagnostics.packet_skew.max_over_average, 0.50);
+    let byte_balance = balance_factor(diagnostics.byte_skew.max_over_average, 0.25);
+    let flow_balance = balance_factor(diagnostics.flow_skew.max_over_average, 0.35);
+    let fallback_factor = (1.0 - (fallback_ratio * 0.30)).clamp(0.25, 1.0);
+    let topology_factor = if config.prefer_power_of_two && !is_power_of_two {
+        0.75
+    } else {
+        1.0
+    };
+
+    workers as f64
+        * work_budget
+        * packet_balance
+        * byte_balance
+        * flow_balance
+        * fallback_factor
+        * topology_factor
+}
+
+fn saturation<T>(value: f64, preferred: T) -> f64
+where
+    T: TryInto<u64>,
+{
+    let preferred = preferred.try_into().ok().unwrap_or(0) as f64;
+    if preferred <= 0.0 {
+        return 1.0;
+    }
+    (value / preferred).clamp(0.0, 1.0)
+}
+
+fn balance_factor(skew: f64, exponent: f64) -> f64 {
+    if skew <= 1.0 {
+        1.0
+    } else {
+        1.0 / skew.powf(exponent)
+    }
+}
+
+fn average_per_worker_usize(value: usize, workers: usize) -> usize {
+    value / workers.max(1)
+}
+
+fn average_per_worker_u64(value: u64, workers: usize) -> u64 {
+    value / workers.max(1) as u64
+}
+
+fn ratio(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 / total as f64
+    }
+}
+
+fn warning_suffix(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        String::new()
+    } else {
+        format!("; warnings: {}", warnings.join("; "))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -384,9 +626,15 @@ pub struct PerfRunDiagnostics {
     pub shard_count: usize,
     pub routed_packets: u64,
     pub fallback_packets: u64,
+    pub fallback_unsupported_link_packets: u64,
+    pub fallback_non_ip_packets: u64,
+    pub fallback_malformed_packets: u64,
+    pub fallback_fragmented_packets: u64,
+    pub fallback_unsupported_transport_packets: u64,
     pub unique_flows: usize,
     pub packet_skew: PerfSkew,
     pub byte_skew: PerfSkew,
+    pub flow_skew: PerfSkew,
     pub shards: Vec<PerfShardLoad>,
 }
 
@@ -396,9 +644,15 @@ impl Default for PerfRunDiagnostics {
             shard_count: 1,
             routed_packets: 0,
             fallback_packets: 0,
+            fallback_unsupported_link_packets: 0,
+            fallback_non_ip_packets: 0,
+            fallback_malformed_packets: 0,
+            fallback_fragmented_packets: 0,
+            fallback_unsupported_transport_packets: 0,
             unique_flows: 0,
             packet_skew: PerfSkew::default(),
             byte_skew: PerfSkew::default(),
+            flow_skew: PerfSkew::default(),
             shards: Vec::new(),
         }
     }
@@ -466,8 +720,13 @@ pub struct PerfWorkerPlannerConfig {
     pub max_workers: usize,
     pub min_packets_per_worker: usize,
     pub min_flows_per_worker: usize,
+    pub preferred_packets_per_worker: usize,
+    pub preferred_bytes_per_worker: u64,
     pub max_packet_skew: f64,
     pub max_byte_skew: f64,
+    pub max_flow_skew: f64,
+    pub max_fallback_ratio: f64,
+    pub prefer_power_of_two: bool,
 }
 
 impl Default for PerfWorkerPlannerConfig {
@@ -476,28 +735,40 @@ impl Default for PerfWorkerPlannerConfig {
             max_workers: 0,
             min_packets_per_worker: 4096,
             min_flows_per_worker: 8,
+            preferred_packets_per_worker: 16_384,
+            preferred_bytes_per_worker: 1_000_000,
             max_packet_skew: 2.5,
             max_byte_skew: 3.0,
+            max_flow_skew: 4.0,
+            max_fallback_ratio: 1.0,
+            prefer_power_of_two: true,
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PerfWorkerPlan {
+    pub planner_version: u32,
     pub selected_workers: usize,
     pub available_workers: usize,
     pub max_workers: usize,
+    pub selected_score: f64,
     pub reason: String,
+    #[serde(default)]
+    pub decision_notes: Vec<String>,
     pub candidates: Vec<PerfWorkerCandidate>,
 }
 
 impl Default for PerfWorkerPlan {
     fn default() -> Self {
         Self {
+            planner_version: 1,
             selected_workers: 1,
             available_workers: 1,
             max_workers: 1,
+            selected_score: 0.0,
             reason: "planner data unavailable".to_owned(),
+            decision_notes: Vec::new(),
             candidates: Vec::new(),
         }
     }
@@ -507,7 +778,15 @@ impl Default for PerfWorkerPlan {
 pub struct PerfWorkerCandidate {
     pub workers: usize,
     pub eligible: bool,
+    pub score: f64,
     pub reason: String,
+    pub packets_per_worker: usize,
+    pub bytes_per_worker: u64,
+    pub flows_per_worker: usize,
+    pub fallback_ratio: f64,
+    pub is_power_of_two: bool,
+    pub warnings: Vec<String>,
+    pub rejections: Vec<String>,
     pub diagnostics: PerfRunDiagnostics,
 }
 
@@ -1192,23 +1471,77 @@ mod tests {
     }
 
     #[test]
-    fn worker_planner_rejects_small_multi_worker_inputs() {
-        let (eligible, reason) = worker_candidate_reason(
+    fn worker_planner_warns_on_small_packet_budget() {
+        let candidate = evaluate_worker_candidate(
             4,
-            8,
-            4,
-            &PerfRunDiagnostics::default(),
+            32,
+            4096,
+            PerfRunDiagnostics {
+                unique_flows: 16,
+                packet_skew: PerfSkew {
+                    max_over_average: 1.0,
+                    ..PerfSkew::default()
+                },
+                byte_skew: PerfSkew {
+                    max_over_average: 1.0,
+                    ..PerfSkew::default()
+                },
+                flow_skew: PerfSkew {
+                    max_over_average: 1.0,
+                    ..PerfSkew::default()
+                },
+                ..PerfRunDiagnostics::default()
+            },
             PerfWorkerPlannerConfig {
                 max_workers: 12,
                 min_packets_per_worker: 16,
                 min_flows_per_worker: 4,
                 max_packet_skew: 1.5,
                 max_byte_skew: 1.5,
+                ..PerfWorkerPlannerConfig::default()
             },
         );
 
-        assert!(!eligible);
-        assert_eq!("too few packets per worker: 8 < 16", reason);
+        assert!(candidate.eligible);
+        assert!(
+            candidate
+                .warnings
+                .iter()
+                .any(|warning| warning == "below minimum packet target: 8 < 16")
+        );
+    }
+
+    #[test]
+    fn worker_planner_rejects_low_flow_budget() {
+        let candidate = evaluate_worker_candidate(
+            4,
+            32,
+            4096,
+            PerfRunDiagnostics {
+                unique_flows: 12,
+                packet_skew: PerfSkew {
+                    max_over_average: 1.0,
+                    ..PerfSkew::default()
+                },
+                byte_skew: PerfSkew {
+                    max_over_average: 1.0,
+                    ..PerfSkew::default()
+                },
+                flow_skew: PerfSkew {
+                    max_over_average: 1.0,
+                    ..PerfSkew::default()
+                },
+                ..PerfRunDiagnostics::default()
+            },
+            PerfWorkerPlannerConfig {
+                min_packets_per_worker: 16,
+                min_flows_per_worker: 4,
+                ..PerfWorkerPlannerConfig::default()
+            },
+        );
+
+        assert!(!candidate.eligible);
+        assert_eq!("too few routed flows per worker: 3 < 4", candidate.reason);
     }
 
     #[test]
@@ -1220,9 +1553,112 @@ mod tests {
             min_flows_per_worker: 4,
             max_packet_skew: 1.5,
             max_byte_skew: 1.5,
+            ..PerfWorkerPlannerConfig::default()
         });
 
         assert!((1..=plan.max_workers).contains(&plan.selected_workers));
+    }
+
+    #[test]
+    fn worker_planner_penalizes_weak_non_power_of_two_candidates() {
+        let diagnostics = PerfRunDiagnostics {
+            unique_flows: 96_000,
+            packet_skew: PerfSkew {
+                max_over_average: 1.0,
+                ..PerfSkew::default()
+            },
+            byte_skew: PerfSkew {
+                max_over_average: 1.0,
+                ..PerfSkew::default()
+            },
+            flow_skew: PerfSkew {
+                max_over_average: 1.0,
+                ..PerfSkew::default()
+            },
+            ..PerfRunDiagnostics::default()
+        };
+        let config = PerfWorkerPlannerConfig {
+            preferred_packets_per_worker: 16_384,
+            preferred_bytes_per_worker: 0,
+            ..PerfWorkerPlannerConfig::default()
+        };
+        let eight = evaluate_worker_candidate(8, 96_000, 96_000, diagnostics.clone(), config);
+        let twelve = evaluate_worker_candidate(12, 96_000, 96_000, diagnostics, config);
+        let candidates = vec![eight.clone(), twelve.clone()];
+
+        let selected = select_worker_candidate(&candidates, config).unwrap();
+
+        assert!(eight.eligible);
+        assert!(twelve.eligible);
+        assert!(eight.score > twelve.score);
+        assert_eq!(8, selected.workers);
+    }
+
+    #[test]
+    fn worker_planner_treats_single_worker_as_fallback_baseline() {
+        let diagnostics = PerfRunDiagnostics {
+            unique_flows: 20_000,
+            packet_skew: PerfSkew {
+                max_over_average: 1.0,
+                ..PerfSkew::default()
+            },
+            byte_skew: PerfSkew {
+                max_over_average: 1.0,
+                ..PerfSkew::default()
+            },
+            flow_skew: PerfSkew {
+                max_over_average: 1.0,
+                ..PerfSkew::default()
+            },
+            ..PerfRunDiagnostics::default()
+        };
+        let config = PerfWorkerPlannerConfig {
+            preferred_packets_per_worker: 16_384,
+            preferred_bytes_per_worker: 0,
+            ..PerfWorkerPlannerConfig::default()
+        };
+        let single = evaluate_worker_candidate(1, 20_000, 20_000, diagnostics.clone(), config);
+        let two = evaluate_worker_candidate(2, 20_000, 20_000, diagnostics, config);
+        let candidates = vec![single.clone(), two.clone()];
+        let selected = select_worker_candidate(&candidates, config).unwrap();
+
+        assert!(single.eligible);
+        assert!(two.eligible);
+        assert!(two.score > single.score);
+        assert_eq!(2, selected.workers);
+    }
+
+    #[test]
+    fn worker_planner_prefers_larger_power_of_two_inside_score_band() {
+        let diagnostics = PerfRunDiagnostics {
+            unique_flows: 20_000,
+            packet_skew: PerfSkew {
+                max_over_average: 1.02,
+                ..PerfSkew::default()
+            },
+            byte_skew: PerfSkew {
+                max_over_average: 1.02,
+                ..PerfSkew::default()
+            },
+            flow_skew: PerfSkew {
+                max_over_average: 1.02,
+                ..PerfSkew::default()
+            },
+            ..PerfRunDiagnostics::default()
+        };
+        let config = PerfWorkerPlannerConfig {
+            min_packets_per_worker: 4096,
+            preferred_packets_per_worker: 16_384,
+            preferred_bytes_per_worker: 1_000_000,
+            ..PerfWorkerPlannerConfig::default()
+        };
+        let two = evaluate_worker_candidate(2, 20_000, 2_048_890, diagnostics.clone(), config);
+        let four = evaluate_worker_candidate(4, 20_000, 2_048_890, diagnostics.clone(), config);
+        let eight = evaluate_worker_candidate(8, 20_000, 2_048_890, diagnostics, config);
+        let candidates = vec![two, four, eight];
+        let selected = select_worker_candidate(&candidates, config).unwrap();
+
+        assert_eq!(8, selected.workers);
     }
 
     #[test]

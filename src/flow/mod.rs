@@ -233,11 +233,25 @@ pub struct FlowTableStats {
     pub dropped_new_flows: u64,
     pub tcp_stream_chunks: u64,
     pub tcp_stream_bytes: u64,
+    pub tcp_current_stream_chunks: u64,
+    pub tcp_current_stream_bytes: u64,
+    pub tcp_buffered_stream_chunks: u64,
+    pub tcp_buffered_stream_bytes: u64,
+    pub tcp_overlap_trimmed_stream_chunks: u64,
+    pub tcp_overlap_trimmed_stream_bytes: u64,
     pub tcp_gaps: u64,
     pub tcp_retransmissions: u64,
     pub tcp_overlaps: u64,
     pub tcp_out_of_order_buffered: u64,
+    pub tcp_out_of_order_buffered_bytes: u64,
     pub tcp_out_of_order_dropped: u64,
+    pub tcp_out_of_order_dropped_bytes: u64,
+    pub tcp_retransmitted_bytes: u64,
+    pub tcp_overlap_trimmed_bytes: u64,
+    pub tcp_reassembly_buffered_bytes_peak: usize,
+    pub tcp_midstream_starts: u64,
+    pub tcp_syns: u64,
+    pub tcp_fins: u64,
     pub tcp_resets: u64,
 }
 
@@ -443,14 +457,33 @@ impl TcpFlowState {
         config: &FlowTableConfig,
         stats: &mut FlowTableStats,
     ) -> TcpObservation<'a> {
+        if segment.flags.syn {
+            stats.tcp_syns = stats.tcp_syns.saturating_add(1);
+        }
+        if segment.flags.fin {
+            stats.tcp_fins = stats.tcp_fins.saturating_add(1);
+        }
+
+        let flow_buffered_bytes = self.buffered_bytes();
         let state = &mut self.directions[direction.index()];
-        let observation = state.observe(direction, segment, payload, config, stats);
+        let observation = state.observe(
+            direction,
+            segment,
+            payload,
+            config,
+            flow_buffered_bytes,
+            stats,
+        );
         stats.tcp_stream_chunks = stats
             .tcp_stream_chunks
             .saturating_add(observation.stream_chunks.len() as u64);
         stats.tcp_stream_bytes = stats
             .tcp_stream_bytes
             .saturating_add(stream_chunk_bytes(&observation.stream_chunks));
+        observe_stream_chunk_sources(&observation.stream_chunks, stats);
+        stats.tcp_reassembly_buffered_bytes_peak = stats
+            .tcp_reassembly_buffered_bytes_peak
+            .max(self.buffered_bytes());
 
         if segment.flags.rst {
             self.resets = self.resets.saturating_add(1);
@@ -462,6 +495,13 @@ impl TcpFlowState {
 
         observation
     }
+
+    fn buffered_bytes(&self) -> usize {
+        self.directions
+            .iter()
+            .map(|direction| direction.buffered_bytes)
+            .sum()
+    }
 }
 
 impl TcpDirectionState {
@@ -471,6 +511,7 @@ impl TcpDirectionState {
         segment: TcpSegment,
         payload: &'a [u8],
         config: &FlowTableConfig,
+        flow_buffered_bytes: usize,
         stats: &mut FlowTableStats,
     ) -> TcpObservation<'a> {
         let mut stream_chunks = SmallVec::new();
@@ -504,6 +545,9 @@ impl TcpDirectionState {
         let Some(expected) = self.next_seq else {
             self.initial_seq = Some(start);
             self.next_seq = Some(end);
+            if !segment.flags.syn {
+                stats.tcp_midstream_starts = stats.tcp_midstream_starts.saturating_add(1);
+            }
             push_current_stream_chunk(
                 &mut stream_chunks,
                 direction,
@@ -535,6 +579,7 @@ impl TcpDirectionState {
             if seq_after(end, expected) {
                 self.overlaps = self.overlaps.saturating_add(1);
                 stats.tcp_overlaps = stats.tcp_overlaps.saturating_add(1);
+                let before_bytes = stream_chunk_bytes(&stream_chunks);
                 push_trimmed_current_stream_chunk(
                     &mut stream_chunks,
                     direction,
@@ -542,27 +587,40 @@ impl TcpDirectionState {
                     payload,
                     expected,
                 );
+                let emitted_bytes = stream_chunk_bytes(&stream_chunks).saturating_sub(before_bytes);
+                stats.tcp_overlap_trimmed_bytes = stats
+                    .tcp_overlap_trimmed_bytes
+                    .saturating_add((payload.len() as u64).saturating_sub(emitted_bytes));
                 self.next_seq = Some(end);
                 self.consume_contiguous_buffer(direction, &mut stream_chunks);
                 TcpSequenceStatus::Overlap
             } else {
                 self.retransmissions = self.retransmissions.saturating_add(1);
                 stats.tcp_retransmissions = stats.tcp_retransmissions.saturating_add(1);
+                stats.tcp_retransmitted_bytes = stats
+                    .tcp_retransmitted_bytes
+                    .saturating_add(payload.len() as u64);
                 TcpSequenceStatus::Retransmission
             }
         } else {
-            match self.buffer_out_of_order(segment, payload, config) {
+            match self.buffer_out_of_order(segment, payload, config, flow_buffered_bytes) {
                 BufferOutcome::Buffered => {
                     self.gaps = self.gaps.saturating_add(1);
                     self.out_of_order_buffered = self.out_of_order_buffered.saturating_add(1);
                     stats.tcp_gaps = stats.tcp_gaps.saturating_add(1);
                     stats.tcp_out_of_order_buffered =
                         stats.tcp_out_of_order_buffered.saturating_add(1);
+                    stats.tcp_out_of_order_buffered_bytes = stats
+                        .tcp_out_of_order_buffered_bytes
+                        .saturating_add(payload.len() as u64);
                     TcpSequenceStatus::OutOfOrderBuffered
                 }
                 BufferOutcome::Duplicate => {
                     self.retransmissions = self.retransmissions.saturating_add(1);
                     stats.tcp_retransmissions = stats.tcp_retransmissions.saturating_add(1);
+                    stats.tcp_retransmitted_bytes = stats
+                        .tcp_retransmitted_bytes
+                        .saturating_add(payload.len() as u64);
                     TcpSequenceStatus::Retransmission
                 }
                 BufferOutcome::Dropped => {
@@ -571,6 +629,9 @@ impl TcpDirectionState {
                     stats.tcp_gaps = stats.tcp_gaps.saturating_add(1);
                     stats.tcp_out_of_order_dropped =
                         stats.tcp_out_of_order_dropped.saturating_add(1);
+                    stats.tcp_out_of_order_dropped_bytes = stats
+                        .tcp_out_of_order_dropped_bytes
+                        .saturating_add(payload.len() as u64);
                     TcpSequenceStatus::OutOfOrderDropped
                 }
             }
@@ -584,6 +645,7 @@ impl TcpDirectionState {
         segment: TcpSegment,
         payload: &[u8],
         config: &FlowTableConfig,
+        flow_buffered_bytes: usize,
     ) -> BufferOutcome {
         let start = segment.sequence_number;
         let end = start.wrapping_add(segment.sequence_span());
@@ -597,7 +659,7 @@ impl TcpDirectionState {
         if self.buffered.len() >= config.max_tcp_out_of_order_segments_per_direction {
             return BufferOutcome::Dropped;
         }
-        if self.buffered_bytes.saturating_add(payload.len())
+        if flow_buffered_bytes.saturating_add(payload.len())
             > config.max_tcp_buffered_bytes_per_flow
         {
             return BufferOutcome::Dropped;
@@ -771,6 +833,33 @@ fn push_trimmed_current_stream_chunk<'a>(
 
 fn stream_chunk_bytes(chunks: &[StreamChunk<'_>]) -> u64 {
     chunks.iter().map(|chunk| chunk.len() as u64).sum()
+}
+
+fn observe_stream_chunk_sources(chunks: &[StreamChunk<'_>], stats: &mut FlowTableStats) {
+    for chunk in chunks {
+        match chunk.source {
+            StreamChunkSource::CurrentSegment => {
+                stats.tcp_current_stream_chunks = stats.tcp_current_stream_chunks.saturating_add(1);
+                stats.tcp_current_stream_bytes = stats
+                    .tcp_current_stream_bytes
+                    .saturating_add(chunk.len() as u64);
+            }
+            StreamChunkSource::BufferedSegment => {
+                stats.tcp_buffered_stream_chunks =
+                    stats.tcp_buffered_stream_chunks.saturating_add(1);
+                stats.tcp_buffered_stream_bytes = stats
+                    .tcp_buffered_stream_bytes
+                    .saturating_add(chunk.len() as u64);
+            }
+            StreamChunkSource::OverlapTrimmed => {
+                stats.tcp_overlap_trimmed_stream_chunks =
+                    stats.tcp_overlap_trimmed_stream_chunks.saturating_add(1);
+                stats.tcp_overlap_trimmed_stream_bytes = stats
+                    .tcp_overlap_trimmed_stream_bytes
+                    .saturating_add(chunk.len() as u64);
+            }
+        }
+    }
 }
 
 impl FlowKey {
@@ -994,6 +1083,75 @@ mod tests {
     }
 
     #[test]
+    fn trims_overlapping_buffered_segments_when_gap_closes() {
+        let mut table = table();
+        let first_raw = tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 100, b"ab", 1);
+        let buffered_raw = tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 105, b"fghij", 2);
+        let overlapping_buffered_raw =
+            tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 108, b"ijklm", 3);
+        let gap_fill_raw = tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 102, b"cde", 4);
+
+        let _ = observe(&mut table, &first_raw);
+        let _ = observe(&mut table, &buffered_raw);
+        let _ = observe(&mut table, &overlapping_buffered_raw);
+        let gap_fill = observe(&mut table, &gap_fill_raw);
+
+        let tcp = gap_fill.tcp.unwrap();
+        assert_eq!(TcpSequenceStatus::GapFilled, tcp.status);
+        assert_eq!(113, tcp.next_sequence);
+        assert_eq!(3, tcp.stream_chunks.len());
+        assert_stream(
+            &tcp.stream_chunks[0],
+            b"cde",
+            102,
+            StreamChunkSource::CurrentSegment,
+        );
+        assert_stream(
+            &tcp.stream_chunks[1],
+            b"fghij",
+            105,
+            StreamChunkSource::BufferedSegment,
+        );
+        assert_stream(
+            &tcp.stream_chunks[2],
+            b"klm",
+            110,
+            StreamChunkSource::BufferedSegment,
+        );
+        assert_eq!(2, table.stats().tcp_buffered_stream_chunks);
+        assert_eq!(8, table.stats().tcp_buffered_stream_bytes);
+        assert_eq!(10, table.stats().tcp_out_of_order_buffered_bytes);
+    }
+
+    #[test]
+    fn handles_sequence_wrap_in_order() {
+        let mut table = table();
+        let first_raw = tcp_packet(
+            [10, 0, 0, 1],
+            1111,
+            [10, 0, 0, 2],
+            80,
+            u32::MAX - 1,
+            b"ab",
+            1,
+        );
+        let second_raw = tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 0, b"c", 2);
+        let first = observe(&mut table, &first_raw);
+        let second = observe(&mut table, &second_raw);
+
+        assert_eq!(TcpSequenceStatus::Init, first.tcp.unwrap().status);
+        let second_tcp = second.tcp.unwrap();
+        assert_eq!(TcpSequenceStatus::InOrder, second_tcp.status);
+        assert_eq!(1, second_tcp.next_sequence);
+        assert_stream(
+            &second_tcp.stream_chunks[0],
+            b"c",
+            0,
+            StreamChunkSource::CurrentSegment,
+        );
+    }
+
+    #[test]
     fn detects_retransmissions_and_overlaps() {
         let mut table = table();
         let first_raw = tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 100, b"abcdef", 1);
@@ -1049,6 +1207,35 @@ mod tests {
         );
         assert_eq!(1, table.stats().tcp_retransmissions);
         assert_eq!(1, table.stats().tcp_out_of_order_buffered);
+    }
+
+    #[test]
+    fn enforces_out_of_order_byte_limit_across_both_directions() {
+        let mut table = FlowTable::new(FlowTableConfig::new(16, 120_000, 4, 16));
+        let forward_initial = tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 100, b"a", 1);
+        let reverse_initial = tcp_packet([10, 0, 0, 2], 80, [10, 0, 0, 1], 1111, 200, b"x", 2);
+        let forward_gap = tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 105, b"bcd", 3);
+        let reverse_gap = tcp_packet([10, 0, 0, 2], 80, [10, 0, 0, 1], 1111, 205, b"yza", 4);
+
+        let _ = observe(&mut table, &forward_initial);
+        let _ = observe(&mut table, &reverse_initial);
+        let buffered = observe(&mut table, &forward_gap);
+        let dropped = observe(&mut table, &reverse_gap);
+
+        assert_eq!(
+            TcpSequenceStatus::OutOfOrderBuffered,
+            buffered.tcp.unwrap().status
+        );
+        assert_eq!(
+            TcpSequenceStatus::OutOfOrderDropped,
+            dropped.tcp.unwrap().status
+        );
+        let stats = table.stats();
+        assert_eq!(1, stats.tcp_out_of_order_buffered);
+        assert_eq!(3, stats.tcp_out_of_order_buffered_bytes);
+        assert_eq!(1, stats.tcp_out_of_order_dropped);
+        assert_eq!(3, stats.tcp_out_of_order_dropped_bytes);
+        assert_eq!(3, stats.tcp_reassembly_buffered_bytes_peak);
     }
 
     #[test]
