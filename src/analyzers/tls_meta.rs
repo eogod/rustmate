@@ -47,7 +47,7 @@ impl Analyzer for TlsMetaAnalyzer {
 
         events.push(Event::from_packet(
             self.name(),
-            "tls_record",
+            "tls_packet_record",
             packet,
             transport.bytes.len(),
             json!({

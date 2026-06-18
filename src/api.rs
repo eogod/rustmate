@@ -1648,6 +1648,8 @@ fn parse_message_protocol(raw: &str) -> Result<StreamMessageProtocol, ApiError> 
     match normalized_token(raw).as_str() {
         "http" | "http1" | "http_1" | "http/1" | "http/1.1" => Ok(StreamMessageProtocol::Http1),
         "dns" => Ok(StreamMessageProtocol::Dns),
+        "ws" | "websocket" | "web_socket" => Ok(StreamMessageProtocol::WebSocket),
+        "tls" | "ssl" => Ok(StreamMessageProtocol::Tls),
         _ => Err(ApiError::bad_request(format!(
             "invalid message protocol: {raw}"
         ))),
@@ -1826,6 +1828,15 @@ mod tests {
         assert_eq!(Some(StreamMessageKind::Response), query.kind);
         assert_eq!(Some(StreamMessageStatus::Complete), query.status);
         assert_eq!(64, query.limit);
+
+        assert_eq!(
+            StreamMessageProtocol::WebSocket,
+            parse_message_protocol("websocket").unwrap()
+        );
+        assert_eq!(
+            StreamMessageProtocol::Tls,
+            parse_message_protocol("tls").unwrap()
+        );
     }
 
     #[test]

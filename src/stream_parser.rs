@@ -11,6 +11,8 @@ use crate::{
 
 const DEFAULT_MAX_HTTP1_STATES: usize = 131_072;
 const DEFAULT_MAX_DNS_STATES: usize = 131_072;
+const DEFAULT_MAX_WEBSOCKET_STATES: usize = 131_072;
+const DEFAULT_MAX_TLS_STATES: usize = 131_072;
 const DEFAULT_MAX_HTTP1_HEADER_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_HTTP1_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_MESSAGES_PER_CHUNK: usize = 512;
@@ -20,6 +22,8 @@ pub struct StreamParserConfig {
     pub enabled: bool,
     pub max_http1_states: usize,
     pub max_dns_states: usize,
+    pub max_websocket_states: usize,
+    pub max_tls_states: usize,
     pub max_http1_header_bytes: usize,
     pub max_http1_buffer_bytes: usize,
     pub max_messages_per_chunk: usize,
@@ -31,6 +35,8 @@ impl Default for StreamParserConfig {
             enabled: true,
             max_http1_states: DEFAULT_MAX_HTTP1_STATES,
             max_dns_states: DEFAULT_MAX_DNS_STATES,
+            max_websocket_states: DEFAULT_MAX_WEBSOCKET_STATES,
+            max_tls_states: DEFAULT_MAX_TLS_STATES,
             max_http1_header_bytes: DEFAULT_MAX_HTTP1_HEADER_BYTES,
             max_http1_buffer_bytes: DEFAULT_MAX_HTTP1_BUFFER_BYTES,
             max_messages_per_chunk: DEFAULT_MAX_MESSAGES_PER_CHUNK,
@@ -55,6 +61,14 @@ pub struct StreamParserStats {
     pub dns_messages: u64,
     pub dns_parse_errors: u64,
     pub dns_dropped_datagrams: u64,
+    pub websocket_active_states: usize,
+    pub websocket_messages: u64,
+    pub websocket_parse_errors: u64,
+    pub websocket_dropped_chunks: u64,
+    pub tls_active_states: usize,
+    pub tls_messages: u64,
+    pub tls_parse_errors: u64,
+    pub tls_dropped_chunks: u64,
 }
 
 pub struct StreamParserLayer {
@@ -69,6 +83,8 @@ impl StreamParserLayer {
         let registry = ProtocolMessageAnalyzer::with_limits(
             config.max_http1_states,
             config.max_dns_states,
+            config.max_websocket_states,
+            config.max_tls_states,
             config.max_http1_header_bytes,
             config.max_http1_buffer_bytes,
         );
@@ -137,15 +153,23 @@ impl StreamParserLayer {
         stats.parser_active_states = self
             .registry
             .http1_active_states()
-            .saturating_add(self.registry.dns_active_states());
+            .saturating_add(self.registry.dns_active_states())
+            .saturating_add(self.registry.websocket_active_states())
+            .saturating_add(self.registry.tls_active_states());
         stats.parser_evicted_states = self
             .registry
             .http1_evicted_states()
-            .saturating_add(self.registry.dns_evicted_states());
+            .saturating_add(self.registry.dns_evicted_states())
+            .saturating_add(self.registry.websocket_evicted_states())
+            .saturating_add(self.registry.tls_evicted_states());
         stats.http1_active_states = self.registry.http1_active_states();
         stats.http1_dropped_chunks = self.registry.http1_dropped_chunks();
         stats.dns_active_states = self.registry.dns_active_states();
         stats.dns_dropped_datagrams = self.registry.dns_dropped_datagrams();
+        stats.websocket_active_states = self.registry.websocket_active_states();
+        stats.websocket_dropped_chunks = self.registry.websocket_dropped_chunks();
+        stats.tls_active_states = self.registry.tls_active_states();
+        stats.tls_dropped_chunks = self.registry.tls_dropped_chunks();
         stats
     }
 
@@ -168,6 +192,12 @@ impl StreamParserLayer {
                 if message.protocol == StreamMessageProtocol::Dns {
                     self.stats.dns_messages = self.stats.dns_messages.saturating_add(1);
                 }
+                if message.protocol == StreamMessageProtocol::WebSocket {
+                    self.stats.websocket_messages = self.stats.websocket_messages.saturating_add(1);
+                }
+                if message.protocol == StreamMessageProtocol::Tls {
+                    self.stats.tls_messages = self.stats.tls_messages.saturating_add(1);
+                }
                 if message.status == StreamMessageStatus::ParseError {
                     match message.protocol {
                         StreamMessageProtocol::Http1 => {
@@ -177,6 +207,14 @@ impl StreamParserLayer {
                         StreamMessageProtocol::Dns => {
                             self.stats.dns_parse_errors =
                                 self.stats.dns_parse_errors.saturating_add(1);
+                        }
+                        StreamMessageProtocol::WebSocket => {
+                            self.stats.websocket_parse_errors =
+                                self.stats.websocket_parse_errors.saturating_add(1);
+                        }
+                        StreamMessageProtocol::Tls => {
+                            self.stats.tls_parse_errors =
+                                self.stats.tls_parse_errors.saturating_add(1);
                         }
                     }
                 }
@@ -196,15 +234,23 @@ impl StreamParserLayer {
         self.stats.parser_active_states = self
             .registry
             .http1_active_states()
-            .saturating_add(self.registry.dns_active_states());
+            .saturating_add(self.registry.dns_active_states())
+            .saturating_add(self.registry.websocket_active_states())
+            .saturating_add(self.registry.tls_active_states());
         self.stats.parser_evicted_states = self
             .registry
             .http1_evicted_states()
-            .saturating_add(self.registry.dns_evicted_states());
+            .saturating_add(self.registry.dns_evicted_states())
+            .saturating_add(self.registry.websocket_evicted_states())
+            .saturating_add(self.registry.tls_evicted_states());
         self.stats.http1_active_states = self.registry.http1_active_states();
         self.stats.http1_dropped_chunks = self.registry.http1_dropped_chunks();
         self.stats.dns_active_states = self.registry.dns_active_states();
         self.stats.dns_dropped_datagrams = self.registry.dns_dropped_datagrams();
+        self.stats.websocket_active_states = self.registry.websocket_active_states();
+        self.stats.websocket_dropped_chunks = self.registry.websocket_dropped_chunks();
+        self.stats.tls_active_states = self.registry.tls_active_states();
+        self.stats.tls_dropped_chunks = self.registry.tls_dropped_chunks();
     }
 }
 
@@ -220,6 +266,8 @@ impl StreamParserConfig {
             enabled: false,
             max_http1_states: 0,
             max_dns_states: 0,
+            max_websocket_states: 0,
+            max_tls_states: 0,
             max_http1_header_bytes: 0,
             max_http1_buffer_bytes: 0,
             max_messages_per_chunk: 0,
@@ -235,6 +283,8 @@ impl StreamParserConfig {
             enabled: true,
             max_http1_states: self.max_http1_states.max(1),
             max_dns_states: self.max_dns_states.max(1),
+            max_websocket_states: self.max_websocket_states.max(1),
+            max_tls_states: self.max_tls_states.max(1),
             max_http1_header_bytes: self.max_http1_header_bytes.max(1),
             max_http1_buffer_bytes: self.max_http1_buffer_bytes.max(1),
             max_messages_per_chunk: self.max_messages_per_chunk.max(1),
@@ -317,6 +367,54 @@ mod tests {
         assert_eq!(1, stats.dns_active_states);
     }
 
+    #[test]
+    fn parser_layer_counts_websocket_messages_and_states() {
+        let mut layer = StreamParserLayer::default();
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+        let upgrade = b"GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+        feed(
+            &mut layer,
+            &mut flow_table,
+            &tcp_packet(100, upgrade),
+            &mut events,
+        );
+        feed(
+            &mut layer,
+            &mut flow_table,
+            &tcp_packet(100 + upgrade.len() as u32, &[0x81, 0x02, b'o', b'k']),
+            &mut events,
+        );
+
+        let stats = layer.stats();
+        assert_eq!(2, events.len());
+        assert_eq!(1, stats.websocket_messages);
+        assert_eq!(1, stats.websocket_active_states);
+        assert_eq!(0, stats.websocket_parse_errors);
+    }
+
+    #[test]
+    fn parser_layer_counts_tls_messages_and_states() {
+        let mut layer = StreamParserLayer::default();
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+
+        feed(
+            &mut layer,
+            &mut flow_table,
+            &tcp_packet_to_port(100, 443, &[23, 3, 3, 0, 3, 1, 2, 3]),
+            &mut events,
+        );
+
+        let stats = layer.stats();
+        assert_eq!(1, events.len());
+        assert_eq!("tls_record", events[0].event_type);
+        assert_eq!(1, stats.tls_messages);
+        assert_eq!(1, stats.tls_active_states);
+        assert_eq!(0, stats.tls_parse_errors);
+    }
+
     fn feed(
         layer: &mut StreamParserLayer,
         flow_table: &mut FlowTable,
@@ -348,9 +446,13 @@ mod tests {
     }
 
     fn tcp_packet(sequence: u32, payload: &[u8]) -> RawPacket {
+        tcp_packet_to_port(sequence, 80, payload)
+    }
+
+    fn tcp_packet_to_port(sequence: u32, destination_port: u16, payload: &[u8]) -> RawPacket {
         let builder = PacketBuilder::ethernet2([1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2])
             .ipv4([10, 0, 0, 1], [10, 0, 0, 2], 20)
-            .tcp(4242, 80, sequence, 2048);
+            .tcp(4242, destination_port, sequence, 2048);
         let mut data = Vec::with_capacity(builder.size(payload.len()));
         builder.write(&mut data, payload).unwrap();
         RawPacket {

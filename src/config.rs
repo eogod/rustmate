@@ -31,6 +31,8 @@ pub const DEFAULT_STREAM_SLICE_HEX_ROW_BYTES: usize = 16;
 pub const DEFAULT_MAX_STREAM_TRANSFORM_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_HTTP1_PARSER_STATES: usize = 131_072;
 pub const DEFAULT_MAX_DNS_PARSER_STATES: usize = 131_072;
+pub const DEFAULT_MAX_WEBSOCKET_PARSER_STATES: usize = 131_072;
+pub const DEFAULT_MAX_TLS_PARSER_STATES: usize = 131_072;
 pub const DEFAULT_MAX_HTTP1_HEADER_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_HTTP1_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_PARSER_MESSAGES_PER_CHUNK: usize = 512;
@@ -90,6 +92,8 @@ pub struct Config {
     pub stream_parser_enabled: bool,
     pub max_http1_parser_states: usize,
     pub max_dns_parser_states: usize,
+    pub max_websocket_parser_states: usize,
+    pub max_tls_parser_states: usize,
     pub max_http1_header_bytes: usize,
     pub max_http1_buffer_bytes: usize,
     pub max_parser_messages_per_chunk: usize,
@@ -136,6 +140,8 @@ impl Default for Config {
             stream_parser_enabled: true,
             max_http1_parser_states: DEFAULT_MAX_HTTP1_PARSER_STATES,
             max_dns_parser_states: DEFAULT_MAX_DNS_PARSER_STATES,
+            max_websocket_parser_states: DEFAULT_MAX_WEBSOCKET_PARSER_STATES,
+            max_tls_parser_states: DEFAULT_MAX_TLS_PARSER_STATES,
             max_http1_header_bytes: DEFAULT_MAX_HTTP1_HEADER_BYTES,
             max_http1_buffer_bytes: DEFAULT_MAX_HTTP1_BUFFER_BYTES,
             max_parser_messages_per_chunk: DEFAULT_MAX_PARSER_MESSAGES_PER_CHUNK,

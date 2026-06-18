@@ -1,14 +1,15 @@
 use std::{
+    collections::VecDeque,
     hash::Hash,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
-use ahash::RandomState;
+use ahash::{AHashMap, RandomState};
 
 use crate::{
     config::RunMode,
     flow::{Endpoint, FlowKey, FlowRoute},
-    health::{ShardedQueueSnapshot, WorkerQueueSnapshot},
+    health::{ShardedQueueSnapshot, WorkerHotFlowSnapshot, WorkerQueueSnapshot},
     packet::{LinkLayer, RawPacket, TransportProtocol},
 };
 
@@ -18,6 +19,7 @@ const ROUTE_HASHER: RandomState = RandomState::with_seeds(
     0x94d0_49bb_1331_11eb,
     0x2545_f491_4f6c_dd1d,
 );
+const DEFAULT_MAX_TRACKED_ROUTE_FLOWS: usize = 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardCoordinatorConfig {
@@ -237,6 +239,9 @@ pub enum FallbackRouteReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardLoadMetrics {
     shards: Vec<ShardLoad>,
+    flow_loads: AHashMap<FlowKey, FlowRouteLoad>,
+    flow_order: VecDeque<FlowKey>,
+    max_tracked_flows: usize,
     total_packets: u64,
     total_bytes: u64,
     flow_routed_packets: u64,
@@ -255,6 +260,9 @@ impl ShardLoadMetrics {
         let shard_count = shard_count.max(1);
         Self {
             shards: (0..shard_count).map(ShardLoad::new).collect(),
+            flow_loads: AHashMap::new(),
+            flow_order: VecDeque::new(),
+            max_tracked_flows: DEFAULT_MAX_TRACKED_ROUTE_FLOWS,
             total_packets: 0,
             total_bytes: 0,
             flow_routed_packets: 0,
@@ -311,6 +319,34 @@ impl ShardLoadMetrics {
 
         if let Some(load) = self.shards.get_mut(route.shard) {
             load.observe(route.kind, route.fallback_reason, bytes);
+        }
+        if route.kind == ShardRouteKind::FlowAffinity
+            && let Some(flow_route) = route.flow_route
+        {
+            self.observe_flow_load(flow_route.key, route.shard, bytes);
+        }
+    }
+
+    fn observe_flow_load(&mut self, key: FlowKey, shard: usize, bytes: u64) {
+        if !self.flow_loads.contains_key(&key) {
+            while self.flow_loads.len() >= self.max_tracked_flows {
+                if self.flow_order.is_empty() {
+                    break;
+                }
+                let Some(evicted) = self.flow_order.pop_front() else {
+                    break;
+                };
+                self.flow_loads.remove(&evicted);
+            }
+            if self.flow_loads.len() >= self.max_tracked_flows {
+                return;
+            }
+            self.flow_loads.insert(key, FlowRouteLoad::new(shard));
+            self.flow_order.push_back(key);
+        }
+
+        if let Some(load) = self.flow_loads.get_mut(&key) {
+            load.observe(shard, bytes);
         }
     }
 
@@ -401,6 +437,7 @@ impl ShardLoadMetrics {
                 fallback_malformed_packets: load.fallback_malformed_packets,
                 fallback_fragmented_packets: load.fallback_fragmented_packets,
                 fallback_unsupported_transport_packets: load.fallback_unsupported_transport_packets,
+                hot_flow: self.hot_flow_snapshot(load.id, load.packets, load.bytes),
             })
             .collect::<Vec<_>>();
 
@@ -416,6 +453,53 @@ impl ShardLoadMetrics {
             output_queue_len,
             output_queue_capacity,
         }
+    }
+
+    fn hot_flow_snapshot(
+        &self,
+        shard: usize,
+        shard_packets: u64,
+        shard_bytes: u64,
+    ) -> Option<WorkerHotFlowSnapshot> {
+        let (key, load) = self
+            .flow_loads
+            .iter()
+            .filter(|(_, load)| load.shard == shard)
+            .max_by_key(|(_, load)| load.bytes)?;
+        Some(WorkerHotFlowSnapshot {
+            stream_id: key.stable_id(),
+            stream_id_hex: format!("{:016x}", key.stable_id()),
+            protocol: transport_name(key.protocol).to_owned(),
+            endpoint_a: endpoint_label(key.a),
+            endpoint_b: endpoint_label(key.b),
+            packets: load.packets,
+            bytes: load.bytes,
+            packet_share_milli: ratio_milli(load.packets, shard_packets),
+            byte_share_milli: ratio_milli(load.bytes, shard_bytes),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlowRouteLoad {
+    shard: usize,
+    packets: u64,
+    bytes: u64,
+}
+
+impl FlowRouteLoad {
+    fn new(shard: usize) -> Self {
+        Self {
+            shard,
+            packets: 0,
+            bytes: 0,
+        }
+    }
+
+    fn observe(&mut self, shard: usize, bytes: u64) {
+        self.shard = shard;
+        self.packets = self.packets.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
     }
 }
 
@@ -774,6 +858,30 @@ fn skew_ratio_milli(max: u64, total: u64, shard_count: usize) -> u64 {
     ratio.min(u128::from(u64::MAX)) as u64
 }
 
+fn ratio_milli(part: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let ratio = u128::from(part).saturating_mul(1000) / u128::from(total);
+    ratio.min(u128::from(u64::MAX)) as u64
+}
+
+fn endpoint_label(endpoint: Endpoint) -> String {
+    match endpoint.addr {
+        IpAddr::V4(addr) => format!("{addr}:{}", endpoint.port),
+        IpAddr::V6(addr) => format!("[{addr}]:{}", endpoint.port),
+    }
+}
+
+fn transport_name(protocol: TransportProtocol) -> &'static str {
+    match protocol {
+        TransportProtocol::Tcp => "tcp",
+        TransportProtocol::Udp => "udp",
+        TransportProtocol::Icmpv4 => "icmpv4",
+        TransportProtocol::Icmpv6 => "icmpv6",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,6 +1000,57 @@ mod tests {
         assert_eq!(1, snapshot.workers[1].fallback_malformed_packets);
     }
 
+    #[test]
+    fn queue_snapshot_reports_hot_flow_per_shard() {
+        let mut metrics = ShardLoadMetrics::new(2);
+        let light = FlowRoute::new(
+            TransportProtocol::Tcp,
+            Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                port: 1111,
+            },
+            Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                port: 80,
+            },
+        );
+        let heavy = FlowRoute::new(
+            TransportProtocol::Tcp,
+            Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+                port: 2222,
+            },
+            Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4)),
+                port: 443,
+            },
+        );
+
+        metrics.observe_route(flow_route_on_shard(heavy, 1), 1000);
+        metrics.observe_route(flow_route_on_shard(light, 1), 50);
+        metrics.observe_route(flow_route_on_shard(heavy, 1), 500);
+
+        let snapshot = metrics.queue_snapshot(
+            [ShardQueueLoad {
+                shard: 1,
+                len: 0,
+                capacity: 8,
+            }],
+            0,
+            16,
+        );
+        let hot = snapshot.workers[1].hot_flow.as_ref().unwrap();
+
+        assert_eq!(heavy.key.stable_id(), hot.stream_id);
+        assert_eq!("tcp", hot.protocol);
+        assert_eq!("10.0.0.3:2222", hot.endpoint_a);
+        assert_eq!("10.0.0.4:443", hot.endpoint_b);
+        assert_eq!(2, hot.packets);
+        assert_eq!(1500, hot.bytes);
+        assert_eq!(666, hot.packet_share_milli);
+        assert_eq!(967, hot.byte_share_milli);
+    }
+
     fn tcp_packet(
         source: [u8; 4],
         source_port: u16,
@@ -914,6 +1073,15 @@ mod tests {
             link_layer: LinkLayer::Ethernet,
             linktype: Linktype::ETHERNET.0,
             data,
+        }
+    }
+
+    fn flow_route_on_shard(flow_route: FlowRoute, shard: usize) -> ShardRoute {
+        ShardRoute {
+            shard,
+            kind: ShardRouteKind::FlowAffinity,
+            flow_route: Some(flow_route),
+            fallback_reason: None,
         }
     }
 }

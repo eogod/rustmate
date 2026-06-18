@@ -12,7 +12,8 @@ use crate::config::{
     DEFAULT_MAX_STREAM_SLICE_BYTES, DEFAULT_MAX_STREAM_SLICE_HIGHLIGHTS,
     DEFAULT_MAX_STREAM_TRANSFORM_BYTES, DEFAULT_MAX_STREAM_VIEW_MATCHES_PER_STREAM,
     DEFAULT_MAX_STREAMS, DEFAULT_MAX_TCP_BUFFERED_BYTES_PER_FLOW,
-    DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION, DEFAULT_PATTERN_REGEX_WINDOW_BYTES,
+    DEFAULT_MAX_TCP_OUT_OF_ORDER_SEGMENTS_PER_DIRECTION, DEFAULT_MAX_TLS_PARSER_STATES,
+    DEFAULT_MAX_WEBSOCKET_PARSER_STATES, DEFAULT_PATTERN_REGEX_WINDOW_BYTES,
     DEFAULT_STREAM_CONTENT_SEGMENT_BYTES, DEFAULT_STREAM_PREVIEW_BYTES,
     DEFAULT_STREAM_SLICE_HEX_ROW_BYTES, DEFAULT_STREAM_UPDATE_BYTES, DEFAULT_STREAM_UPDATE_PACKETS,
     DEFAULT_STREAM_VIEW_QUERY_LIMIT, DEFAULT_WORKER_QUEUE_DEPTH, DEFAULT_WORKERS, RunMode,
@@ -185,6 +186,14 @@ pub struct Opts {
     /// Max active DNS parser states across flow directions
     #[arg(long, default_value_t = DEFAULT_MAX_DNS_PARSER_STATES)]
     pub max_dns_parser_states: usize,
+
+    /// Max active WebSocket parser states across flow directions
+    #[arg(long, default_value_t = DEFAULT_MAX_WEBSOCKET_PARSER_STATES)]
+    pub max_websocket_parser_states: usize,
+
+    /// Max active TLS parser states across flow directions
+    #[arg(long, default_value_t = DEFAULT_MAX_TLS_PARSER_STATES)]
+    pub max_tls_parser_states: usize,
 
     /// Max HTTP/1 header bytes buffered before a parse error
     #[arg(long, default_value_t = DEFAULT_MAX_HTTP1_HEADER_BYTES)]

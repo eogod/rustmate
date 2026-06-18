@@ -111,6 +111,8 @@ pub struct PipelineStats {
     pub message_observed_messages: u64,
     pub message_http1_messages: u64,
     pub message_dns_messages: u64,
+    pub message_websocket_messages: u64,
+    pub message_tls_messages: u64,
     pub message_parse_errors: u64,
     pub parser_enabled: bool,
     pub parser_stream_chunks: u64,
@@ -127,6 +129,14 @@ pub struct PipelineStats {
     pub parser_dns_messages: u64,
     pub parser_dns_parse_errors: u64,
     pub parser_dns_dropped_datagrams: u64,
+    pub parser_websocket_active_states: usize,
+    pub parser_websocket_messages: u64,
+    pub parser_websocket_parse_errors: u64,
+    pub parser_websocket_dropped_chunks: u64,
+    pub parser_tls_active_states: usize,
+    pub parser_tls_messages: u64,
+    pub parser_tls_parse_errors: u64,
+    pub parser_tls_dropped_chunks: u64,
     pub pattern_matches: u64,
     pub pattern_dropped_matches: u64,
     pub pattern_matched_streams: usize,
@@ -365,6 +375,8 @@ impl PipelineStats {
         self.message_observed_messages = message_stats.observed_messages;
         self.message_http1_messages = message_stats.http1_messages;
         self.message_dns_messages = message_stats.dns_messages;
+        self.message_websocket_messages = message_stats.websocket_messages;
+        self.message_tls_messages = message_stats.tls_messages;
         self.message_parse_errors = message_stats.parse_errors;
     }
 
@@ -384,6 +396,14 @@ impl PipelineStats {
         self.parser_dns_messages = parser_stats.dns_messages;
         self.parser_dns_parse_errors = parser_stats.dns_parse_errors;
         self.parser_dns_dropped_datagrams = parser_stats.dns_dropped_datagrams;
+        self.parser_websocket_active_states = parser_stats.websocket_active_states;
+        self.parser_websocket_messages = parser_stats.websocket_messages;
+        self.parser_websocket_parse_errors = parser_stats.websocket_parse_errors;
+        self.parser_websocket_dropped_chunks = parser_stats.websocket_dropped_chunks;
+        self.parser_tls_active_states = parser_stats.tls_active_states;
+        self.parser_tls_messages = parser_stats.tls_messages;
+        self.parser_tls_parse_errors = parser_stats.tls_parse_errors;
+        self.parser_tls_dropped_chunks = parser_stats.tls_dropped_chunks;
     }
 
     pub(crate) fn add_stream_parser_stats(&mut self, parser_stats: StreamParserStats) {
@@ -430,6 +450,30 @@ impl PipelineStats {
         self.parser_dns_dropped_datagrams = self
             .parser_dns_dropped_datagrams
             .saturating_add(parser_stats.dns_dropped_datagrams);
+        self.parser_websocket_active_states = self
+            .parser_websocket_active_states
+            .saturating_add(parser_stats.websocket_active_states);
+        self.parser_websocket_messages = self
+            .parser_websocket_messages
+            .saturating_add(parser_stats.websocket_messages);
+        self.parser_websocket_parse_errors = self
+            .parser_websocket_parse_errors
+            .saturating_add(parser_stats.websocket_parse_errors);
+        self.parser_websocket_dropped_chunks = self
+            .parser_websocket_dropped_chunks
+            .saturating_add(parser_stats.websocket_dropped_chunks);
+        self.parser_tls_active_states = self
+            .parser_tls_active_states
+            .saturating_add(parser_stats.tls_active_states);
+        self.parser_tls_messages = self
+            .parser_tls_messages
+            .saturating_add(parser_stats.tls_messages);
+        self.parser_tls_parse_errors = self
+            .parser_tls_parse_errors
+            .saturating_add(parser_stats.tls_parse_errors);
+        self.parser_tls_dropped_chunks = self
+            .parser_tls_dropped_chunks
+            .saturating_add(parser_stats.tls_dropped_chunks);
     }
 }
 

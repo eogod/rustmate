@@ -537,7 +537,7 @@ function updateShardDiagnostics(health) {
   if (!workers.length) {
     const tr = document.createElement("tr");
     tr.className = "empty-row";
-    tr.innerHTML = '<td colspan="5">No shard telemetry.</td>';
+    tr.innerHTML = '<td colspan="6">No shard telemetry.</td>';
     el.shardDiagnostics.replaceChildren(tr);
     return;
   }
@@ -557,8 +557,29 @@ function shardRow(worker, busiest) {
     <td>${formatNumber(worker.routed_packets)}</td>
     <td>${formatBytes(worker.routed_bytes)}</td>
     <td>${fallbackBreakdown(fallback, malformed)}</td>
+    <td title="${escapeHtml(hotFlowTitle(worker.hot_flow))}">${escapeHtml(hotFlowSummary(worker.hot_flow))}</td>
   `;
   return tr;
+}
+
+function hotFlowSummary(flow) {
+  if (!flow) return "-";
+  return `${flow.protocol} ${shortEndpoint(flow.endpoint_a)} -> ${shortEndpoint(flow.endpoint_b)} / ${formatBytes(flow.bytes)} ${formatMilliPercent(flow.byte_share_milli)}`;
+}
+
+function hotFlowTitle(flow) {
+  if (!flow) return "no flow-routed packets on this shard";
+  return [
+    flow.stream_id_hex || "",
+    `${flow.protocol} ${flow.endpoint_a} -> ${flow.endpoint_b}`,
+    `${formatNumber(flow.packets)} packets, ${formatBytes(flow.bytes)}`,
+    `packet share ${formatMilliPercent(flow.packet_share_milli)}, byte share ${formatMilliPercent(flow.byte_share_milli)}`,
+  ].filter(Boolean).join(" / ");
+}
+
+function shortEndpoint(endpoint) {
+  const value = String(endpoint || "");
+  return value.length > 24 ? `${value.slice(0, 10)}..${value.slice(-10)}` : value;
 }
 
 function rowPassesCurrentFilters(row) {
@@ -896,6 +917,10 @@ function formatBytes(value) {
 
 function formatMilliRatio(value) {
   return `${(Number(value || 0) / 1000).toFixed(2)}x`;
+}
+
+function formatMilliPercent(value) {
+  return `${(Number(value || 0) / 10).toFixed(1)}%`;
 }
 
 function formatWarning(value) {

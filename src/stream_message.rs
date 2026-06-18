@@ -22,11 +22,16 @@ const DEFAULT_MAX_QUERY_LIMIT: usize = 512;
 const DEFAULT_MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_HTTP_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_HTTP_PARSER_STATES: usize = DEFAULT_MAX_STREAMS * 2;
+const DEFAULT_MAX_WEBSOCKET_PARSER_STATES: usize = DEFAULT_MAX_STREAMS * 2;
+const DEFAULT_MAX_TLS_PARSER_STATES: usize = DEFAULT_MAX_STREAMS * 2;
 const MAX_STORED_HTTP_HEADERS: usize = 128;
 const DEFAULT_MAX_DNS_PARSER_STATES: usize = DEFAULT_MAX_STREAMS * 2;
 const MAX_STORED_DNS_QUESTIONS: usize = 16;
 const MAX_STORED_DNS_RECORDS: usize = 32;
 const MAX_DNS_NAME_JUMPS: usize = 16;
+const MAX_TLS_ALPN_PROTOCOLS: usize = 16;
+const MAX_TLS_EXTENSIONS: usize = 256;
+const MAX_WS_PAYLOAD_PREVIEW_BYTES: usize = 128;
 
 const HTTP_SIGNATURES: [&[u8]; 10] = [
     b"GET", b"POST", b"PUT", b"DELETE", b"PATCH", b"HEAD", b"OPTIONS", b"TRACE", b"CONNECT",
@@ -58,6 +63,8 @@ pub struct StreamMessageStats {
     pub observed_messages: u64,
     pub http1_messages: u64,
     pub dns_messages: u64,
+    pub websocket_messages: u64,
+    pub tls_messages: u64,
     pub parse_errors: u64,
 }
 
@@ -66,6 +73,9 @@ pub struct StreamMessageStats {
 pub enum StreamMessageProtocol {
     Http1,
     Dns,
+    #[serde(rename = "websocket")]
+    WebSocket,
+    Tls,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +116,8 @@ pub struct StreamMessage {
     pub body_bytes: u64,
     pub http: Option<Http1MessageInfo>,
     pub dns: Option<DnsMessageInfo>,
+    pub websocket: Option<WebSocketMessageInfo>,
+    pub tls: Option<TlsMessageInfo>,
     pub error: Option<String>,
 }
 
@@ -123,12 +135,18 @@ impl StreamMessage {
                 "http1_parse_error"
             }
             (StreamMessageProtocol::Dns, _, StreamMessageStatus::ParseError) => "dns_parse_error",
+            (StreamMessageProtocol::WebSocket, _, StreamMessageStatus::ParseError) => {
+                "websocket_parse_error"
+            }
+            (StreamMessageProtocol::Tls, _, StreamMessageStatus::ParseError) => "tls_parse_error",
             (StreamMessageProtocol::Http1, StreamMessageKind::Request, _) => "http1_request",
             (StreamMessageProtocol::Http1, StreamMessageKind::Response, _) => "http1_response",
             (StreamMessageProtocol::Http1, StreamMessageKind::Unknown, _) => "http1_message",
             (StreamMessageProtocol::Dns, StreamMessageKind::Request, _) => "dns_query",
             (StreamMessageProtocol::Dns, StreamMessageKind::Response, _) => "dns_response",
             (StreamMessageProtocol::Dns, StreamMessageKind::Unknown, _) => "dns_message",
+            (StreamMessageProtocol::WebSocket, _, _) => "websocket_frame",
+            (StreamMessageProtocol::Tls, _, _) => "tls_record",
         }
     }
 }
@@ -156,12 +174,28 @@ pub struct Http1MessageInfo {
     pub transfer_encoding: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<Http1BodyInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Http1Header {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Http1BodyInfo {
+    pub framing: String,
+    pub wire_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trailer_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transforms: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +230,45 @@ pub struct DnsResourceRecord {
     pub class: String,
     pub ttl: u32,
     pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSocketMessageInfo {
+    pub opcode: u8,
+    pub opcode_name: String,
+    pub fin: bool,
+    pub rsv1: bool,
+    pub rsv2: bool,
+    pub rsv3: bool,
+    pub masked: bool,
+    pub control: bool,
+    pub payload_bytes: u64,
+    pub header_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsMessageInfo {
+    pub content_type: String,
+    pub record_version: String,
+    pub record_len: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handshake_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handshake_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alpn: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cipher_suite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cipher_suites: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +355,12 @@ impl StreamMessageStore {
         }
         if message.protocol == StreamMessageProtocol::Dns {
             self.stats.dns_messages = self.stats.dns_messages.saturating_add(1);
+        }
+        if message.protocol == StreamMessageProtocol::WebSocket {
+            self.stats.websocket_messages = self.stats.websocket_messages.saturating_add(1);
+        }
+        if message.protocol == StreamMessageProtocol::Tls {
+            self.stats.tls_messages = self.stats.tls_messages.saturating_add(1);
         }
         if message.status == StreamMessageStatus::ParseError {
             self.stats.parse_errors = self.stats.parse_errors.saturating_add(1);
@@ -379,14 +458,26 @@ pub struct ProtocolMessageAnalyzer {
     http1_order: VecDeque<Http1StreamKey>,
     dns: AHashMap<DnsStreamKey, DnsDirectionState>,
     dns_order: VecDeque<DnsStreamKey>,
+    websocket: AHashMap<WebSocketStreamKey, WebSocketDirectionState>,
+    websocket_order: VecDeque<WebSocketStreamKey>,
+    websocket_active: AHashMap<FlowKey, ()>,
+    websocket_active_order: VecDeque<FlowKey>,
+    tls: AHashMap<TlsStreamKey, TlsDirectionState>,
+    tls_order: VecDeque<TlsStreamKey>,
     max_http1_states: usize,
     max_dns_states: usize,
+    max_websocket_states: usize,
+    max_tls_states: usize,
     max_header_bytes: usize,
     max_buffer_bytes: usize,
     evicted_http1_states: u64,
     evicted_dns_states: u64,
+    evicted_websocket_states: u64,
+    evicted_tls_states: u64,
     dropped_http1_chunks: u64,
     dropped_dns_datagrams: u64,
+    dropped_websocket_chunks: u64,
+    dropped_tls_chunks: u64,
 }
 
 impl Default for ProtocolMessageAnalyzer {
@@ -396,14 +487,26 @@ impl Default for ProtocolMessageAnalyzer {
             http1_order: VecDeque::new(),
             dns: AHashMap::new(),
             dns_order: VecDeque::new(),
+            websocket: AHashMap::new(),
+            websocket_order: VecDeque::new(),
+            websocket_active: AHashMap::new(),
+            websocket_active_order: VecDeque::new(),
+            tls: AHashMap::new(),
+            tls_order: VecDeque::new(),
             max_http1_states: DEFAULT_MAX_HTTP_PARSER_STATES,
             max_dns_states: DEFAULT_MAX_DNS_PARSER_STATES,
+            max_websocket_states: DEFAULT_MAX_WEBSOCKET_PARSER_STATES,
+            max_tls_states: DEFAULT_MAX_TLS_PARSER_STATES,
             max_header_bytes: DEFAULT_MAX_HTTP_HEADER_BYTES,
             max_buffer_bytes: DEFAULT_MAX_HTTP_BUFFER_BYTES,
             evicted_http1_states: 0,
             evicted_dns_states: 0,
+            evicted_websocket_states: 0,
+            evicted_tls_states: 0,
             dropped_http1_chunks: 0,
             dropped_dns_datagrams: 0,
+            dropped_websocket_chunks: 0,
+            dropped_tls_chunks: 0,
         }
     }
 }
@@ -416,12 +519,16 @@ impl ProtocolMessageAnalyzer {
     pub fn with_limits(
         max_http1_states: usize,
         max_dns_states: usize,
+        max_websocket_states: usize,
+        max_tls_states: usize,
         max_header_bytes: usize,
         max_buffer_bytes: usize,
     ) -> Self {
         Self {
             max_http1_states: max_http1_states.max(1),
             max_dns_states: max_dns_states.max(1),
+            max_websocket_states: max_websocket_states.max(1),
+            max_tls_states: max_tls_states.max(1),
             max_header_bytes: max_header_bytes.max(1),
             max_buffer_bytes: max_buffer_bytes.max(1),
             ..Self::default()
@@ -472,6 +579,30 @@ impl ProtocolMessageAnalyzer {
         self.dropped_dns_datagrams
     }
 
+    pub fn websocket_active_states(&self) -> usize {
+        self.websocket.len()
+    }
+
+    pub fn websocket_evicted_states(&self) -> u64 {
+        self.evicted_websocket_states
+    }
+
+    pub fn websocket_dropped_chunks(&self) -> u64 {
+        self.dropped_websocket_chunks
+    }
+
+    pub fn tls_active_states(&self) -> usize {
+        self.tls.len()
+    }
+
+    pub fn tls_evicted_states(&self) -> u64 {
+        self.evicted_tls_states
+    }
+
+    pub fn tls_dropped_chunks(&self) -> u64 {
+        self.dropped_tls_chunks
+    }
+
     fn emit_messages(
         &mut self,
         packet: &DecodedPacket<'_>,
@@ -479,6 +610,11 @@ impl ProtocolMessageAnalyzer {
         chunk: &StreamChunk<'_>,
         events: &mut Vec<Event>,
     ) {
+        self.emit_tls_records(packet, flow, chunk, events);
+        if self.websocket_active.contains_key(&flow.key) {
+            self.emit_websocket_frames(packet, flow, chunk, events);
+        }
+
         let key = Http1StreamKey {
             flow: flow.key,
             direction: chunk.direction,
@@ -494,6 +630,83 @@ impl ProtocolMessageAnalyzer {
             chunk.direction,
             chunk.bytes.as_slice(),
             max_header_bytes,
+            max_buffer_bytes,
+        );
+
+        for message in messages {
+            if http1_is_websocket_upgrade(&message) {
+                self.activate_websocket_flow(flow.key);
+            }
+            let length = message.wire_bytes.min(usize::MAX as u64) as usize;
+            events.push(Event::from_packet(
+                ANALYZER_NAME,
+                message.event_type(),
+                packet,
+                length,
+                json!(message),
+            ));
+        }
+    }
+
+    fn emit_websocket_frames(
+        &mut self,
+        packet: &DecodedPacket<'_>,
+        flow: &FlowObservation<'_>,
+        chunk: &StreamChunk<'_>,
+        events: &mut Vec<Event>,
+    ) {
+        let key = WebSocketStreamKey {
+            flow: flow.key,
+            direction: chunk.direction,
+        };
+        let max_buffer_bytes = self.max_buffer_bytes;
+        let Some(state) = self.websocket_state(key) else {
+            self.dropped_websocket_chunks = self.dropped_websocket_chunks.saturating_add(1);
+            return;
+        };
+        let messages = state.push(
+            flow.key.stable_id(),
+            chunk.direction,
+            chunk.bytes.as_slice(),
+            max_buffer_bytes,
+        );
+
+        for message in messages {
+            let length = message.wire_bytes.min(usize::MAX as u64) as usize;
+            events.push(Event::from_packet(
+                ANALYZER_NAME,
+                message.event_type(),
+                packet,
+                length,
+                json!(message),
+            ));
+        }
+    }
+
+    fn emit_tls_records(
+        &mut self,
+        packet: &DecodedPacket<'_>,
+        flow: &FlowObservation<'_>,
+        chunk: &StreamChunk<'_>,
+        events: &mut Vec<Event>,
+    ) {
+        let key = TlsStreamKey {
+            flow: flow.key,
+            direction: chunk.direction,
+        };
+        if !self.tls.contains_key(&key) && !looks_like_tls_prefix(chunk.bytes.as_slice()) {
+            return;
+        }
+
+        let max_buffer_bytes = self.max_buffer_bytes;
+        let Some(state) = self.tls_state(key) else {
+            self.dropped_tls_chunks = self.dropped_tls_chunks.saturating_add(1);
+            return;
+        };
+        let messages = state.push(
+            flow.key.stable_id(),
+            chunk.direction,
+            chunk.bytes.as_slice(),
             max_buffer_bytes,
         );
 
@@ -601,6 +814,63 @@ impl ProtocolMessageAnalyzer {
 
         self.dns.get_mut(&key)
     }
+
+    fn websocket_state(&mut self, key: WebSocketStreamKey) -> Option<&mut WebSocketDirectionState> {
+        if !self.websocket.contains_key(&key) {
+            while self.websocket.len() >= self.max_websocket_states {
+                let Some(evicted) = self.websocket_order.pop_front() else {
+                    break;
+                };
+                self.websocket.remove(&evicted);
+                self.evicted_websocket_states = self.evicted_websocket_states.saturating_add(1);
+            }
+            if self.websocket.len() >= self.max_websocket_states {
+                return None;
+            }
+            self.websocket
+                .insert(key, WebSocketDirectionState::default());
+            self.websocket_order.push_back(key);
+        }
+
+        self.websocket.get_mut(&key)
+    }
+
+    fn tls_state(&mut self, key: TlsStreamKey) -> Option<&mut TlsDirectionState> {
+        if !self.tls.contains_key(&key) {
+            while self.tls.len() >= self.max_tls_states {
+                let Some(evicted) = self.tls_order.pop_front() else {
+                    break;
+                };
+                self.tls.remove(&evicted);
+                self.evicted_tls_states = self.evicted_tls_states.saturating_add(1);
+            }
+            if self.tls.len() >= self.max_tls_states {
+                return None;
+            }
+            self.tls.insert(key, TlsDirectionState::default());
+            self.tls_order.push_back(key);
+        }
+
+        self.tls.get_mut(&key)
+    }
+
+    fn activate_websocket_flow(&mut self, flow: FlowKey) {
+        if self.websocket_active.contains_key(&flow) {
+            return;
+        }
+        while self.websocket_active.len() >= self.max_websocket_states {
+            let Some(evicted) = self.websocket_active_order.pop_front() else {
+                break;
+            };
+            self.websocket_active.remove(&evicted);
+        }
+        if self.websocket_active.len() >= self.max_websocket_states {
+            self.evicted_websocket_states = self.evicted_websocket_states.saturating_add(1);
+            return;
+        }
+        self.websocket_active.insert(flow, ());
+        self.websocket_active_order.push_back(flow);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -611,6 +881,18 @@ struct Http1StreamKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct DnsStreamKey {
+    flow: FlowKey,
+    direction: FlowDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct WebSocketStreamKey {
+    flow: FlowKey,
+    direction: FlowDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TlsStreamKey {
     flow: FlowKey,
     direction: FlowDirection,
 }
@@ -626,6 +908,22 @@ struct Http1DirectionState {
 
 #[derive(Debug, Default)]
 struct DnsDirectionState {
+    next_logical: u64,
+    next_ordinal: u64,
+}
+
+#[derive(Debug, Default)]
+struct WebSocketDirectionState {
+    buffer: Vec<u8>,
+    buffer_start: u64,
+    next_logical: u64,
+    next_ordinal: u64,
+}
+
+#[derive(Debug, Default)]
+struct TlsDirectionState {
+    buffer: Vec<u8>,
+    buffer_start: u64,
     next_logical: u64,
     next_ordinal: u64,
 }
@@ -662,6 +960,752 @@ impl DnsDirectionState {
             ),
         }
     }
+}
+
+impl WebSocketDirectionState {
+    fn push(
+        &mut self,
+        stream_id: u64,
+        direction: FlowDirection,
+        bytes: &[u8],
+        max_buffer_bytes: usize,
+    ) -> Vec<StreamMessage> {
+        let mut messages = Vec::new();
+        if bytes.is_empty() {
+            return messages;
+        }
+        if self.buffer.is_empty() {
+            self.buffer_start = self.next_logical;
+        }
+        self.next_logical = self.next_logical.saturating_add(bytes.len() as u64);
+        self.buffer.extend_from_slice(bytes);
+
+        if self.buffer.len() > max_buffer_bytes {
+            messages.push(self.parse_error(
+                stream_id,
+                direction,
+                "websocket frame exceeded parser buffer limit",
+            ));
+            self.clear_buffer();
+            return messages;
+        }
+
+        loop {
+            match parse_websocket_frame(&self.buffer) {
+                WebSocketFrameParse::Complete(frame) => {
+                    let logical_start = self.buffer_start;
+                    let header_end = logical_start.saturating_add(frame.header_len as u64);
+                    let logical_end = logical_start.saturating_add(frame.total_len as u64);
+                    let ordinal = self.next_ordinal;
+                    self.next_ordinal = self.next_ordinal.saturating_add(1);
+                    messages.push(websocket_stream_message(
+                        stream_id,
+                        direction,
+                        ordinal,
+                        logical_start,
+                        header_end,
+                        logical_end,
+                        frame.info,
+                    ));
+                    self.drain_front(frame.total_len);
+                }
+                WebSocketFrameParse::Incomplete => break,
+                WebSocketFrameParse::Invalid(reason) => {
+                    messages.push(self.parse_error(stream_id, direction, reason));
+                    self.clear_buffer();
+                    break;
+                }
+            }
+            if self.buffer.is_empty() {
+                break;
+            }
+        }
+
+        messages
+    }
+
+    fn parse_error(
+        &mut self,
+        stream_id: u64,
+        direction: FlowDirection,
+        reason: impl Into<String>,
+    ) -> StreamMessage {
+        let start = self.buffer_start;
+        let end = start.saturating_add(self.buffer.len() as u64);
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = self.next_ordinal.saturating_add(1);
+        StreamMessage {
+            stream_id,
+            stream_id_hex: format!("{stream_id:016x}"),
+            message_id: stable_message_id(stream_id, direction, ordinal),
+            protocol: StreamMessageProtocol::WebSocket,
+            kind: StreamMessageKind::Unknown,
+            status: StreamMessageStatus::ParseError,
+            direction,
+            ordinal,
+            summary: "WebSocket parse error".to_owned(),
+            logical_start: start,
+            logical_end: end,
+            header_start: Some(start),
+            header_end: Some(end),
+            body_start: None,
+            body_end: None,
+            wire_bytes: end.saturating_sub(start),
+            header_bytes: end.saturating_sub(start),
+            body_bytes: 0,
+            http: None,
+            dns: None,
+            websocket: None,
+            tls: None,
+            error: Some(reason.into()),
+        }
+    }
+
+    fn drain_front(&mut self, count: usize) {
+        if count >= self.buffer.len() {
+            self.clear_buffer();
+            return;
+        }
+        self.buffer.drain(..count);
+        self.buffer_start = self.buffer_start.saturating_add(count as u64);
+    }
+
+    fn clear_buffer(&mut self) {
+        self.buffer.clear();
+        self.buffer_start = self.next_logical;
+    }
+}
+
+impl TlsDirectionState {
+    fn push(
+        &mut self,
+        stream_id: u64,
+        direction: FlowDirection,
+        bytes: &[u8],
+        max_buffer_bytes: usize,
+    ) -> Vec<StreamMessage> {
+        let mut messages = Vec::new();
+        if bytes.is_empty() {
+            return messages;
+        }
+        if self.buffer.is_empty() {
+            self.buffer_start = self.next_logical;
+        }
+        self.next_logical = self.next_logical.saturating_add(bytes.len() as u64);
+        self.buffer.extend_from_slice(bytes);
+
+        if self.buffer.len() > max_buffer_bytes {
+            messages.push(self.parse_error(
+                stream_id,
+                direction,
+                "tls record exceeded parser buffer limit",
+            ));
+            self.clear_buffer();
+            return messages;
+        }
+
+        loop {
+            match parse_tls_record(&self.buffer) {
+                TlsRecordParse::Complete(record) => {
+                    let logical_start = self.buffer_start;
+                    let header_end = logical_start.saturating_add(5);
+                    let logical_end = logical_start.saturating_add(record.total_len as u64);
+                    let ordinal = self.next_ordinal;
+                    self.next_ordinal = self.next_ordinal.saturating_add(1);
+                    messages.push(tls_stream_message(
+                        stream_id,
+                        direction,
+                        ordinal,
+                        logical_start,
+                        header_end,
+                        logical_end,
+                        record.info,
+                    ));
+                    self.drain_front(record.total_len);
+                }
+                TlsRecordParse::Incomplete => break,
+                TlsRecordParse::Invalid(reason) => {
+                    messages.push(self.parse_error(stream_id, direction, reason));
+                    self.clear_buffer();
+                    break;
+                }
+            }
+            if self.buffer.is_empty() {
+                break;
+            }
+        }
+
+        messages
+    }
+
+    fn parse_error(
+        &mut self,
+        stream_id: u64,
+        direction: FlowDirection,
+        reason: impl Into<String>,
+    ) -> StreamMessage {
+        let start = self.buffer_start;
+        let end = start.saturating_add(self.buffer.len() as u64);
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = self.next_ordinal.saturating_add(1);
+        StreamMessage {
+            stream_id,
+            stream_id_hex: format!("{stream_id:016x}"),
+            message_id: stable_message_id(stream_id, direction, ordinal),
+            protocol: StreamMessageProtocol::Tls,
+            kind: StreamMessageKind::Unknown,
+            status: StreamMessageStatus::ParseError,
+            direction,
+            ordinal,
+            summary: "TLS parse error".to_owned(),
+            logical_start: start,
+            logical_end: end,
+            header_start: Some(start),
+            header_end: Some(end),
+            body_start: None,
+            body_end: None,
+            wire_bytes: end.saturating_sub(start),
+            header_bytes: end.saturating_sub(start),
+            body_bytes: 0,
+            http: None,
+            dns: None,
+            websocket: None,
+            tls: None,
+            error: Some(reason.into()),
+        }
+    }
+
+    fn drain_front(&mut self, count: usize) {
+        if count >= self.buffer.len() {
+            self.clear_buffer();
+            return;
+        }
+        self.buffer.drain(..count);
+        self.buffer_start = self.buffer_start.saturating_add(count as u64);
+    }
+
+    fn clear_buffer(&mut self) {
+        self.buffer.clear();
+        self.buffer_start = self.next_logical;
+    }
+}
+
+#[derive(Debug)]
+enum WebSocketFrameParse {
+    Complete(ParsedWebSocketFrame),
+    Incomplete,
+    Invalid(String),
+}
+
+#[derive(Debug)]
+struct ParsedWebSocketFrame {
+    total_len: usize,
+    header_len: usize,
+    info: WebSocketMessageInfo,
+}
+
+fn parse_websocket_frame(bytes: &[u8]) -> WebSocketFrameParse {
+    if bytes.len() < 2 {
+        return WebSocketFrameParse::Incomplete;
+    }
+
+    let first = bytes[0];
+    let second = bytes[1];
+    let fin = first & 0x80 != 0;
+    let rsv1 = first & 0x40 != 0;
+    let rsv2 = first & 0x20 != 0;
+    let rsv3 = first & 0x10 != 0;
+    let opcode = first & 0x0f;
+    if !matches!(opcode, 0x0..=0x2 | 0x8..=0xA) {
+        return WebSocketFrameParse::Invalid(format!("unsupported websocket opcode {opcode}"));
+    }
+    let control = opcode >= 0x8;
+    if control && !fin {
+        return WebSocketFrameParse::Invalid("fragmented websocket control frame".to_owned());
+    }
+
+    let masked = second & 0x80 != 0;
+    let mut header_len = 2usize;
+    let mut payload_len = u64::from(second & 0x7f);
+    if payload_len == 126 {
+        if bytes.len() < header_len + 2 {
+            return WebSocketFrameParse::Incomplete;
+        }
+        payload_len = u64::from(u16::from_be_bytes([bytes[2], bytes[3]]));
+        header_len += 2;
+    } else if payload_len == 127 {
+        if bytes.len() < header_len + 8 {
+            return WebSocketFrameParse::Incomplete;
+        }
+        payload_len = u64::from_be_bytes([
+            bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
+        ]);
+        header_len += 8;
+    }
+    if control && payload_len > 125 {
+        return WebSocketFrameParse::Invalid("oversized websocket control frame".to_owned());
+    }
+    if payload_len > usize::MAX as u64 {
+        return WebSocketFrameParse::Invalid("websocket payload is too large".to_owned());
+    }
+    let payload_len_usize = payload_len as usize;
+
+    let mask = if masked {
+        if bytes.len() < header_len + 4 {
+            return WebSocketFrameParse::Incomplete;
+        }
+        let mask = [
+            bytes[header_len],
+            bytes[header_len + 1],
+            bytes[header_len + 2],
+            bytes[header_len + 3],
+        ];
+        header_len += 4;
+        Some(mask)
+    } else {
+        None
+    };
+
+    let total_len = header_len.saturating_add(payload_len_usize);
+    if bytes.len() < total_len {
+        return WebSocketFrameParse::Incomplete;
+    }
+    let payload = &bytes[header_len..total_len];
+    let preview = websocket_payload_preview(payload, mask, opcode);
+    let close_code = (opcode == 0x8 && payload_len_usize >= 2).then(|| {
+        let first = unmask_byte(payload[0], mask, 0);
+        let second = unmask_byte(payload[1], mask, 1);
+        u16::from_be_bytes([first, second])
+    });
+
+    WebSocketFrameParse::Complete(ParsedWebSocketFrame {
+        total_len,
+        header_len,
+        info: WebSocketMessageInfo {
+            opcode,
+            opcode_name: websocket_opcode_name(opcode).to_owned(),
+            fin,
+            rsv1,
+            rsv2,
+            rsv3,
+            masked,
+            control,
+            payload_bytes: payload_len,
+            header_bytes: header_len as u64,
+            close_code,
+            text_preview: preview,
+        },
+    })
+}
+
+fn websocket_stream_message(
+    stream_id: u64,
+    direction: FlowDirection,
+    ordinal: u64,
+    logical_start: u64,
+    header_end: u64,
+    logical_end: u64,
+    info: WebSocketMessageInfo,
+) -> StreamMessage {
+    let summary = websocket_summary(&info);
+    StreamMessage {
+        stream_id,
+        stream_id_hex: format!("{stream_id:016x}"),
+        message_id: stable_message_id(stream_id, direction, ordinal),
+        protocol: StreamMessageProtocol::WebSocket,
+        kind: StreamMessageKind::Unknown,
+        status: StreamMessageStatus::Complete,
+        direction,
+        ordinal,
+        summary,
+        logical_start,
+        logical_end,
+        header_start: Some(logical_start),
+        header_end: Some(header_end),
+        body_start: Some(header_end),
+        body_end: Some(logical_end),
+        wire_bytes: logical_end.saturating_sub(logical_start),
+        header_bytes: header_end.saturating_sub(logical_start),
+        body_bytes: logical_end.saturating_sub(header_end),
+        http: None,
+        dns: None,
+        websocket: Some(info),
+        tls: None,
+        error: None,
+    }
+}
+
+fn websocket_summary(info: &WebSocketMessageInfo) -> String {
+    let mut summary = format!("WS {} {} bytes", info.opcode_name, info.payload_bytes);
+    if info.rsv1 {
+        summary.push_str(" compressed");
+    }
+    if let Some(close_code) = info.close_code {
+        summary.push_str(&format!(" close={close_code}"));
+    }
+    if let Some(preview) = &info.text_preview {
+        summary.push_str(&format!(" {preview}"));
+    }
+    summary
+}
+
+fn websocket_opcode_name(opcode: u8) -> &'static str {
+    match opcode {
+        0x0 => "continuation",
+        0x1 => "text",
+        0x2 => "binary",
+        0x8 => "close",
+        0x9 => "ping",
+        0xA => "pong",
+        _ => "unknown",
+    }
+}
+
+fn websocket_payload_preview(payload: &[u8], mask: Option<[u8; 4]>, opcode: u8) -> Option<String> {
+    if !matches!(opcode, 0x1 | 0x8 | 0x9 | 0xA) {
+        return None;
+    }
+    let take = payload.len().min(MAX_WS_PAYLOAD_PREVIEW_BYTES);
+    let mut decoded = Vec::with_capacity(take);
+    for (index, byte) in payload.iter().copied().enumerate().take(take) {
+        decoded.push(unmask_byte(byte, mask, index));
+    }
+    let text = String::from_utf8(decoded).ok()?;
+    let text = text.replace('\r', "\\r").replace('\n', "\\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn unmask_byte(byte: u8, mask: Option<[u8; 4]>, index: usize) -> u8 {
+    mask.map_or(byte, |mask| byte ^ mask[index % 4])
+}
+
+#[derive(Debug)]
+enum TlsRecordParse {
+    Complete(ParsedTlsRecord),
+    Incomplete,
+    Invalid(String),
+}
+
+#[derive(Debug)]
+struct ParsedTlsRecord {
+    total_len: usize,
+    info: TlsMessageInfo,
+}
+
+fn parse_tls_record(bytes: &[u8]) -> TlsRecordParse {
+    if bytes.len() < 5 {
+        return TlsRecordParse::Incomplete;
+    }
+    let content_type = bytes[0];
+    if !matches!(content_type, 20..=23) {
+        return TlsRecordParse::Invalid(format!("unsupported tls content type {content_type}"));
+    }
+    let major = bytes[1];
+    let minor = bytes[2];
+    if major != 3 || minor > 4 {
+        return TlsRecordParse::Invalid("unsupported tls record version".to_owned());
+    }
+    let record_len = u16::from_be_bytes([bytes[3], bytes[4]]);
+    let total_len = 5usize.saturating_add(record_len as usize);
+    if bytes.len() < total_len {
+        return TlsRecordParse::Incomplete;
+    }
+    let payload = &bytes[5..total_len];
+    let mut info = TlsMessageInfo {
+        content_type: tls_content_type_name(content_type).to_owned(),
+        record_version: tls_version_name(major, minor),
+        record_len,
+        handshake_type: None,
+        handshake_version: None,
+        sni: None,
+        alpn: Vec::new(),
+        cipher_suite: None,
+        cipher_suites: None,
+        extensions: None,
+    };
+
+    if content_type == 22 && payload.len() >= 4 {
+        parse_tls_handshake(payload, &mut info);
+    }
+
+    TlsRecordParse::Complete(ParsedTlsRecord { total_len, info })
+}
+
+fn parse_tls_handshake(payload: &[u8], info: &mut TlsMessageInfo) {
+    let handshake_type = payload[0];
+    let handshake_len = read_u24(payload, 1).unwrap_or(0) as usize;
+    let body_end = 4usize.saturating_add(handshake_len).min(payload.len());
+    let body = &payload[4..body_end];
+    info.handshake_type = Some(tls_handshake_type_name(handshake_type).to_owned());
+
+    match handshake_type {
+        1 => parse_tls_client_hello(body, info),
+        2 => parse_tls_server_hello(body, info),
+        _ => {}
+    }
+}
+
+fn parse_tls_client_hello(body: &[u8], info: &mut TlsMessageInfo) {
+    if body.len() < 34 {
+        return;
+    }
+    info.handshake_version = Some(tls_version_name(body[0], body[1]));
+    let mut offset = 34usize;
+    let Some(session_id_len) = body.get(offset).map(|value| *value as usize) else {
+        return;
+    };
+    offset = offset.saturating_add(1).saturating_add(session_id_len);
+    if body.len() < offset.saturating_add(2) {
+        return;
+    }
+    let cipher_suites_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+    info.cipher_suites = Some((cipher_suites_len / 2).min(u16::MAX as usize) as u16);
+    offset = offset.saturating_add(2).saturating_add(cipher_suites_len);
+    if body.len() <= offset {
+        return;
+    }
+    let compression_methods_len = body[offset] as usize;
+    offset = offset
+        .saturating_add(1)
+        .saturating_add(compression_methods_len);
+    parse_tls_extensions(body, offset, info, false);
+}
+
+fn parse_tls_server_hello(body: &[u8], info: &mut TlsMessageInfo) {
+    if body.len() < 38 {
+        return;
+    }
+    info.handshake_version = Some(tls_version_name(body[0], body[1]));
+    let mut offset = 34usize;
+    let Some(session_id_len) = body.get(offset).map(|value| *value as usize) else {
+        return;
+    };
+    offset = offset.saturating_add(1).saturating_add(session_id_len);
+    if body.len() < offset.saturating_add(3) {
+        return;
+    }
+    let cipher = u16::from_be_bytes([body[offset], body[offset + 1]]);
+    info.cipher_suite = Some(tls_cipher_suite_name(cipher));
+    offset = offset.saturating_add(3);
+    parse_tls_extensions(body, offset, info, true);
+}
+
+fn parse_tls_extensions(body: &[u8], offset: usize, info: &mut TlsMessageInfo, server: bool) {
+    if body.len() < offset.saturating_add(2) {
+        return;
+    }
+    let extensions_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+    let mut cursor = offset.saturating_add(2);
+    let end = cursor.saturating_add(extensions_len).min(body.len());
+    let mut count = 0u16;
+
+    while cursor.saturating_add(4) <= end && usize::from(count) < MAX_TLS_EXTENSIONS {
+        let ext_type = u16::from_be_bytes([body[cursor], body[cursor + 1]]);
+        let ext_len = u16::from_be_bytes([body[cursor + 2], body[cursor + 3]]) as usize;
+        cursor = cursor.saturating_add(4);
+        if end < cursor.saturating_add(ext_len) {
+            break;
+        }
+        let data = &body[cursor..cursor + ext_len];
+        match ext_type {
+            0 => {
+                if !server {
+                    info.sni = parse_tls_sni(data);
+                }
+            }
+            16 => {
+                info.alpn = parse_tls_alpn(data);
+            }
+            43 => {
+                if let Some(version) = parse_tls_supported_version(data, server) {
+                    info.handshake_version = Some(version);
+                }
+            }
+            _ => {}
+        }
+        cursor = cursor.saturating_add(ext_len);
+        count = count.saturating_add(1);
+    }
+
+    info.extensions = Some(count);
+}
+
+fn parse_tls_sni(data: &[u8]) -> Option<String> {
+    if data.len() < 5 {
+        return None;
+    }
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let mut cursor = 2usize;
+    let end = cursor.saturating_add(list_len).min(data.len());
+    while cursor.saturating_add(3) <= end {
+        let name_type = data[cursor];
+        let name_len = u16::from_be_bytes([data[cursor + 1], data[cursor + 2]]) as usize;
+        cursor = cursor.saturating_add(3);
+        if end < cursor.saturating_add(name_len) {
+            return None;
+        }
+        if name_type == 0 {
+            return std::str::from_utf8(&data[cursor..cursor + name_len])
+                .ok()
+                .map(ToOwned::to_owned);
+        }
+        cursor = cursor.saturating_add(name_len);
+    }
+    None
+}
+
+fn parse_tls_alpn(data: &[u8]) -> Vec<String> {
+    if data.len() < 2 {
+        return Vec::new();
+    }
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let mut cursor = 2usize;
+    let end = cursor.saturating_add(list_len).min(data.len());
+    let mut protocols = Vec::new();
+    while cursor < end && protocols.len() < MAX_TLS_ALPN_PROTOCOLS {
+        let len = data[cursor] as usize;
+        cursor = cursor.saturating_add(1);
+        if end < cursor.saturating_add(len) {
+            break;
+        }
+        if let Ok(protocol) = std::str::from_utf8(&data[cursor..cursor + len]) {
+            protocols.push(protocol.to_owned());
+        }
+        cursor = cursor.saturating_add(len);
+    }
+    protocols
+}
+
+fn parse_tls_supported_version(data: &[u8], server: bool) -> Option<String> {
+    if server {
+        if data.len() >= 2 {
+            return known_tls_version_name(data[0], data[1]);
+        }
+        return None;
+    }
+    let (&list_len, rest) = data.split_first()?;
+    let mut cursor = 0usize;
+    let end = usize::from(list_len).min(rest.len());
+    let mut best: Option<(u8, u8)> = None;
+    while cursor.saturating_add(2) <= end {
+        let version = (rest[cursor], rest[cursor + 1]);
+        if known_tls_version_name(version.0, version.1).is_some() {
+            best = Some(best.map_or(version, |current| current.max(version)));
+        }
+        cursor = cursor.saturating_add(2);
+    }
+    best.and_then(|(major, minor)| known_tls_version_name(major, minor))
+}
+
+fn tls_stream_message(
+    stream_id: u64,
+    direction: FlowDirection,
+    ordinal: u64,
+    logical_start: u64,
+    header_end: u64,
+    logical_end: u64,
+    info: TlsMessageInfo,
+) -> StreamMessage {
+    let summary = tls_summary(&info);
+    StreamMessage {
+        stream_id,
+        stream_id_hex: format!("{stream_id:016x}"),
+        message_id: stable_message_id(stream_id, direction, ordinal),
+        protocol: StreamMessageProtocol::Tls,
+        kind: StreamMessageKind::Unknown,
+        status: StreamMessageStatus::Complete,
+        direction,
+        ordinal,
+        summary,
+        logical_start,
+        logical_end,
+        header_start: Some(logical_start),
+        header_end: Some(header_end),
+        body_start: Some(header_end),
+        body_end: Some(logical_end),
+        wire_bytes: logical_end.saturating_sub(logical_start),
+        header_bytes: header_end.saturating_sub(logical_start),
+        body_bytes: logical_end.saturating_sub(header_end),
+        http: None,
+        dns: None,
+        websocket: None,
+        tls: Some(info),
+        error: None,
+    }
+}
+
+fn tls_summary(info: &TlsMessageInfo) -> String {
+    let mut summary = format!("TLS {}", info.content_type);
+    if let Some(handshake) = &info.handshake_type {
+        summary.push_str(&format!(" {handshake}"));
+    }
+    if let Some(sni) = &info.sni {
+        summary.push_str(&format!(" sni={sni}"));
+    }
+    if !info.alpn.is_empty() {
+        summary.push_str(&format!(" alpn={}", info.alpn.join(",")));
+    }
+    if let Some(cipher) = &info.cipher_suite {
+        summary.push_str(&format!(" cipher={cipher}"));
+    }
+    summary
+}
+
+fn tls_content_type_name(content_type: u8) -> &'static str {
+    match content_type {
+        20 => "change_cipher_spec",
+        21 => "alert",
+        22 => "handshake",
+        23 => "application_data",
+        _ => "unknown",
+    }
+}
+
+fn tls_handshake_type_name(handshake_type: u8) -> &'static str {
+    match handshake_type {
+        1 => "client_hello",
+        2 => "server_hello",
+        11 => "certificate",
+        12 => "server_key_exchange",
+        14 => "server_hello_done",
+        16 => "client_key_exchange",
+        20 => "finished",
+        _ => "handshake",
+    }
+}
+
+fn tls_version_name(major: u8, minor: u8) -> String {
+    known_tls_version_name(major, minor).unwrap_or_else(|| format!("{major}.{minor}"))
+}
+
+fn known_tls_version_name(major: u8, minor: u8) -> Option<String> {
+    match (major, minor) {
+        (3, 0) => Some("SSL 3.0".to_owned()),
+        (3, 1) => Some("TLS 1.0".to_owned()),
+        (3, 2) => Some("TLS 1.1".to_owned()),
+        (3, 3) => Some("TLS 1.2".to_owned()),
+        (3, 4) => Some("TLS 1.3".to_owned()),
+        _ => None,
+    }
+}
+
+fn tls_cipher_suite_name(cipher: u16) -> String {
+    match cipher {
+        0x1301 => "TLS_AES_128_GCM_SHA256".to_owned(),
+        0x1302 => "TLS_AES_256_GCM_SHA384".to_owned(),
+        0x1303 => "TLS_CHACHA20_POLY1305_SHA256".to_owned(),
+        0xC02F => "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".to_owned(),
+        0xC030 => "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384".to_owned(),
+        _ => format!("0x{cipher:04x}"),
+    }
+}
+
+fn read_u24(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(
+        (u32::from(*bytes.get(offset)?) << 16)
+            | (u32::from(*bytes.get(offset + 1)?) << 8)
+            | u32::from(*bytes.get(offset + 2)?),
+    )
 }
 
 struct DnsCursor<'a> {
@@ -1016,6 +2060,8 @@ fn dns_stream_message(
         body_bytes: logical_end.saturating_sub(logical_start).saturating_sub(12),
         http: None,
         dns: Some(dns),
+        websocket: None,
+        tls: None,
         error: None,
     }
 }
@@ -1049,6 +2095,8 @@ fn dns_parse_error(
         body_bytes: 0,
         http: None,
         dns: None,
+        websocket: None,
+        tls: None,
         error: Some(error.into()),
     }
 }
@@ -1199,6 +2247,8 @@ impl Http1DirectionState {
                 BodyFraming::ContentLength(body_len) => {
                     if body_len > available_body as u64 {
                         let observed = available_body as u64;
+                        let mut http = head.info;
+                        http.body = http_content_length_body(&http, body_len);
                         let pending = PendingContentLengthMessage {
                             ordinal: self.next_ordinal,
                             kind: head.kind,
@@ -1208,7 +2258,7 @@ impl Http1DirectionState {
                             body_start,
                             body_len,
                             remaining: body_len.saturating_sub(observed),
-                            http: head.info,
+                            http,
                         };
                         self.next_ordinal = self.next_ordinal.saturating_add(1);
                         self.clear_buffer();
@@ -1217,6 +2267,9 @@ impl Http1DirectionState {
                     }
 
                     let consumed = header_total_len.saturating_add(body_len as usize);
+                    let mut head = head.clone();
+                    let body_info = http_content_length_body(&head.info, body_len);
+                    head.info.body = body_info;
                     messages.push(build_message(
                         context.stream_id,
                         context.direction,
@@ -1232,8 +2285,12 @@ impl Http1DirectionState {
                 }
                 BodyFraming::Chunked => {
                     match find_chunked_body_end(&self.buffer[header_total_len..]) {
-                        ChunkedBodyEnd::Complete(body_len) => {
-                            let consumed = header_total_len.saturating_add(body_len);
+                        ChunkedBodyEnd::Complete(chunked) => {
+                            let consumed = header_total_len.saturating_add(chunked.wire_bytes);
+                            let body_len = chunked.wire_bytes as u64;
+                            let mut head = head;
+                            let body_info = http_chunked_body(&head.info, &chunked);
+                            head.info.body = body_info;
                             messages.push(build_message(
                                 context.stream_id,
                                 context.direction,
@@ -1241,7 +2298,7 @@ impl Http1DirectionState {
                                 head,
                                 self.buffer_start,
                                 body_start,
-                                body_len as u64,
+                                body_len,
                             ));
                             self.next_ordinal = self.next_ordinal.saturating_add(1);
                             self.fix_message_context(messages.last_mut(), consumed);
@@ -1322,6 +2379,8 @@ impl Http1DirectionState {
             body_bytes: 0,
             http: None,
             dns: None,
+            websocket: None,
+            tls: None,
             error: Some(reason.into()),
         }
     }
@@ -1386,6 +2445,8 @@ impl PendingContentLengthMessage {
             body_bytes: self.body_len,
             http: Some(self.http),
             dns: None,
+            websocket: None,
+            tls: None,
             error: None,
         }
     }
@@ -1407,9 +2468,17 @@ enum BodyFraming {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChunkedBodyEnd {
-    Complete(usize),
+    Complete(ChunkedBodyInfo),
     Incomplete,
     Invalid(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChunkedBodyInfo {
+    wire_bytes: usize,
+    decoded_bytes: usize,
+    chunks: u64,
+    trailer_bytes: usize,
 }
 
 fn build_message(
@@ -1443,8 +2512,52 @@ fn build_message(
         body_bytes: body_len,
         http: Some(head.info),
         dns: None,
+        websocket: None,
+        tls: None,
         error: None,
     }
+}
+
+fn http_content_length_body(http: &Http1MessageInfo, body_len: u64) -> Option<Http1BodyInfo> {
+    if body_len == 0 {
+        return None;
+    }
+    Some(Http1BodyInfo {
+        framing: "content_length".to_owned(),
+        wire_bytes: body_len,
+        normalized_bytes: (!http_has_gzip(http)).then_some(body_len),
+        chunk_count: None,
+        trailer_bytes: None,
+        transforms: http_body_transforms(http, false),
+    })
+}
+
+fn http_chunked_body(http: &Http1MessageInfo, chunked: &ChunkedBodyInfo) -> Option<Http1BodyInfo> {
+    Some(Http1BodyInfo {
+        framing: "chunked".to_owned(),
+        wire_bytes: chunked.wire_bytes as u64,
+        normalized_bytes: Some(chunked.decoded_bytes as u64),
+        chunk_count: Some(chunked.chunks),
+        trailer_bytes: Some(chunked.trailer_bytes as u64),
+        transforms: http_body_transforms(http, true),
+    })
+}
+
+fn http_body_transforms(http: &Http1MessageInfo, chunked: bool) -> Vec<String> {
+    let mut transforms = Vec::with_capacity(2);
+    if chunked {
+        transforms.push("http_chunked".to_owned());
+    }
+    if http_has_gzip(http) {
+        transforms.push("http_gzip".to_owned());
+    }
+    transforms
+}
+
+fn http_has_gzip(http: &Http1MessageInfo) -> bool {
+    http.content_encoding
+        .as_deref()
+        .is_some_and(|value| value.to_ascii_lowercase().contains("gzip"))
 }
 
 fn body_framing(head: &Http1Head) -> BodyFraming {
@@ -1553,6 +2666,7 @@ fn parse_request_head(
             content_length,
             transfer_encoding,
             content_encoding,
+            body: None,
         },
     })
 }
@@ -1599,12 +2713,15 @@ fn parse_response_head(
             content_length,
             transfer_encoding,
             content_encoding,
+            body: None,
         },
     })
 }
 
 fn find_chunked_body_end(body: &[u8]) -> ChunkedBodyEnd {
     let mut position = 0usize;
+    let mut decoded_bytes = 0usize;
+    let mut chunks = 0u64;
     loop {
         let Some((line_len, line_total_len)) = find_line_end(&body[position..]) else {
             return ChunkedBodyEnd::Incomplete;
@@ -1627,19 +2744,38 @@ fn find_chunked_body_end(body: &[u8]) -> ChunkedBodyEnd {
         position = position.saturating_add(line_total_len);
         if size == 0 {
             if body.get(position..position + 2) == Some(b"\r\n") {
-                return ChunkedBodyEnd::Complete(position + 2);
+                return ChunkedBodyEnd::Complete(ChunkedBodyInfo {
+                    wire_bytes: position + 2,
+                    decoded_bytes,
+                    chunks,
+                    trailer_bytes: 2,
+                });
             }
             if body.get(position) == Some(&b'\n') {
-                return ChunkedBodyEnd::Complete(position + 1);
-            }
-            return find_header_end(&body[position..])
-                .map_or(ChunkedBodyEnd::Incomplete, |(_, end)| {
-                    ChunkedBodyEnd::Complete(position.saturating_add(end))
+                return ChunkedBodyEnd::Complete(ChunkedBodyInfo {
+                    wire_bytes: position + 1,
+                    decoded_bytes,
+                    chunks,
+                    trailer_bytes: 1,
                 });
+            }
+            return find_header_end(&body[position..]).map_or(
+                ChunkedBodyEnd::Incomplete,
+                |(_, end)| {
+                    ChunkedBodyEnd::Complete(ChunkedBodyInfo {
+                        wire_bytes: position.saturating_add(end),
+                        decoded_bytes,
+                        chunks,
+                        trailer_bytes: end,
+                    })
+                },
+            );
         }
         if body.len() < position.saturating_add(size) {
             return ChunkedBodyEnd::Incomplete;
         }
+        decoded_bytes = decoded_bytes.saturating_add(size);
+        chunks = chunks.saturating_add(1);
         position = position.saturating_add(size);
         if body.len() < position.saturating_add(1) {
             return ChunkedBodyEnd::Incomplete;
@@ -1695,6 +2831,40 @@ fn looks_like_http_prefix(bytes: &[u8]) -> bool {
     HTTP_SIGNATURES
         .iter()
         .any(|signature| signature.starts_with(bytes) || bytes.starts_with(signature))
+}
+
+fn http1_is_websocket_upgrade(message: &StreamMessage) -> bool {
+    if message.protocol != StreamMessageProtocol::Http1 {
+        return false;
+    }
+    let Some(http) = message.http.as_ref() else {
+        return false;
+    };
+    let upgrade = header_value(&http.headers, "upgrade")
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    let connection_upgrade = header_value(&http.headers, "connection").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+    });
+    let request_upgrade =
+        message.kind == StreamMessageKind::Request && upgrade && connection_upgrade;
+    let response_upgrade =
+        message.kind == StreamMessageKind::Response && http.status_code == Some(101) && upgrade;
+    request_upgrade || response_upgrade
+}
+
+fn looks_like_tls_prefix(bytes: &[u8]) -> bool {
+    let Some((&content_type, rest)) = bytes.split_first() else {
+        return false;
+    };
+    if !matches!(content_type, 20..=23) {
+        return false;
+    }
+    if rest.len() < 2 {
+        return true;
+    }
+    rest[0] == 3 && rest[1] <= 4
 }
 
 fn header_value<'a>(headers: &'a [Http1Header], name: &str) -> Option<&'a str> {
@@ -1835,6 +3005,75 @@ mod tests {
             Some("chunked"),
             message.http.as_ref().unwrap().transfer_encoding.as_deref()
         );
+        let body = message.http.as_ref().unwrap().body.as_ref().unwrap();
+        assert_eq!("chunked", body.framing);
+        assert_eq!(24, body.wire_bytes);
+        assert_eq!(Some(9), body.normalized_bytes);
+        assert_eq!(Some(2), body.chunk_count);
+        assert_eq!(vec!["http_chunked"], body.transforms);
+    }
+
+    #[test]
+    fn emits_websocket_frames_after_http_upgrade() {
+        let mut analyzer = ProtocolMessageAnalyzer::new();
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+        let upgrade =
+            b"GET /chat HTTP/1.1\r\nHost: ws.local\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
+        feed(
+            &mut analyzer,
+            &mut flow_table,
+            &tcp_packet(100, upgrade),
+            &mut events,
+        );
+        feed(
+            &mut analyzer,
+            &mut flow_table,
+            &tcp_packet(
+                100 + upgrade.len() as u32,
+                &websocket_text_frame("hello", true),
+            ),
+            &mut events,
+        );
+
+        assert_eq!(2, events.len());
+        assert_eq!("http1_request", events[0].event_type);
+        assert_eq!("websocket_frame", events[1].event_type);
+        let message = StreamMessage::from_event(&events[1]).unwrap();
+        assert_eq!(StreamMessageProtocol::WebSocket, message.protocol);
+        let ws = message.websocket.as_ref().unwrap();
+        assert_eq!("text", ws.opcode_name);
+        assert!(ws.masked);
+        assert_eq!(5, ws.payload_bytes);
+        assert_eq!(Some("hello"), ws.text_preview.as_deref());
+    }
+
+    #[test]
+    fn emits_tls_client_hello_metadata() {
+        let mut analyzer = ProtocolMessageAnalyzer::new();
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+
+        feed(
+            &mut analyzer,
+            &mut flow_table,
+            &tcp_packet_to_port(100, 443, &tls_client_hello_record()),
+            &mut events,
+        );
+
+        assert_eq!(1, events.len());
+        assert_eq!("tls_record", events[0].event_type);
+        let message = StreamMessage::from_event(&events[0]).unwrap();
+        assert_eq!(StreamMessageProtocol::Tls, message.protocol);
+        let tls = message.tls.as_ref().unwrap();
+        assert_eq!("handshake", tls.content_type);
+        assert_eq!(Some("client_hello"), tls.handshake_type.as_deref());
+        assert_eq!(Some("TLS 1.3"), tls.handshake_version.as_deref());
+        assert_eq!(Some("example.com"), tls.sni.as_deref());
+        assert_eq!(vec!["h2", "http/1.1"], tls.alpn);
+        assert_eq!(Some(2), tls.cipher_suites);
+        assert!(message.summary.contains("sni=example.com"));
     }
 
     #[test]
@@ -1954,9 +3193,13 @@ mod tests {
     }
 
     fn tcp_packet(sequence: u32, payload: &[u8]) -> RawPacket {
+        tcp_packet_to_port(sequence, 80, payload)
+    }
+
+    fn tcp_packet_to_port(sequence: u32, destination_port: u16, payload: &[u8]) -> RawPacket {
         let builder = PacketBuilder::ethernet2([1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2])
             .ipv4([10, 0, 0, 1], [10, 0, 0, 2], 20)
-            .tcp(4242, 80, sequence, 2048);
+            .tcp(4242, destination_port, sequence, 2048);
         let mut data = Vec::with_capacity(builder.size(payload.len()));
         builder.write(&mut data, payload).unwrap();
         RawPacket {
@@ -1991,6 +3234,96 @@ mod tests {
         bytes.extend_from_slice(b"com");
         bytes.extend_from_slice(&[0, 0, 1, 0, 1]);
         bytes
+    }
+
+    fn websocket_text_frame(text: &str, masked: bool) -> Vec<u8> {
+        let payload = text.as_bytes();
+        assert!(payload.len() < 126);
+        let mut frame = vec![0x81, payload.len() as u8 | if masked { 0x80 } else { 0 }];
+        if masked {
+            let mask = [1, 2, 3, 4];
+            frame.extend_from_slice(&mask);
+            frame.extend(
+                payload
+                    .iter()
+                    .enumerate()
+                    .map(|(index, byte)| *byte ^ mask[index % 4]),
+            );
+        } else {
+            frame.extend_from_slice(payload);
+        }
+        frame
+    }
+
+    fn tls_client_hello_record() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x11; 32]);
+        body.push(0);
+        body.extend_from_slice(&4u16.to_be_bytes());
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.extend_from_slice(&0x1302u16.to_be_bytes());
+        body.push(1);
+        body.push(0);
+
+        let mut extensions = Vec::new();
+        push_tls_extension(&mut extensions, 0, &tls_sni_extension("example.com"));
+        push_tls_extension(
+            &mut extensions,
+            16,
+            &tls_alpn_extension(&["h2", "http/1.1"]),
+        );
+        push_tls_extension(
+            &mut extensions,
+            43,
+            &[6, 0x7a, 0x7a, 0x03, 0x04, 0x03, 0x03],
+        );
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = vec![1];
+        let len = body.len() as u32;
+        handshake.extend_from_slice(&[
+            ((len >> 16) & 0xff) as u8,
+            ((len >> 8) & 0xff) as u8,
+            (len & 0xff) as u8,
+        ]);
+        handshake.extend_from_slice(&body);
+
+        let mut record = vec![22, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    fn push_tls_extension(out: &mut Vec<u8>, ext_type: u16, data: &[u8]) {
+        out.extend_from_slice(&ext_type.to_be_bytes());
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(data);
+    }
+
+    fn tls_sni_extension(host: &str) -> Vec<u8> {
+        let host = host.as_bytes();
+        let mut list = Vec::new();
+        list.push(0);
+        list.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        list.extend_from_slice(host);
+        let mut out = Vec::new();
+        out.extend_from_slice(&(list.len() as u16).to_be_bytes());
+        out.extend_from_slice(&list);
+        out
+    }
+
+    fn tls_alpn_extension(protocols: &[&str]) -> Vec<u8> {
+        let mut list = Vec::new();
+        for protocol in protocols {
+            list.push(protocol.len() as u8);
+            list.extend_from_slice(protocol.as_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&(list.len() as u16).to_be_bytes());
+        out.extend_from_slice(&list);
+        out
     }
 
     fn dns_response_packet() -> Vec<u8> {
@@ -2034,6 +3367,8 @@ mod tests {
             body_bytes: 0,
             http: None,
             dns: None,
+            websocket: None,
+            tls: None,
             error: None,
         }
     }
@@ -2079,6 +3414,8 @@ mod tests {
                 questions_truncated: false,
                 records_truncated: false,
             }),
+            websocket: None,
+            tls: None,
             error: None,
         }
     }

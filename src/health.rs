@@ -30,7 +30,20 @@ pub struct PipelineQueueSnapshot {
     pub worker_byte_skew_ratio_milli: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WorkerHotFlowSnapshot {
+    pub stream_id: u64,
+    pub stream_id_hex: String,
+    pub protocol: String,
+    pub endpoint_a: String,
+    pub endpoint_b: String,
+    pub packets: u64,
+    pub bytes: u64,
+    pub packet_share_milli: u64,
+    pub byte_share_milli: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WorkerQueueSnapshot {
     pub id: usize,
     pub len: usize,
@@ -44,6 +57,7 @@ pub struct WorkerQueueSnapshot {
     pub fallback_malformed_packets: u64,
     pub fallback_fragmented_packets: u64,
     pub fallback_unsupported_transport_packets: u64,
+    pub hot_flow: Option<WorkerHotFlowSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -66,6 +80,7 @@ pub struct ShardPressureSnapshot {
     pub busiest_shard: Option<usize>,
     pub busiest_shard_packets: u64,
     pub busiest_shard_bytes: u64,
+    pub hot_flow: Option<WorkerHotFlowSnapshot>,
     pub packet_skew_ratio_milli: u64,
     pub byte_skew_ratio_milli: u64,
     pub warnings: Vec<ShardPressureWarning>,
@@ -208,9 +223,13 @@ impl PipelineHealthReporter {
             message_observed_messages = stats.message_observed_messages,
             message_http1_messages = stats.message_http1_messages,
             message_dns_messages = stats.message_dns_messages,
+            message_websocket_messages = stats.message_websocket_messages,
+            message_tls_messages = stats.message_tls_messages,
             message_parse_errors = stats.message_parse_errors,
             parser_http1_messages = stats.parser_http1_messages,
             parser_dns_messages = stats.parser_dns_messages,
+            parser_websocket_messages = stats.parser_websocket_messages,
+            parser_tls_messages = stats.parser_tls_messages,
             parser_dns_parse_errors = stats.parser_dns_parse_errors,
             parser_dns_dropped_datagrams = stats.parser_dns_dropped_datagrams,
             pattern_matches = stats.pattern_matches,
@@ -473,6 +492,10 @@ impl ShardedQueueSnapshot {
             busiest_shard: summary.busiest_worker,
             busiest_shard_packets: summary.busiest_worker_packets,
             busiest_shard_bytes: summary.busiest_worker_bytes,
+            hot_flow: summary
+                .busiest_worker
+                .and_then(|id| self.workers.iter().find(|worker| worker.id == id))
+                .and_then(|worker| worker.hot_flow.clone()),
             packet_skew_ratio_milli: summary.worker_packet_skew_ratio_milli,
             byte_skew_ratio_milli: summary.worker_byte_skew_ratio_milli,
             warnings,
