@@ -99,7 +99,6 @@ async function refreshHealthTelemetry(options = {}) {
   const health = await api("/api/health");
   updateStats(health);
   updateShardDiagnostics(health);
-  state.deltaCursor = Math.max(state.deltaCursor, health.latest_delta_cursor || 0);
 }
 
 async function loadProfiles() {

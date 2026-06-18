@@ -166,6 +166,16 @@ impl PipelineStats {
             .saturating_add(counters.decode_error_packets());
     }
 
+    pub(crate) fn clear_worker_runtime_stats(&mut self) {
+        self.packet_decode = PacketDecodeCounters::default();
+        self.decode_errors = 0;
+        self.set_flow_table_stats(FlowTableStats::default());
+        self.set_stream_inventory_stats(StreamInventoryStats::default());
+        self.set_stream_content_stats(StreamContentStats::default());
+        self.set_stream_parser_stats(StreamParserStats::default());
+        self.set_pattern_stats(PatternEngineStats::default());
+    }
+
     pub(crate) fn set_flow_table_stats(&mut self, flow_stats: FlowTableStats) {
         self.active_flows = flow_stats.active_flows;
         self.created_flows = flow_stats.created_flows;
@@ -678,7 +688,7 @@ impl Pipeline {
                 let flow = self.flow_table.observe(&packet);
                 if let Some(flow) = flow.as_ref() {
                     self.stream_inventory
-                        .observe_flow(&packet, flow, &mut self.events);
+                        .observe_flow(&packet, flow, None, &mut self.events);
                     self.observe_stream_content(&packet, flow);
                     if flow.tcp.is_none()
                         && let Some(transport) = packet.transport_payload()

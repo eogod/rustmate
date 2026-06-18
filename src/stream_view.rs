@@ -92,6 +92,7 @@ pub struct StreamViewQueryResult {
 pub struct StreamViewRow {
     pub stream_id: u64,
     pub stream_id_hex: String,
+    pub content_shard: Option<usize>,
     pub first_seen_us: u64,
     pub last_seen_us: u64,
     pub protocol: TransportProtocol,
@@ -116,6 +117,7 @@ pub struct StreamViewRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamViewEntry {
     pub stream_id: u64,
+    pub content_shard: Option<usize>,
     pub first_seen_us: u64,
     pub last_seen_us: u64,
     pub protocol: TransportProtocol,
@@ -588,6 +590,7 @@ impl StreamViewState {
         StreamViewRow {
             stream_id: entry.stream_id,
             stream_id_hex: stream_id_hex(entry.stream_id),
+            content_shard: entry.content_shard,
             first_seen_us: entry.first_seen_us,
             last_seen_us: entry.last_seen_us,
             protocol: entry.protocol,
@@ -641,6 +644,7 @@ impl StreamViewEntry {
         let fields = &event.fields;
         Some(Self {
             stream_id: stream_id_field(fields, "stream_id")?,
+            content_shard: optional_usize_field(fields, "content_shard").unwrap_or(None),
             first_seen_us: u64_field(fields, "first_seen_us")?,
             last_seen_us: u64_field(fields, "last_seen_us")?,
             protocol: protocol_field(fields, "protocol")?,
@@ -902,6 +906,13 @@ fn usize_field(fields: &Value, name: &str) -> Option<usize> {
     u64_field(fields, name)?.try_into().ok()
 }
 
+fn optional_usize_field(fields: &Value, name: &str) -> Option<Option<usize>> {
+    match fields.get(name) {
+        Some(Value::Null) | None => Some(None),
+        Some(value) => Some(Some(value.as_u64()?.try_into().ok()?)),
+    }
+}
+
 fn u16_field(fields: &Value, name: &str) -> Option<u16> {
     u64_field(fields, name)?.try_into().ok()
 }
@@ -1044,6 +1055,22 @@ mod tests {
         assert_eq!("c", matches[1].pattern_name);
         assert_eq!(3, view.stream(0x10).unwrap().match_count);
         assert_eq!(1, view.stats().dropped_matches);
+    }
+
+    #[test]
+    fn stores_content_shard_from_stream_event() {
+        let mut view = view();
+        let mut event = stream_event(0x10, "http", 80);
+        event
+            .fields
+            .as_object_mut()
+            .unwrap()
+            .insert("content_shard".to_owned(), json!(3usize));
+
+        view.observe_event(&event);
+
+        assert_eq!(Some(3), view.stream(0x10).unwrap().content_shard);
+        assert_eq!(Some(3), view.stream_row(0x10).unwrap().content_shard);
     }
 
     #[test]

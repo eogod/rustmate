@@ -1,11 +1,11 @@
 use std::{
     sync::Arc,
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use tokio::sync::oneshot;
 
 use crate::{
@@ -29,12 +29,15 @@ use crate::{
         StreamContentSlice, StreamSliceConfig, StreamSliceError, StreamSliceReader,
         StreamSliceRequest,
     },
-    stream_view::{StreamPatternMatch, StreamViewState},
+    stream_view::{StreamPatternMatch, StreamViewEntry, StreamViewState},
 };
 
 pub use crate::shard::shard_for_flow_key;
 
 type AnalyzerFactory = Arc<dyn Fn() -> Box<dyn Analyzer> + Send + Sync + 'static>;
+
+const WORKER_LIVE_EVENT_FLUSH_MS: u64 = 100;
+const WORKER_LIVE_STATS_FLUSH_MS: u64 = 500;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ShardedPipelineConfig {
@@ -63,6 +66,7 @@ enum WorkerCommand {
 
 struct RoutedPacket {
     raw: RawPacket,
+    owner_shard: usize,
     flow_route: Option<FlowRoute>,
 }
 
@@ -75,6 +79,7 @@ struct WorkerSliceRequest {
 
 enum WorkerMessage {
     Events(Vec<Event>),
+    StatsSnapshot(Box<WorkerStats>),
     Stats(Box<WorkerReport>),
 }
 
@@ -83,7 +88,7 @@ struct WorkerReport {
     stream_content: StreamContent,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct WorkerStats {
     id: usize,
     packet_decode: PacketDecodeCounters,
@@ -110,6 +115,7 @@ struct CoordinatorState<'a> {
     stream_view: &'a mut StreamViewState,
     stream_messages: &'a mut StreamMessageStore,
     stream_content_shards: &'a mut [Option<StreamContent>],
+    worker_stats_snapshots: &'a mut [Option<WorkerStats>],
     live_api: Option<&'a LiveApiHandle>,
     stats: &'a mut PipelineStats,
 }
@@ -138,6 +144,14 @@ struct WorkerRuntime {
     analyzers: Vec<Box<dyn Analyzer>>,
     events: Vec<Event>,
     stats: WorkerStats,
+}
+
+struct WorkerLiveFlushState {
+    event_batch_capacity: usize,
+    event_flush_interval: Duration,
+    stats_flush_interval: Duration,
+    last_event_flush: Instant,
+    last_stats_flush: Instant,
 }
 
 impl ShardedPipeline {
@@ -194,7 +208,7 @@ impl ShardedPipeline {
                 stream_id: request.stream_id,
             });
         };
-        let shard = shard_for_flow_key(&entry.flow_key(), self.stream_content_shards.len());
+        let shard = stream_content_shard_for_entry(entry, self.stream_content_shards.len());
         let Some(content) = self
             .stream_content_shards
             .get(shard)
@@ -238,15 +252,16 @@ impl ShardedPipeline {
             ..PipelineStats::default()
         };
         let mut batch = PacketBatch::with_capacity(self.config.pipeline.batch_size.max(1));
-        let mut shard_coordinator = ShardCoordinator::new(ShardCoordinatorConfig::new(
-            self.config.worker_count,
-            self.config.pipeline.mode,
-        ));
+        let mut shard_coordinator = ShardCoordinator::new(
+            ShardCoordinatorConfig::new(self.config.worker_count, self.config.pipeline.mode)
+                .with_max_flow_owners(flow_owner_limit(self.config)),
+        );
         let mut pool = WorkerPool::start(
             self.config,
             self.pattern_config.clone(),
             Arc::new(self.analyzer_factories.clone()),
         )?;
+        let mut worker_stats_snapshots = vec![None; self.config.worker_count];
         if let Some(live_api) = &self.live_api {
             live_api.set_sharded_content(pool.content_slice_handle());
             live_api.publish_stats(stats);
@@ -262,6 +277,7 @@ impl ShardedPipeline {
                         stream_view: &mut self.stream_view,
                         stream_messages: &mut self.stream_messages,
                         stream_content_shards: &mut self.stream_content_shards,
+                        worker_stats_snapshots: &mut worker_stats_snapshots,
                         live_api: self.live_api.as_ref(),
                         stats: &mut stats,
                     }) {
@@ -298,6 +314,7 @@ impl ShardedPipeline {
 
                         let packet = RoutedPacket {
                             raw,
+                            owner_shard: route.shard,
                             flow_route: route.flow_route,
                         };
 
@@ -309,6 +326,7 @@ impl ShardedPipeline {
                                 stream_view: &mut self.stream_view,
                                 stream_messages: &mut self.stream_messages,
                                 stream_content_shards: &mut self.stream_content_shards,
+                                worker_stats_snapshots: &mut worker_stats_snapshots,
                                 live_api: self.live_api.as_ref(),
                                 stats: &mut stats,
                             },
@@ -327,6 +345,7 @@ impl ShardedPipeline {
                         stream_view: &mut self.stream_view,
                         stream_messages: &mut self.stream_messages,
                         stream_content_shards: &mut self.stream_content_shards,
+                        worker_stats_snapshots: &mut worker_stats_snapshots,
                         live_api: self.live_api.as_ref(),
                         stats: &mut stats,
                     }) {
@@ -366,6 +385,7 @@ impl ShardedPipeline {
             stream_view: &mut self.stream_view,
             stream_messages: &mut self.stream_messages,
             stream_content_shards: &mut self.stream_content_shards,
+            worker_stats_snapshots: &mut worker_stats_snapshots,
             live_api: self.live_api.as_ref(),
             stats: &mut stats,
         });
@@ -518,22 +538,24 @@ impl WorkerPool {
         )
     }
 
-    fn shutdown(self, coordinator: &mut CoordinatorState<'_>) -> Result<()> {
+    fn shutdown(mut self, coordinator: &mut CoordinatorState<'_>) -> Result<()> {
         let worker_count = self.workers.len();
         let mut first_error = None;
+        let mut received_stats = 0usize;
 
-        for worker in &self.workers {
-            if worker.sender.send(WorkerCommand::Shutdown).is_err() {
-                tracing::warn!(worker = worker.id, "Worker shard stopped before shutdown");
-            }
+        for index in 0..worker_count {
+            self.send_shutdown(index, coordinator, &mut received_stats, &mut first_error);
         }
 
-        let mut received_stats = 0usize;
         while received_stats < worker_count {
             match self.output_rx.recv() {
                 Ok(WorkerMessage::Stats(worker_report)) => {
                     let worker_id = worker_report.stats.id;
-                    add_worker_stats(coordinator.stats, &worker_report.stats);
+                    replace_worker_stats_snapshot(
+                        coordinator.stats,
+                        coordinator.worker_stats_snapshots,
+                        worker_report.stats,
+                    );
                     store_worker_content(
                         coordinator.stream_content_shards,
                         worker_id,
@@ -546,6 +568,13 @@ impl WorkerPool {
                     if let Err(err) = write_events(events, coordinator) {
                         record_first_error(&mut first_error, err);
                     }
+                }
+                Ok(WorkerMessage::StatsSnapshot(worker_stats)) => {
+                    replace_worker_stats_snapshot(
+                        coordinator.stats,
+                        coordinator.worker_stats_snapshots,
+                        *worker_stats,
+                    );
                 }
                 Err(_) => {
                     record_first_error(
@@ -578,6 +607,90 @@ impl WorkerPool {
             Err(err)
         } else {
             Ok(())
+        }
+    }
+
+    fn send_shutdown(
+        &mut self,
+        worker_index: usize,
+        coordinator: &mut CoordinatorState<'_>,
+        received_stats: &mut usize,
+        first_error: &mut Option<anyhow::Error>,
+    ) {
+        let Some(worker) = self.workers.get(worker_index) else {
+            return;
+        };
+        let worker_id = worker.id;
+        let sender = worker.sender.clone();
+
+        loop {
+            match sender.try_send(WorkerCommand::Shutdown) {
+                Ok(()) => return,
+                Err(TrySendError::Full(WorkerCommand::Shutdown)) => {
+                    self.drain_shutdown_available(coordinator, received_stats, first_error);
+                    thread::yield_now();
+                }
+                Err(TrySendError::Full(_)) => {
+                    record_first_error(
+                        first_error,
+                        anyhow!(
+                            "worker shard {worker_id} send queue returned an unexpected command"
+                        ),
+                    );
+                    return;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    tracing::warn!(worker = worker_id, "Worker shard stopped before shutdown");
+                    return;
+                }
+            }
+        }
+    }
+
+    fn drain_shutdown_available(
+        &mut self,
+        coordinator: &mut CoordinatorState<'_>,
+        received_stats: &mut usize,
+        first_error: &mut Option<anyhow::Error>,
+    ) {
+        loop {
+            match self.output_rx.try_recv() {
+                Ok(WorkerMessage::Stats(worker_report)) => {
+                    let worker_id = worker_report.stats.id;
+                    replace_worker_stats_snapshot(
+                        coordinator.stats,
+                        coordinator.worker_stats_snapshots,
+                        worker_report.stats,
+                    );
+                    store_worker_content(
+                        coordinator.stream_content_shards,
+                        worker_id,
+                        worker_report.stream_content,
+                    );
+                    *received_stats = received_stats.saturating_add(1);
+                    tracing::debug!(worker = worker_id, "Worker shard reported final stats");
+                }
+                Ok(WorkerMessage::Events(events)) => {
+                    if let Err(err) = write_events(events, coordinator) {
+                        record_first_error(first_error, err);
+                    }
+                }
+                Ok(WorkerMessage::StatsSnapshot(worker_stats)) => {
+                    replace_worker_stats_snapshot(
+                        coordinator.stats,
+                        coordinator.worker_stats_snapshots,
+                        *worker_stats,
+                    );
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    record_first_error(
+                        first_error,
+                        anyhow!("worker output channel closed before final stats"),
+                    );
+                    return;
+                }
+            }
         }
     }
 }
@@ -634,7 +747,7 @@ fn run_worker(
     receiver: Receiver<WorkerCommand>,
     output_tx: Sender<WorkerMessage>,
 ) -> Result<()> {
-    let event_batch_capacity = config.batch_size.clamp(1, 8192);
+    let mut flush_state = WorkerLiveFlushState::new(config.batch_size.clamp(1, 8192));
     let mut runtime = WorkerRuntime {
         mode: config.mode,
         flow_table: FlowTable::new(flow_config),
@@ -646,21 +759,26 @@ fn run_worker(
             .iter()
             .map(|factory| factory())
             .collect::<Vec<_>>(),
-        events: Vec::with_capacity(event_batch_capacity),
+        events: Vec::with_capacity(flush_state.event_batch_capacity),
         stats: WorkerStats {
             id,
             ..WorkerStats::default()
         },
     };
 
-    while let Ok(command) = receiver.recv() {
+    loop {
+        let command = match receiver.recv_timeout(flush_state.event_flush_interval) {
+            Ok(command) => command,
+            Err(RecvTimeoutError::Timeout) => {
+                flush_state.flush(&output_tx, &mut runtime, true)?;
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
         match command {
             WorkerCommand::Packet(packet) => {
                 runtime.process_packet(&packet);
-
-                if runtime.events.len() >= event_batch_capacity {
-                    flush_worker_events(&output_tx, &mut runtime.events)?;
-                }
             }
             WorkerCommand::ContentSlice(slice_request) => {
                 let empty_view = StreamViewState::new(config.stream_view);
@@ -678,14 +796,12 @@ fn run_worker(
             }
             WorkerCommand::Shutdown => break,
         }
+
+        flush_state.flush(&output_tx, &mut runtime, false)?;
     }
 
     flush_worker_events(&output_tx, &mut runtime.events)?;
-    runtime.stats.flow_stats = runtime.flow_table.stats();
-    runtime.stats.stream_inventory_stats = runtime.stream_inventory.stats();
-    runtime.stats.stream_content_stats = runtime.stream_content.stats();
-    runtime.stats.stream_parser_stats = runtime.stream_parser.stats();
-    runtime.stats.pattern_stats = runtime.pattern_engine.stats();
+    runtime.refresh_stats();
     let report = WorkerReport {
         stats: runtime.stats,
         stream_content: runtime.stream_content,
@@ -714,8 +830,12 @@ impl WorkerRuntime {
                     .map(|route| self.flow_table.observe_with_route(&packet, route))
                     .unwrap_or_else(|| self.flow_table.observe(&packet));
                 if let Some(flow) = flow.as_ref() {
-                    self.stream_inventory
-                        .observe_flow(&packet, flow, &mut self.events);
+                    self.stream_inventory.observe_flow(
+                        &packet,
+                        flow,
+                        Some(routed.owner_shard),
+                        &mut self.events,
+                    );
                     if let Some(update) = self.stream_content.observe_flow(&packet, flow) {
                         self.pattern_engine.scan_update(
                             &packet,
@@ -754,6 +874,55 @@ impl WorkerRuntime {
             }
         }
     }
+
+    fn refresh_stats(&mut self) {
+        self.stats.flow_stats = self.flow_table.stats();
+        self.stats.stream_inventory_stats = self.stream_inventory.stats();
+        self.stats.stream_content_stats = self.stream_content.stats();
+        self.stats.stream_parser_stats = self.stream_parser.stats();
+        self.stats.pattern_stats = self.pattern_engine.stats();
+    }
+
+    fn stats_snapshot(&mut self) -> WorkerStats {
+        self.refresh_stats();
+        self.stats
+    }
+}
+
+impl WorkerLiveFlushState {
+    fn new(event_batch_capacity: usize) -> Self {
+        Self {
+            event_batch_capacity,
+            event_flush_interval: Duration::from_millis(WORKER_LIVE_EVENT_FLUSH_MS),
+            stats_flush_interval: Duration::from_millis(WORKER_LIVE_STATS_FLUSH_MS),
+            last_event_flush: Instant::now(),
+            last_stats_flush: Instant::now(),
+        }
+    }
+
+    fn flush(
+        &mut self,
+        output_tx: &Sender<WorkerMessage>,
+        runtime: &mut WorkerRuntime,
+        force_events: bool,
+    ) -> Result<()> {
+        let now = Instant::now();
+        if !runtime.events.is_empty()
+            && (force_events
+                || runtime.events.len() >= self.event_batch_capacity
+                || now.duration_since(self.last_event_flush) >= self.event_flush_interval)
+        {
+            flush_worker_events(output_tx, &mut runtime.events)?;
+            self.last_event_flush = now;
+        }
+
+        if now.duration_since(self.last_stats_flush) >= self.stats_flush_interval {
+            try_flush_worker_stats(output_tx, runtime)?;
+            self.last_stats_flush = now;
+        }
+
+        Ok(())
+    }
 }
 
 fn flush_worker_events(output_tx: &Sender<WorkerMessage>, events: &mut Vec<Event>) -> Result<()> {
@@ -768,15 +937,43 @@ fn flush_worker_events(output_tx: &Sender<WorkerMessage>, events: &mut Vec<Event
         .map_err(|_| anyhow!("coordinator stopped before receiving worker events"))
 }
 
+fn try_flush_worker_stats(
+    output_tx: &Sender<WorkerMessage>,
+    runtime: &mut WorkerRuntime,
+) -> Result<()> {
+    let snapshot = runtime.stats_snapshot();
+    let worker_id = snapshot.id;
+    match output_tx.try_send(WorkerMessage::StatsSnapshot(Box::new(snapshot))) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Ok(()),
+        Err(TrySendError::Disconnected(_)) => Err(anyhow!(
+            "coordinator stopped before receiving worker shard {} stats snapshot",
+            worker_id
+        )),
+    }
+}
+
 fn write_worker_message(
     message: WorkerMessage,
     coordinator: &mut CoordinatorState<'_>,
 ) -> Result<()> {
     match message {
         WorkerMessage::Events(events) => write_events(events, coordinator),
+        WorkerMessage::StatsSnapshot(worker_stats) => {
+            replace_worker_stats_snapshot(
+                coordinator.stats,
+                coordinator.worker_stats_snapshots,
+                *worker_stats,
+            );
+            Ok(())
+        }
         WorkerMessage::Stats(worker_report) => {
             let worker_id = worker_report.stats.id;
-            add_worker_stats(coordinator.stats, &worker_report.stats);
+            replace_worker_stats_snapshot(
+                coordinator.stats,
+                coordinator.worker_stats_snapshots,
+                worker_report.stats,
+            );
             store_worker_content(
                 coordinator.stream_content_shards,
                 worker_id,
@@ -784,6 +981,34 @@ fn write_worker_message(
             );
             Ok(())
         }
+    }
+}
+
+fn replace_worker_stats_snapshot(
+    stats: &mut PipelineStats,
+    snapshots: &mut [Option<WorkerStats>],
+    worker_stats: WorkerStats,
+) {
+    let worker_id = worker_stats.id;
+    let Some(slot) = snapshots.get_mut(worker_id) else {
+        tracing::warn!(
+            worker = worker_id,
+            "Worker stats snapshot index is out of range"
+        );
+        return;
+    };
+
+    *slot = Some(worker_stats);
+    rebuild_worker_stats_from_snapshots(stats, snapshots);
+}
+
+fn rebuild_worker_stats_from_snapshots(
+    stats: &mut PipelineStats,
+    snapshots: &[Option<WorkerStats>],
+) {
+    stats.clear_worker_runtime_stats();
+    for worker_stats in snapshots.iter().flatten() {
+        add_worker_stats(stats, worker_stats);
     }
 }
 
@@ -858,6 +1083,17 @@ fn publish_queue_stats(live_api: Option<&LiveApiHandle>, stats: PipelineStats) {
     }
 }
 
+fn stream_content_shard_for_entry(entry: &StreamViewEntry, content_shards: usize) -> usize {
+    if content_shards <= 1 {
+        return 0;
+    }
+
+    entry
+        .content_shard
+        .filter(|shard| *shard < content_shards)
+        .unwrap_or_else(|| shard_for_flow_key(&entry.flow_key(), content_shards))
+}
+
 fn final_queue_snapshot(
     config: ShardedPipelineConfig,
     metrics: &ShardLoadMetrics,
@@ -918,6 +1154,29 @@ fn flow_table_config(config: ShardedPipelineConfig) -> FlowTableConfig {
     )
 }
 
+fn flow_owner_limit(config: ShardedPipelineConfig) -> usize {
+    let worker_count = config.worker_count.max(1);
+    [
+        config.pipeline.max_flows,
+        config
+            .pipeline
+            .stream_inventory
+            .max_streams
+            .saturating_mul(worker_count),
+        config
+            .pipeline
+            .stream_content
+            .max_streams
+            .saturating_mul(worker_count),
+        config.pipeline.stream_view.max_streams,
+        worker_count,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(1)
+    .max(1)
+}
+
 fn max_flows_per_worker(max_flows: usize, worker_count: usize) -> usize {
     max_flows.max(1).div_ceil(worker_count.max(1))
 }
@@ -927,7 +1186,10 @@ mod tests {
     use std::{
         collections::VecDeque,
         net::Ipv4Addr,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     use etherparse::PacketBuilder;
@@ -1105,6 +1367,7 @@ mod tests {
             ..StreamViewQuery::default()
         });
         let stream_id = rows.rows.first().unwrap().stream_id;
+        let content_shard = rows.rows.first().unwrap().content_shard;
         let slice = pipeline
             .content_slice(&StreamSliceRequest {
                 stream_id,
@@ -1116,6 +1379,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(1, stats.pattern_matches);
+        assert!(content_shard.is_some());
         assert_eq!("flag", slice.copy_as(StreamSliceCopyFormat::Text));
         assert_eq!(1, slice.highlights.len());
         assert_eq!(0, slice.highlights[0].logical_start);
@@ -1171,6 +1435,40 @@ mod tests {
         assert_eq!(250, max_flows_per_worker(1_000, 4));
         assert_eq!(251, max_flows_per_worker(1_001, 4));
         assert_eq!(1, max_flows_per_worker(0, 16));
+    }
+
+    #[test]
+    fn flow_owner_limit_covers_worker_local_state_caps() {
+        let config = ShardedPipelineConfig {
+            pipeline: PipelineConfig {
+                mode: RunMode::Analyze,
+                batch_size: 2,
+                health_interval_ms: 0,
+                max_flows: 10,
+                flow_idle_timeout_ms: 120_000,
+                max_tcp_buffered_bytes_per_flow: 64 * 1024,
+                max_tcp_out_of_order_segments_per_direction: 16,
+                stream_inventory: StreamInventoryConfig {
+                    max_streams: 100,
+                    ..test_stream_inventory_config()
+                },
+                stream_content: StreamContentConfig {
+                    max_streams: 200,
+                    ..test_stream_content_config()
+                },
+                stream_parser: StreamParserConfig::disabled(),
+                stream_view: StreamViewConfig {
+                    max_streams: 50,
+                    ..test_stream_view_config()
+                },
+                stream_slice: test_stream_slice_config(),
+            },
+            worker_count: 4,
+            worker_queue_depth: 8,
+            event_queue_depth: 8,
+        };
+
+        assert_eq!(800, flow_owner_limit(config));
     }
 
     #[tokio::test]
@@ -1237,6 +1535,68 @@ mod tests {
             .find(|event| event["event_type"] == "http_request")
             .unwrap();
         assert_eq!("/idle-shard", http["fields"]["target"]);
+    }
+
+    #[tokio::test]
+    async fn flushes_small_live_event_batches_before_source_finishes() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let finish = Arc::new(AtomicBool::new(false));
+        let mut pipeline = ShardedPipeline::new(ShardedPipelineConfig {
+            pipeline: PipelineConfig {
+                mode: RunMode::Analyze,
+                batch_size: 4096,
+                health_interval_ms: 0,
+                max_flows: 1024,
+                flow_idle_timeout_ms: 120_000,
+                max_tcp_buffered_bytes_per_flow: 64 * 1024,
+                max_tcp_out_of_order_segments_per_direction: 16,
+                stream_inventory: test_stream_inventory_config(),
+                stream_content: test_stream_content_config(),
+                stream_parser: StreamParserConfig::disabled(),
+                stream_view: test_stream_view_config(),
+                stream_slice: test_stream_slice_config(),
+            },
+            worker_count: 2,
+            worker_queue_depth: 8,
+            event_queue_depth: 8,
+        });
+        pipeline.register_sink(Box::new(CollectSink {
+            events: Arc::clone(&events),
+        }));
+
+        let source = HoldOpenAfterPacketsSource::new(
+            vec![tcp_packet(
+                [10, 0, 0, 1],
+                1111,
+                [10, 0, 0, 2],
+                80,
+                1,
+                b"GET /live-flush HTTP/1.1\r\nHost: live.local\r\n\r\n",
+                1,
+            )],
+            Arc::clone(&finish),
+        );
+        let run = tokio::spawn(async move { pipeline.run_with_source(source).await });
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if !events.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(1, events.lock().unwrap().len());
+        finish.store(true, Ordering::Relaxed);
+        let stats = tokio::time::timeout(tokio::time::Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(1, stats.packets);
+        assert_eq!(1, stats.events);
+        assert_eq!(1, stats.packet_decode.packet_parsed_packets);
+        assert_eq!(1, stats.view_tracked_streams);
     }
 
     #[tokio::test]
@@ -1325,11 +1685,25 @@ mod tests {
         yielded_idle: bool,
     }
 
+    struct HoldOpenAfterPacketsSource {
+        packets: VecDeque<RawPacket>,
+        finish: Arc<AtomicBool>,
+    }
+
     impl IdleThenPacketSource {
         fn new(packets: Vec<RawPacket>) -> Self {
             Self {
                 packets: VecDeque::from(packets),
                 yielded_idle: false,
+            }
+        }
+    }
+
+    impl HoldOpenAfterPacketsSource {
+        fn new(packets: Vec<RawPacket>, finish: Arc<AtomicBool>) -> Self {
+            Self {
+                packets: VecDeque::from(packets),
+                finish,
             }
         }
     }
@@ -1355,6 +1729,27 @@ mod tests {
 
         fn is_finished(&self) -> bool {
             self.yielded_idle && self.packets.is_empty()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PacketSource for HoldOpenAfterPacketsSource {
+        async fn next_batch(&mut self, batch: &mut PacketBatch) -> anyhow::Result<usize> {
+            batch.clear();
+            while batch.len() < batch.capacity() {
+                let Some(packet) = self.packets.pop_front() else {
+                    break;
+                };
+                batch.push(packet);
+            }
+            if batch.is_empty() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+            Ok(batch.len())
+        }
+
+        fn is_finished(&self) -> bool {
+            self.packets.is_empty() && self.finish.load(Ordering::Relaxed)
         }
     }
 

@@ -20,12 +20,15 @@ const ROUTE_HASHER: RandomState = RandomState::with_seeds(
     0x2545_f491_4f6c_dd1d,
 );
 const DEFAULT_MAX_TRACKED_ROUTE_FLOWS: usize = 1_048_576;
+const DEFAULT_MAX_FLOW_OWNERS: usize = 1_048_576;
+const SECONDARY_ROUTE_HASH_SALT: u64 = 0x517c_c1b7_2722_0a95;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardCoordinatorConfig {
     pub shard_count: usize,
     pub mode: RunMode,
     pub routing_policy: RoutingPolicy,
+    pub max_flow_owners: usize,
 }
 
 impl ShardCoordinatorConfig {
@@ -34,7 +37,13 @@ impl ShardCoordinatorConfig {
             shard_count,
             mode,
             routing_policy: RoutingPolicy::default(),
+            max_flow_owners: DEFAULT_MAX_FLOW_OWNERS,
         }
+    }
+
+    pub fn with_max_flow_owners(mut self, max_flow_owners: usize) -> Self {
+        self.max_flow_owners = max_flow_owners.max(1);
+        self
     }
 }
 
@@ -44,6 +53,7 @@ pub struct ShardCoordinator {
     mode: RunMode,
     routing_policy: RoutingPolicy,
     next_sequence: u64,
+    flow_owners: FlowOwnerTable,
     metrics: ShardLoadMetrics,
 }
 
@@ -55,6 +65,7 @@ impl ShardCoordinator {
             mode: config.mode,
             routing_policy: config.routing_policy,
             next_sequence: 0,
+            flow_owners: FlowOwnerTable::new(config.max_flow_owners),
             metrics: ShardLoadMetrics::new(topology.shard_count()),
         }
     }
@@ -74,15 +85,163 @@ impl ShardCoordinator {
     pub fn route_packet(&mut self, raw: &RawPacket) -> ShardRoute {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
-        let route = self
-            .routing_policy
-            .route_packet(&self.topology, self.mode, sequence, raw);
+        let route = self.route_packet_inner(sequence, raw);
         self.metrics.observe_route(route, raw.data.len() as u64);
         route
     }
 
     pub fn metrics(&self) -> &ShardLoadMetrics {
         &self.metrics
+    }
+
+    pub fn flow_owner_count(&self) -> usize {
+        self.flow_owners.len()
+    }
+
+    pub fn flow_owner_evictions(&self) -> u64 {
+        self.flow_owners.evictions()
+    }
+
+    fn route_packet_inner(&mut self, sequence: u64, raw: &RawPacket) -> ShardRoute {
+        if matches!(self.mode, RunMode::Dump) {
+            return ShardRoute {
+                shard: 0,
+                kind: ShardRouteKind::Dump,
+                flow_route: None,
+                fallback_reason: None,
+            };
+        }
+        if self.topology.is_single_shard() {
+            return ShardRoute {
+                shard: 0,
+                kind: ShardRouteKind::SingleShard,
+                flow_route: None,
+                fallback_reason: None,
+            };
+        }
+
+        match flow_route_from_raw_result(raw) {
+            Ok(flow_route) => self.route_flow(flow_route),
+            Err(reason) => ShardRoute {
+                shard: self
+                    .routing_policy
+                    .fallback()
+                    .route(sequence, &self.topology),
+                kind: ShardRouteKind::Fallback,
+                flow_route: None,
+                fallback_reason: Some(reason),
+            },
+        }
+    }
+
+    fn route_flow(&mut self, flow_route: FlowRoute) -> ShardRoute {
+        let shard = self.flow_owners.owner(flow_route.key).unwrap_or_else(|| {
+            let shard = self.choose_shard_for_new_flow(flow_route.key);
+            self.flow_owners.remember(flow_route.key, shard);
+            shard
+        });
+
+        ShardRoute {
+            shard,
+            kind: ShardRouteKind::FlowAffinity,
+            flow_route: Some(flow_route),
+            fallback_reason: None,
+        }
+    }
+
+    fn choose_shard_for_new_flow(&self, key: FlowKey) -> usize {
+        let primary = self.topology.shard_for_hash(route_hash(key));
+        let secondary = self
+            .topology
+            .shard_for_hash(route_hash((SECONDARY_ROUTE_HASH_SALT, key)));
+
+        if primary == secondary {
+            return primary;
+        }
+
+        let primary_load = self.placement_load(primary);
+        let secondary_load = self.placement_load(secondary);
+        if secondary_load < primary_load {
+            secondary
+        } else {
+            primary
+        }
+    }
+
+    fn placement_load(&self, shard: usize) -> ShardPlacementLoad {
+        self.metrics
+            .shard(shard)
+            .map(ShardPlacementLoad::from)
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FlowOwnerTable {
+    owners: AHashMap<FlowKey, usize>,
+    order: VecDeque<FlowKey>,
+    max_owners: usize,
+    evictions: u64,
+}
+
+impl FlowOwnerTable {
+    fn new(max_owners: usize) -> Self {
+        Self {
+            owners: AHashMap::new(),
+            order: VecDeque::new(),
+            max_owners: max_owners.max(1),
+            evictions: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.owners.len()
+    }
+
+    fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    fn owner(&self, key: FlowKey) -> Option<usize> {
+        self.owners.get(&key).copied()
+    }
+
+    fn remember(&mut self, key: FlowKey, shard: usize) {
+        if let Some(owner) = self.owners.get_mut(&key) {
+            *owner = shard;
+            return;
+        }
+
+        while self.owners.len() >= self.max_owners {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if self.owners.remove(&evicted).is_some() {
+                self.evictions = self.evictions.saturating_add(1);
+            }
+        }
+
+        if self.owners.len() >= self.max_owners {
+            return;
+        }
+
+        self.owners.insert(key, shard);
+        self.order.push_back(key);
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ShardPlacementLoad {
+    bytes: u64,
+    packets: u64,
+}
+
+impl From<&ShardLoad> for ShardPlacementLoad {
+    fn from(load: &ShardLoad) -> Self {
+        Self {
+            bytes: load.bytes,
+            packets: load.packets,
+        }
     }
 }
 
@@ -100,45 +259,9 @@ impl Default for RoutingPolicy {
 }
 
 impl RoutingPolicy {
-    fn route_packet(
-        self,
-        topology: &ShardTopology,
-        mode: RunMode,
-        sequence: u64,
-        raw: &RawPacket,
-    ) -> ShardRoute {
-        if matches!(mode, RunMode::Dump) {
-            return ShardRoute {
-                shard: 0,
-                kind: ShardRouteKind::Dump,
-                flow_route: None,
-                fallback_reason: None,
-            };
-        }
-        if topology.is_single_shard() {
-            return ShardRoute {
-                shard: 0,
-                kind: ShardRouteKind::SingleShard,
-                flow_route: None,
-                fallback_reason: None,
-            };
-        }
-
+    fn fallback(self) -> FallbackRoutingPolicy {
         match self {
-            Self::FlowAffinity { fallback } => match flow_route_from_raw_result(raw) {
-                Ok(flow_route) => ShardRoute {
-                    shard: topology.shard_for_hash(route_hash(flow_route.key)),
-                    kind: ShardRouteKind::FlowAffinity,
-                    flow_route: Some(flow_route),
-                    fallback_reason: None,
-                },
-                Err(reason) => ShardRoute {
-                    shard: fallback.route(sequence, topology),
-                    kind: ShardRouteKind::Fallback,
-                    flow_route: None,
-                    fallback_reason: Some(reason),
-                },
-            },
+            Self::FlowAffinity { fallback } => fallback,
         }
     }
 }
@@ -638,7 +761,9 @@ pub(crate) fn route_packet(
     sequence: u64,
     shard_count: usize,
 ) -> ShardRoute {
-    RoutingPolicy::default().route_packet(&ShardTopology::new(shard_count), mode, sequence, raw)
+    let mut coordinator = ShardCoordinator::new(ShardCoordinatorConfig::new(shard_count, mode));
+    coordinator.next_sequence = sequence;
+    coordinator.route_packet(raw)
 }
 
 // Tiny parser for the dispatcher. Workers still do the full decode once analyzers need it.
@@ -916,6 +1041,55 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_reuses_flow_owner_for_reverse_direction() {
+        let mut coordinator =
+            ShardCoordinator::new(ShardCoordinatorConfig::new(4, RunMode::Analyze));
+        let forward = tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 1, b"x");
+        let reverse = tcp_packet([10, 0, 0, 2], 80, [10, 0, 0, 1], 1111, 1, b"y");
+
+        let forward_route = coordinator.route_packet(&forward);
+        let reverse_route = coordinator.route_packet(&reverse);
+
+        assert_eq!(ShardRouteKind::FlowAffinity, forward_route.kind);
+        assert_eq!(ShardRouteKind::FlowAffinity, reverse_route.kind);
+        assert_eq!(forward_route.shard, reverse_route.shard);
+        assert_eq!(1, coordinator.flow_owner_count());
+    }
+
+    #[test]
+    fn stateful_placement_chooses_colder_secondary_candidate() {
+        let mut coordinator =
+            ShardCoordinator::new(ShardCoordinatorConfig::new(4, RunMode::Analyze));
+        let (packet, flow_route, primary, secondary) = flow_with_distinct_candidates(4);
+
+        coordinator
+            .metrics
+            .observe_route(flow_route_on_shard(flow_route, primary), 50_000);
+
+        let first = coordinator.route_packet(&packet);
+        let second = coordinator.route_packet(&packet);
+
+        assert_eq!(secondary, first.shard);
+        assert_eq!(secondary, second.shard);
+        assert_eq!(1, coordinator.flow_owner_count());
+    }
+
+    #[test]
+    fn flow_owner_table_is_bounded_by_config() {
+        let mut coordinator = ShardCoordinator::new(
+            ShardCoordinatorConfig::new(4, RunMode::Analyze).with_max_flow_owners(1),
+        );
+        let first = tcp_packet([10, 0, 0, 1], 1111, [10, 0, 0, 2], 80, 1, b"x");
+        let second = tcp_packet([10, 0, 0, 3], 2222, [10, 0, 0, 4], 443, 1, b"y");
+
+        coordinator.route_packet(&first);
+        coordinator.route_packet(&second);
+
+        assert_eq!(1, coordinator.flow_owner_count());
+        assert_eq!(1, coordinator.flow_owner_evictions());
+    }
+
+    #[test]
     fn coordinator_tracks_routing_load_without_queue_state() {
         let mut coordinator =
             ShardCoordinator::new(ShardCoordinatorConfig::new(4, RunMode::Analyze));
@@ -1083,5 +1257,27 @@ mod tests {
             flow_route: Some(flow_route),
             fallback_reason: None,
         }
+    }
+
+    fn flow_with_distinct_candidates(shard_count: usize) -> (RawPacket, FlowRoute, usize, usize) {
+        let topology = ShardTopology::new(shard_count);
+        for host in 1..=254 {
+            let packet = tcp_packet(
+                [10, 0, 1, host],
+                10_000 + host as u16,
+                [10, 0, 2, 1],
+                80,
+                1,
+                b"x",
+            );
+            let flow_route = flow_route_from_raw(&packet).unwrap();
+            let primary = topology.shard_for_hash(route_hash(flow_route.key));
+            let secondary =
+                topology.shard_for_hash(route_hash((SECONDARY_ROUTE_HASH_SALT, flow_route.key)));
+            if primary != secondary {
+                return (packet, flow_route, primary, secondary);
+            }
+        }
+        panic!("expected to find a flow with distinct placement candidates");
     }
 }

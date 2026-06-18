@@ -37,8 +37,8 @@ use crate::{
     },
     stream_view::{
         StreamHideRule, StreamPatternMatch, StreamViewConfig, StreamViewContentKind,
-        StreamViewDirection, StreamViewQuery, StreamViewQueryResult, StreamViewRow,
-        StreamViewState, StreamViewStats, StreamViewStatus,
+        StreamViewDirection, StreamViewEntry, StreamViewQuery, StreamViewQueryResult,
+        StreamViewRow, StreamViewState, StreamViewStats, StreamViewStatus,
     },
 };
 
@@ -97,14 +97,10 @@ impl ApiSnapshot {
             )));
         };
 
-        if self.content_shards.len() <= 1 {
-            Ok(0)
-        } else {
-            Ok(shard_for_flow_key(
-                &entry.flow_key(),
-                self.content_shards.len(),
-            ))
-        }
+        Ok(stream_content_shard_for_entry(
+            entry,
+            self.content_shards.len(),
+        ))
     }
 
     fn slice(&self, request: &StreamSliceRequest) -> Result<StreamContentSlice, ApiError> {
@@ -1561,11 +1557,18 @@ fn live_stream_shard(
     content_shards: usize,
 ) -> Option<usize> {
     let entry = view.stream(stream_id)?;
+    Some(stream_content_shard_for_entry(entry, content_shards))
+}
+
+fn stream_content_shard_for_entry(entry: &StreamViewEntry, content_shards: usize) -> usize {
     if content_shards <= 1 {
-        Some(0)
-    } else {
-        Some(shard_for_flow_key(&entry.flow_key(), content_shards))
+        return 0;
     }
+
+    entry
+        .content_shard
+        .filter(|shard| *shard < content_shards)
+        .unwrap_or_else(|| shard_for_flow_key(&entry.flow_key(), content_shards))
 }
 
 fn event_stream_id(event: &Event) -> Option<u64> {

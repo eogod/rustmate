@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use pcap::{Active, Capture, Device};
+use pcap::{Active, Capture, Device, Linktype};
 
 use crate::{
     ingest::{PacketBatch, PacketSource, PacketSourceStats},
@@ -66,6 +66,8 @@ impl LiveCaptureSource {
             .open()
             .with_context(|| format!("failed to open capture on {}", config.interface))?;
 
+        let linktype = choose_supported_datalink(&mut cap)?;
+
         if let Some(filter) = config
             .bpf_filter
             .as_deref()
@@ -75,7 +77,6 @@ impl LiveCaptureSource {
                 .with_context(|| format!("failed to compile/apply BPF filter: {filter}"))?;
         }
 
-        let linktype = cap.get_datalink();
         tracing::info!(
             interface = %config.interface,
             linktype = linktype.0,
@@ -105,6 +106,33 @@ impl LiveCaptureSource {
                 .max_packets
                 .is_some_and(|limit| self.captured_packets >= limit)
     }
+}
+
+fn choose_supported_datalink(cap: &mut Capture<Active>) -> Result<Linktype> {
+    let current = cap.get_datalink();
+    if LinkLayer::from_pcap(current) != LinkLayer::Unsupported {
+        return Ok(current);
+    }
+
+    let datalinks = cap
+        .list_datalinks()
+        .context("failed to list live capture datalinks")?;
+    let Some(linktype) = datalinks
+        .into_iter()
+        .find(|linktype| LinkLayer::from_pcap(*linktype) != LinkLayer::Unsupported)
+    else {
+        return Ok(current);
+    };
+
+    tracing::warn!(
+        from_linktype = current.0,
+        to_linktype = linktype.0,
+        to_link_layer = LinkLayer::from_pcap(linktype).as_str(),
+        "Switching live capture to a supported datalink"
+    );
+    cap.set_datalink(linktype)
+        .with_context(|| format!("failed to switch live capture datalink to {}", linktype.0))?;
+    Ok(cap.get_datalink())
 }
 
 #[async_trait::async_trait]

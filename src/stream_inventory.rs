@@ -58,6 +58,7 @@ pub struct StreamInventory {
 struct StreamRecord {
     id: u64,
     key: FlowKey,
+    content_shard: Option<usize>,
     service: ServiceGuess,
     first_seen_us: u64,
     last_seen_us: u64,
@@ -171,6 +172,7 @@ impl StreamInventory {
         &mut self,
         packet: &DecodedPacket<'_>,
         flow: &FlowObservation<'_>,
+        content_shard: Option<usize>,
         events: &mut Vec<Event>,
     ) {
         if !self.config.enabled {
@@ -195,7 +197,9 @@ impl StreamInventory {
             let previous_status = record.status;
             let previous_kind = record.content_kind();
             let previous_service = record.service;
+            let previous_content_shard = record.content_shard;
 
+            record.content_shard = content_shard.or(record.content_shard);
             record.observe_packet(packet, flow.direction);
             if let Some(tcp) = flow.tcp.as_ref() {
                 record.observe_tcp_status(flow.direction, tcp.status);
@@ -215,7 +219,8 @@ impl StreamInventory {
                 previous_status != StreamStatus::Closed && record.status == StreamStatus::Closed;
             let force_update = previous_status != record.status
                 || previous_kind != record.content_kind()
-                || previous_service != record.service;
+                || previous_service != record.service
+                || previous_content_shard != record.content_shard;
             let event = if created {
                 record.mark_emitted();
                 Some(("stream_open", record.fields()))
@@ -314,6 +319,7 @@ impl StreamRecord {
         Self {
             id: key.stable_id(),
             key,
+            content_shard: None,
             service: infer_service(key),
             first_seen_us: now_us,
             last_seen_us: now_us,
@@ -398,10 +404,10 @@ impl StreamRecord {
     }
 
     fn content_kind(&self) -> ContentKind {
-        combine_content_kind(
+        self.service.adjust_content_kind(combine_content_kind(
             self.directions[0].content.kind(),
             self.directions[1].content.kind(),
-        )
+        ))
     }
 
     fn should_emit_update(
@@ -433,6 +439,7 @@ impl StreamRecord {
             "protocol": self.key.protocol,
             "endpoint_a": endpoint_fields(self.key.a),
             "endpoint_b": endpoint_fields(self.key.b),
+            "content_shard": self.content_shard,
             "service": {
                 "name": self.service.name,
                 "side": self.service.side.as_str(),
@@ -538,6 +545,36 @@ impl ContentKind {
             Self::Mixed => "mixed",
         }
     }
+}
+
+impl ServiceGuess {
+    fn adjust_content_kind(self, kind: ContentKind) -> ContentKind {
+        if kind != ContentKind::Binary {
+            return kind;
+        }
+
+        if is_text_framed_service(self.name) {
+            ContentKind::Mixed
+        } else {
+            kind
+        }
+    }
+}
+
+fn is_text_framed_service(service: &str) -> bool {
+    matches!(
+        service,
+        "http"
+            | "http2"
+            | "websocket"
+            | "ssh"
+            | "smtp"
+            | "ftp"
+            | "redis"
+            | "memcached"
+            | "pop3"
+            | "imap"
+    )
 }
 
 fn endpoint_fields(endpoint: Endpoint) -> Value {
@@ -686,6 +723,27 @@ mod tests {
     }
 
     #[test]
+    fn text_framed_services_with_binary_body_report_mixed() {
+        let mut inventory = inventory(config());
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+
+        feed(
+            &mut inventory,
+            &mut flow_table,
+            &tcp_packet(1, 1111, 80, b"\x1f\x8b\x08\x00\x00\x00\x00\x00"),
+            &mut events,
+        );
+
+        assert_eq!("http", events[0].fields["service"]["name"]);
+        assert_eq!("mixed", events[0].fields["content_kind"]);
+        assert_eq!(
+            "binary",
+            events[0].fields["directions"]["a_to_b"]["content_kind"]
+        );
+    }
+
+    #[test]
     fn detects_http_on_nonstandard_port_from_payload() {
         let mut inventory = inventory(config());
         let mut flow_table = flow_table();
@@ -797,6 +855,21 @@ mod tests {
         assert_eq!(StreamInventoryStats::default(), inventory.stats());
     }
 
+    #[test]
+    fn stream_events_include_content_shard_when_known() {
+        let mut inventory = inventory(config());
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+        let raw = tcp_packet(1, 1111, 80, b"GET / HTTP/1.1\r\n\r\n");
+        let packet = DecodedPacket::from_raw(&raw);
+        let flow = flow_table.observe(&packet).unwrap();
+
+        inventory.observe_flow(&packet, &flow, Some(3), &mut events);
+
+        assert_eq!(1, events.len());
+        assert_eq!(Some(3), events[0].fields["content_shard"].as_u64());
+    }
+
     fn inventory(config: StreamInventoryConfig) -> StreamInventory {
         StreamInventory::new(config)
     }
@@ -824,7 +897,7 @@ mod tests {
     ) {
         let packet = DecodedPacket::from_raw(raw);
         let flow = flow_table.observe(&packet).unwrap();
-        inventory.observe_flow(&packet, &flow, events);
+        inventory.observe_flow(&packet, &flow, None, events);
     }
 
     fn tcp_packet(
