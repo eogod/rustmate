@@ -365,6 +365,7 @@ fn log_completed(message: &str, stats: &rustmate::pipeline::PipelineStats, out_p
         packet_malformed_packets = stats.packet_decode.packet_malformed_packets,
         packet_unsupported_link_packets = stats.packet_decode.packet_unsupported_link_packets,
         fallback_routed_packets = stats.fallback_routed_packets,
+        striped_flow_packets = stats.striped_flow_packets,
         fallback_unsupported_link_packets = stats.fallback_unsupported_link_packets,
         fallback_non_ip_packets = stats.fallback_non_ip_packets,
         fallback_malformed_packets = stats.fallback_malformed_packets,

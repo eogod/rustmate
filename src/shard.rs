@@ -5,6 +5,7 @@ use std::{
 };
 
 use ahash::{AHashMap, RandomState};
+use smallvec::SmallVec;
 
 use crate::{
     config::RunMode,
@@ -22,6 +23,10 @@ const ROUTE_HASHER: RandomState = RandomState::with_seeds(
 const DEFAULT_MAX_TRACKED_ROUTE_FLOWS: usize = 1_048_576;
 const DEFAULT_MAX_FLOW_OWNERS: usize = 1_048_576;
 const SECONDARY_ROUTE_HASH_SALT: u64 = 0x517c_c1b7_2722_0a95;
+const DEFAULT_ELEPHANT_MIN_PACKETS: u64 = 1024;
+const DEFAULT_ELEPHANT_MIN_BYTES: u64 = 1 << 20;
+const DEFAULT_ELEPHANT_MAX_STRIPES: usize = 0;
+const STRIPED_ROUTE_HASH_SALT: u64 = 0x8f7c_3b91_c1d5_aa6d;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardCoordinatorConfig {
@@ -29,6 +34,7 @@ pub struct ShardCoordinatorConfig {
     pub mode: RunMode,
     pub routing_policy: RoutingPolicy,
     pub max_flow_owners: usize,
+    pub elephant_flows: ElephantFlowConfig,
 }
 
 impl ShardCoordinatorConfig {
@@ -38,12 +44,55 @@ impl ShardCoordinatorConfig {
             mode,
             routing_policy: RoutingPolicy::default(),
             max_flow_owners: DEFAULT_MAX_FLOW_OWNERS,
+            elephant_flows: ElephantFlowConfig::default(),
         }
     }
 
     pub fn with_max_flow_owners(mut self, max_flow_owners: usize) -> Self {
         self.max_flow_owners = max_flow_owners.max(1);
         self
+    }
+
+    pub fn with_elephant_flows(mut self, elephant_flows: ElephantFlowConfig) -> Self {
+        self.elephant_flows = elephant_flows.normalized();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElephantFlowConfig {
+    pub enabled: bool,
+    pub min_packets: u64,
+    pub min_bytes: u64,
+    pub max_stripes: usize,
+}
+
+impl Default for ElephantFlowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_packets: DEFAULT_ELEPHANT_MIN_PACKETS,
+            min_bytes: DEFAULT_ELEPHANT_MIN_BYTES,
+            max_stripes: DEFAULT_ELEPHANT_MAX_STRIPES,
+        }
+    }
+}
+
+impl ElephantFlowConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    fn normalized(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            min_packets: self.min_packets.max(1),
+            min_bytes: self.min_bytes.max(1),
+            max_stripes: self.max_stripes,
+        }
     }
 }
 
@@ -52,6 +101,7 @@ pub struct ShardCoordinator {
     topology: ShardTopology,
     mode: RunMode,
     routing_policy: RoutingPolicy,
+    elephant_flows: ElephantFlowConfig,
     next_sequence: u64,
     flow_owners: FlowOwnerTable,
     metrics: ShardLoadMetrics,
@@ -64,6 +114,7 @@ impl ShardCoordinator {
             topology,
             mode: config.mode,
             routing_policy: config.routing_policy,
+            elephant_flows: config.elephant_flows.normalized(),
             next_sequence: 0,
             flow_owners: FlowOwnerTable::new(config.max_flow_owners),
             metrics: ShardLoadMetrics::new(topology.shard_count()),
@@ -106,6 +157,7 @@ impl ShardCoordinator {
         if matches!(self.mode, RunMode::Dump) {
             return ShardRoute {
                 shard: 0,
+                owner_shard: 0,
                 kind: ShardRouteKind::Dump,
                 flow_route: None,
                 fallback_reason: None,
@@ -114,6 +166,7 @@ impl ShardCoordinator {
         if self.topology.is_single_shard() {
             return ShardRoute {
                 shard: 0,
+                owner_shard: 0,
                 kind: ShardRouteKind::SingleShard,
                 flow_route: None,
                 fallback_reason: None,
@@ -121,12 +174,13 @@ impl ShardCoordinator {
         }
 
         match flow_route_from_raw_result(raw) {
-            Ok(flow_route) => self.route_flow(flow_route),
+            Ok(flow_route) => self.route_flow(sequence, flow_route, raw.data.len() as u64),
             Err(reason) => ShardRoute {
                 shard: self
                     .routing_policy
                     .fallback()
                     .route(sequence, &self.topology),
+                owner_shard: 0,
                 kind: ShardRouteKind::Fallback,
                 flow_route: None,
                 fallback_reason: Some(reason),
@@ -134,19 +188,48 @@ impl ShardCoordinator {
         }
     }
 
-    fn route_flow(&mut self, flow_route: FlowRoute) -> ShardRoute {
-        let shard = self.flow_owners.owner(flow_route.key).unwrap_or_else(|| {
+    fn route_flow(&mut self, sequence: u64, flow_route: FlowRoute, bytes: u64) -> ShardRoute {
+        if self.flow_owners.owner(flow_route.key).is_none() {
             let shard = self.choose_shard_for_new_flow(flow_route.key);
             self.flow_owners.remember(flow_route.key, shard);
-            shard
-        });
+        }
+
+        let mut owner = self
+            .flow_owners
+            .owner(flow_route.key)
+            .expect("flow owner was just installed");
+        if self.should_stripe_flow(flow_route, owner) {
+            self.flow_owners.mark_striped(flow_route.key);
+            owner.striped = true;
+        }
+
+        let shard = if owner.striped {
+            self.choose_shard_for_striped_flow(flow_route.key, sequence, owner.owner_shard)
+        } else {
+            owner.owner_shard
+        };
+        self.flow_owners.observe(flow_route.key, bytes);
 
         ShardRoute {
             shard,
-            kind: ShardRouteKind::FlowAffinity,
+            owner_shard: owner.owner_shard,
+            kind: if owner.striped {
+                ShardRouteKind::StripedFlow
+            } else {
+                ShardRouteKind::FlowAffinity
+            },
             flow_route: Some(flow_route),
             fallback_reason: None,
         }
+    }
+
+    fn should_stripe_flow(&self, flow_route: FlowRoute, owner: FlowOwnerSnapshot) -> bool {
+        self.elephant_flows.enabled
+            && !owner.striped
+            && self.topology.shard_count() > 1
+            && flow_route.key.protocol == TransportProtocol::Udp
+            && (owner.packets >= self.elephant_flows.min_packets
+                || owner.bytes >= self.elephant_flows.min_bytes)
     }
 
     fn choose_shard_for_new_flow(&self, key: FlowKey) -> usize {
@@ -168,6 +251,57 @@ impl ShardCoordinator {
         }
     }
 
+    fn choose_shard_for_striped_flow(
+        &self,
+        key: FlowKey,
+        sequence: u64,
+        owner_shard: usize,
+    ) -> usize {
+        let candidates = self.elephant_stripe_candidates(key, owner_shard);
+        if candidates.len() <= 1 {
+            return owner_shard;
+        }
+
+        let mut selected = owner_shard;
+        let mut selected_load = self.placement_load(owner_shard);
+        let mut selected_tie = route_hash((STRIPED_ROUTE_HASH_SALT, key, sequence, owner_shard));
+
+        for shard in candidates {
+            let load = self.placement_load(shard);
+            let tie = route_hash((STRIPED_ROUTE_HASH_SALT, key, sequence, shard));
+            if load < selected_load || (load == selected_load && tie < selected_tie) {
+                selected = shard;
+                selected_load = load;
+                selected_tie = tie;
+            }
+        }
+
+        selected
+    }
+
+    fn elephant_stripe_candidates(&self, key: FlowKey, owner_shard: usize) -> Vec<usize> {
+        let shard_count = self.topology.shard_count();
+        let max_stripes = self.elephant_flows.max_stripes;
+        if max_stripes == 0 || max_stripes >= shard_count {
+            return (0..shard_count).collect();
+        }
+
+        let target = max_stripes.max(1);
+        let mut candidates = Vec::with_capacity(target);
+        candidates.push(owner_shard);
+        let mut salt = 0u64;
+        while candidates.len() < target && salt < (shard_count as u64).saturating_mul(4) {
+            let shard =
+                self.topology
+                    .shard_for_hash(route_hash((STRIPED_ROUTE_HASH_SALT, key, salt)));
+            if !candidates.contains(&shard) {
+                candidates.push(shard);
+            }
+            salt = salt.saturating_add(1);
+        }
+        candidates
+    }
+
     fn placement_load(&self, shard: usize) -> ShardPlacementLoad {
         self.metrics
             .shard(shard)
@@ -178,10 +312,26 @@ impl ShardCoordinator {
 
 #[derive(Debug, Clone)]
 struct FlowOwnerTable {
-    owners: AHashMap<FlowKey, usize>,
+    owners: AHashMap<FlowKey, FlowOwnerState>,
     order: VecDeque<FlowKey>,
     max_owners: usize,
     evictions: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlowOwnerState {
+    owner_shard: usize,
+    packets: u64,
+    bytes: u64,
+    striped: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlowOwnerSnapshot {
+    owner_shard: usize,
+    packets: u64,
+    bytes: u64,
+    striped: bool,
 }
 
 impl FlowOwnerTable {
@@ -202,13 +352,18 @@ impl FlowOwnerTable {
         self.evictions
     }
 
-    fn owner(&self, key: FlowKey) -> Option<usize> {
-        self.owners.get(&key).copied()
+    fn owner(&self, key: FlowKey) -> Option<FlowOwnerSnapshot> {
+        self.owners.get(&key).map(|state| FlowOwnerSnapshot {
+            owner_shard: state.owner_shard,
+            packets: state.packets,
+            bytes: state.bytes,
+            striped: state.striped,
+        })
     }
 
     fn remember(&mut self, key: FlowKey, shard: usize) {
         if let Some(owner) = self.owners.get_mut(&key) {
-            *owner = shard;
+            owner.owner_shard = shard;
             return;
         }
 
@@ -225,8 +380,30 @@ impl FlowOwnerTable {
             return;
         }
 
-        self.owners.insert(key, shard);
+        self.owners.insert(
+            key,
+            FlowOwnerState {
+                owner_shard: shard,
+                packets: 0,
+                bytes: 0,
+                striped: false,
+            },
+        );
         self.order.push_back(key);
+    }
+
+    fn observe(&mut self, key: FlowKey, bytes: u64) {
+        let Some(owner) = self.owners.get_mut(&key) else {
+            return;
+        };
+        owner.packets = owner.packets.saturating_add(1);
+        owner.bytes = owner.bytes.saturating_add(bytes);
+    }
+
+    fn mark_striped(&mut self, key: FlowKey) {
+        if let Some(owner) = self.owners.get_mut(&key) {
+            owner.striped = true;
+        }
     }
 }
 
@@ -331,6 +508,7 @@ impl ShardTopology {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardRoute {
     pub shard: usize,
+    pub owner_shard: usize,
     pub kind: ShardRouteKind,
     pub flow_route: Option<FlowRoute>,
     pub fallback_reason: Option<FallbackRouteReason>,
@@ -345,6 +523,7 @@ impl ShardRoute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShardRouteKind {
     FlowAffinity,
+    StripedFlow,
     Fallback,
     SingleShard,
     Dump,
@@ -368,6 +547,7 @@ pub struct ShardLoadMetrics {
     total_packets: u64,
     total_bytes: u64,
     flow_routed_packets: u64,
+    striped_flow_packets: u64,
     fallback_packets: u64,
     fallback_unsupported_link_packets: u64,
     fallback_non_ip_packets: u64,
@@ -389,6 +569,7 @@ impl ShardLoadMetrics {
             total_packets: 0,
             total_bytes: 0,
             flow_routed_packets: 0,
+            striped_flow_packets: 0,
             fallback_packets: 0,
             fallback_unsupported_link_packets: 0,
             fallback_non_ip_packets: 0,
@@ -428,6 +609,10 @@ impl ShardLoadMetrics {
             ShardRouteKind::FlowAffinity => {
                 self.flow_routed_packets = self.flow_routed_packets.saturating_add(1);
             }
+            ShardRouteKind::StripedFlow => {
+                self.flow_routed_packets = self.flow_routed_packets.saturating_add(1);
+                self.striped_flow_packets = self.striped_flow_packets.saturating_add(1);
+            }
             ShardRouteKind::Fallback => {
                 self.fallback_packets = self.fallback_packets.saturating_add(1);
                 self.observe_fallback_reason(route.fallback_reason);
@@ -443,14 +628,21 @@ impl ShardLoadMetrics {
         if let Some(load) = self.shards.get_mut(route.shard) {
             load.observe(route.kind, route.fallback_reason, bytes);
         }
-        if route.kind == ShardRouteKind::FlowAffinity
-            && let Some(flow_route) = route.flow_route
+        if matches!(
+            route.kind,
+            ShardRouteKind::FlowAffinity | ShardRouteKind::StripedFlow
+        ) && let Some(flow_route) = route.flow_route
         {
-            self.observe_flow_load(flow_route.key, route.shard, bytes);
+            self.observe_flow_load(
+                flow_route.key,
+                route.shard,
+                bytes,
+                route.kind == ShardRouteKind::StripedFlow,
+            );
         }
     }
 
-    fn observe_flow_load(&mut self, key: FlowKey, shard: usize, bytes: u64) {
+    fn observe_flow_load(&mut self, key: FlowKey, shard: usize, bytes: u64, striped: bool) {
         if !self.flow_loads.contains_key(&key) {
             while self.flow_loads.len() >= self.max_tracked_flows {
                 if self.flow_order.is_empty() {
@@ -464,12 +656,12 @@ impl ShardLoadMetrics {
             if self.flow_loads.len() >= self.max_tracked_flows {
                 return;
             }
-            self.flow_loads.insert(key, FlowRouteLoad::new(shard));
+            self.flow_loads.insert(key, FlowRouteLoad::new());
             self.flow_order.push_back(key);
         }
 
         if let Some(load) = self.flow_loads.get_mut(&key) {
-            load.observe(shard, bytes);
+            load.observe(shard, bytes, striped);
         }
     }
 
@@ -505,6 +697,7 @@ impl ShardLoadMetrics {
             total_packets: self.total_packets,
             total_bytes: self.total_bytes,
             flow_routed_packets: self.flow_routed_packets,
+            striped_flow_packets: self.striped_flow_packets,
             fallback_packets: self.fallback_packets,
             fallback_unsupported_link_packets: self.fallback_unsupported_link_packets,
             fallback_non_ip_packets: self.fallback_non_ip_packets,
@@ -554,6 +747,7 @@ impl ShardLoadMetrics {
                 routed_packets: load.packets,
                 routed_bytes: load.bytes,
                 flow_routed_packets: load.flow_routed_packets,
+                striped_flow_packets: load.striped_flow_packets,
                 fallback_packets: load.fallback_packets,
                 fallback_unsupported_link_packets: load.fallback_unsupported_link_packets,
                 fallback_non_ip_packets: load.fallback_non_ip_packets,
@@ -584,45 +778,81 @@ impl ShardLoadMetrics {
         shard_packets: u64,
         shard_bytes: u64,
     ) -> Option<WorkerHotFlowSnapshot> {
-        let (key, load) = self
+        let (key, load, shard_load) = self
             .flow_loads
             .iter()
-            .filter(|(_, load)| load.shard == shard)
-            .max_by_key(|(_, load)| load.bytes)?;
+            .filter_map(|(key, load)| {
+                load.shard_load(shard)
+                    .map(|shard_load| (key, load, shard_load))
+            })
+            .max_by_key(|(_, _, shard_load)| shard_load.bytes)?;
         Some(WorkerHotFlowSnapshot {
             stream_id: key.stable_id(),
             stream_id_hex: format!("{:016x}", key.stable_id()),
             protocol: transport_name(key.protocol).to_owned(),
             endpoint_a: endpoint_label(key.a),
             endpoint_b: endpoint_label(key.b),
-            packets: load.packets,
-            bytes: load.bytes,
-            packet_share_milli: ratio_milli(load.packets, shard_packets),
-            byte_share_milli: ratio_milli(load.bytes, shard_bytes),
+            packets: shard_load.packets,
+            bytes: shard_load.bytes,
+            total_packets: load.total_packets,
+            total_bytes: load.total_bytes,
+            striped: load.striped,
+            stripe_shards: load.shard_count(),
+            packet_share_milli: ratio_milli(shard_load.packets, shard_packets),
+            byte_share_milli: ratio_milli(shard_load.bytes, shard_bytes),
         })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FlowRouteLoad {
+struct FlowShardRouteLoad {
     shard: usize,
     packets: u64,
     bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FlowRouteLoad {
+    total_packets: u64,
+    total_bytes: u64,
+    striped: bool,
+    shards: SmallVec<[FlowShardRouteLoad; 4]>,
+}
+
 impl FlowRouteLoad {
-    fn new(shard: usize) -> Self {
+    fn new() -> Self {
         Self {
-            shard,
-            packets: 0,
-            bytes: 0,
+            total_packets: 0,
+            total_bytes: 0,
+            striped: false,
+            shards: SmallVec::new(),
         }
     }
 
-    fn observe(&mut self, shard: usize, bytes: u64) {
-        self.shard = shard;
-        self.packets = self.packets.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(bytes);
+    fn observe(&mut self, shard: usize, bytes: u64, striped: bool) {
+        self.total_packets = self.total_packets.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.striped |= striped;
+
+        if let Some(load) = self.shards.iter_mut().find(|load| load.shard == shard) {
+            load.packets = load.packets.saturating_add(1);
+            load.bytes = load.bytes.saturating_add(bytes);
+            return;
+        }
+
+        self.shards.push(FlowShardRouteLoad {
+            shard,
+            packets: 1,
+            bytes,
+        });
+    }
+
+    fn shard_load(&self, shard: usize) -> Option<&FlowShardRouteLoad> {
+        self.shards.iter().find(|load| load.shard == shard)
+    }
+
+    fn shard_count(&self) -> usize {
+        self.shards.len()
     }
 }
 
@@ -632,6 +862,7 @@ pub struct ShardLoad {
     pub packets: u64,
     pub bytes: u64,
     pub flow_routed_packets: u64,
+    pub striped_flow_packets: u64,
     pub fallback_packets: u64,
     pub fallback_unsupported_link_packets: u64,
     pub fallback_non_ip_packets: u64,
@@ -649,6 +880,7 @@ impl ShardLoad {
             packets: 0,
             bytes: 0,
             flow_routed_packets: 0,
+            striped_flow_packets: 0,
             fallback_packets: 0,
             fallback_unsupported_link_packets: 0,
             fallback_non_ip_packets: 0,
@@ -671,6 +903,10 @@ impl ShardLoad {
         match kind {
             ShardRouteKind::FlowAffinity => {
                 self.flow_routed_packets = self.flow_routed_packets.saturating_add(1);
+            }
+            ShardRouteKind::StripedFlow => {
+                self.flow_routed_packets = self.flow_routed_packets.saturating_add(1);
+                self.striped_flow_packets = self.striped_flow_packets.saturating_add(1);
             }
             ShardRouteKind::Fallback => {
                 self.fallback_packets = self.fallback_packets.saturating_add(1);
@@ -716,6 +952,7 @@ pub struct ShardLoadSnapshot {
     pub total_packets: u64,
     pub total_bytes: u64,
     pub flow_routed_packets: u64,
+    pub striped_flow_packets: u64,
     pub fallback_packets: u64,
     pub fallback_unsupported_link_packets: u64,
     pub fallback_non_ip_packets: u64,
@@ -1090,6 +1327,99 @@ mod tests {
     }
 
     #[test]
+    fn udp_elephant_flow_stripes_after_threshold() {
+        let mut coordinator = ShardCoordinator::new(
+            ShardCoordinatorConfig::new(4, RunMode::Analyze).with_elephant_flows(
+                ElephantFlowConfig {
+                    enabled: true,
+                    min_packets: 2,
+                    min_bytes: u64::MAX,
+                    max_stripes: 0,
+                },
+            ),
+        );
+        let packets = (0..12)
+            .map(|index| {
+                udp_packet(
+                    [10, 0, 0, 1],
+                    44444,
+                    [10, 0, 0, 2],
+                    443,
+                    &[index as u8; 1200],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let routes = packets
+            .iter()
+            .map(|packet| coordinator.route_packet(packet))
+            .collect::<Vec<_>>();
+        let owner = routes[0].owner_shard;
+        let striped_shards = routes
+            .iter()
+            .filter(|route| route.kind == ShardRouteKind::StripedFlow)
+            .map(|route| route.shard)
+            .collect::<std::collections::BTreeSet<_>>();
+        let snapshot = coordinator.metrics().snapshot();
+
+        assert!(
+            routes[..2]
+                .iter()
+                .all(|route| route.kind == ShardRouteKind::FlowAffinity)
+        );
+        assert!(
+            routes[2..]
+                .iter()
+                .all(|route| route.kind == ShardRouteKind::StripedFlow)
+        );
+        assert!(routes.iter().all(|route| route.owner_shard == owner));
+        assert!(striped_shards.len() > 1);
+        assert_eq!(10, snapshot.striped_flow_packets);
+    }
+
+    #[test]
+    fn tcp_elephant_flow_stays_on_owner_shard() {
+        let mut coordinator = ShardCoordinator::new(
+            ShardCoordinatorConfig::new(4, RunMode::Analyze).with_elephant_flows(
+                ElephantFlowConfig {
+                    enabled: true,
+                    min_packets: 1,
+                    min_bytes: 1,
+                    max_stripes: 0,
+                },
+            ),
+        );
+        let packets = (0..8)
+            .map(|index| {
+                tcp_packet(
+                    [10, 0, 0, 1],
+                    44444,
+                    [10, 0, 0, 2],
+                    443,
+                    1 + index * 1200,
+                    &[index as u8; 1200],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let routes = packets
+            .iter()
+            .map(|packet| coordinator.route_packet(packet))
+            .collect::<Vec<_>>();
+        let owner = routes[0].owner_shard;
+        let snapshot = coordinator.metrics().snapshot();
+
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.kind == ShardRouteKind::FlowAffinity)
+        );
+        assert!(routes.iter().all(|route| route.shard == owner));
+        assert!(routes.iter().all(|route| route.owner_shard == owner));
+        assert_eq!(0, snapshot.striped_flow_packets);
+    }
+
+    #[test]
     fn coordinator_tracks_routing_load_without_queue_state() {
         let mut coordinator =
             ShardCoordinator::new(ShardCoordinatorConfig::new(4, RunMode::Analyze));
@@ -1142,6 +1472,7 @@ mod tests {
         metrics.observe_route(
             ShardRoute {
                 shard: 1,
+                owner_shard: 1,
                 kind: ShardRouteKind::Fallback,
                 flow_route: None,
                 fallback_reason: Some(FallbackRouteReason::Malformed),
@@ -1250,9 +1581,34 @@ mod tests {
         }
     }
 
+    fn udp_packet(
+        source: [u8; 4],
+        source_port: u16,
+        destination: [u8; 4],
+        destination_port: u16,
+        payload: &[u8],
+    ) -> RawPacket {
+        let builder = PacketBuilder::ethernet2([1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2])
+            .ipv4(
+                Ipv4Addr::from(source).octets(),
+                Ipv4Addr::from(destination).octets(),
+                20,
+            )
+            .udp(source_port, destination_port);
+        let mut data = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut data, payload).unwrap();
+        RawPacket {
+            timestamp: PacketTimestamp { sec: 1, usec: 0 },
+            link_layer: LinkLayer::Ethernet,
+            linktype: Linktype::ETHERNET.0,
+            data,
+        }
+    }
+
     fn flow_route_on_shard(flow_route: FlowRoute, shard: usize) -> ShardRoute {
         ShardRoute {
             shard,
+            owner_shard: shard,
             kind: ShardRouteKind::FlowAffinity,
             flow_route: Some(flow_route),
             fallback_reason: None,

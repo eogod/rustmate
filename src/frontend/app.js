@@ -155,6 +155,11 @@ function updateStats(healthOrDelta) {
     stats.worker_fallback_routed_packets,
     queue.fallback_routed_packets,
   );
+  const striped = firstPositive(
+    stats.striped_flow_packets,
+    stats.worker_striped_flow_packets,
+    queue.striped_flow_packets,
+  );
   const malformedFallback = firstPositive(
     stats.fallback_malformed_packets,
     stats.worker_fallback_malformed_packets,
@@ -168,7 +173,9 @@ function updateStats(healthOrDelta) {
   el.skew.textContent = `${formatMilliRatio(packetSkew)} / ${formatMilliRatio(byteSkew)}`;
   el.fallback.textContent = malformedFallback > 0
     ? `${formatNumber(fallback)} / bad ${formatNumber(malformedFallback)}`
-    : formatNumber(fallback);
+    : striped > 0
+      ? `${formatNumber(fallback)} / striped ${formatNumber(striped)}`
+      : formatNumber(fallback);
 }
 
 function updateDecodeStats(stats) {
@@ -563,7 +570,8 @@ function shardRow(worker, busiest) {
 
 function hotFlowSummary(flow) {
   if (!flow) return "-";
-  return `${flow.protocol} ${shortEndpoint(flow.endpoint_a)} -> ${shortEndpoint(flow.endpoint_b)} / ${formatBytes(flow.bytes)} ${formatMilliPercent(flow.byte_share_milli)}`;
+  const striped = flow.striped ? ` / striped ${formatNumber(flow.stripe_shards || 0)}` : "";
+  return `${flow.protocol} ${shortEndpoint(flow.endpoint_a)} -> ${shortEndpoint(flow.endpoint_b)} / ${formatBytes(flow.bytes)}${striped} ${formatMilliPercent(flow.byte_share_milli)}`;
 }
 
 function hotFlowTitle(flow) {
@@ -572,6 +580,7 @@ function hotFlowTitle(flow) {
     flow.stream_id_hex || "",
     `${flow.protocol} ${flow.endpoint_a} -> ${flow.endpoint_b}`,
     `${formatNumber(flow.packets)} packets, ${formatBytes(flow.bytes)}`,
+    flow.striped ? `striped across ${formatNumber(flow.stripe_shards || 0)} shards, total ${formatNumber(flow.total_packets || 0)} packets / ${formatBytes(flow.total_bytes || 0)}` : "",
     `packet share ${formatMilliPercent(flow.packet_share_milli)}, byte share ${formatMilliPercent(flow.byte_share_milli)}`,
   ].filter(Boolean).join(" / ");
 }

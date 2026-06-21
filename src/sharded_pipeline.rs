@@ -20,7 +20,9 @@ use crate::{
     packet::{DecodedPacket, PacketDecodeCounters, RawPacket},
     pattern::{PatternEngine, PatternEngineConfig, PatternEngineStats},
     pipeline::{PipelineConfig, PipelineStats},
-    shard::{ShardCoordinator, ShardCoordinatorConfig, ShardLoadMetrics, ShardQueueLoad},
+    shard::{
+        ShardCoordinator, ShardCoordinatorConfig, ShardLoadMetrics, ShardQueueLoad, ShardRouteKind,
+    },
     stream_content::{StreamContent, StreamContentStats},
     stream_inventory::{StreamInventory, StreamInventoryStats},
     stream_message::StreamMessageStore,
@@ -67,6 +69,7 @@ enum WorkerCommand {
 struct RoutedPacket {
     raw: RawPacket,
     owner_shard: usize,
+    route_kind: ShardRouteKind,
     flow_route: Option<FlowRoute>,
 }
 
@@ -314,7 +317,8 @@ impl ShardedPipeline {
 
                         let packet = RoutedPacket {
                             raw,
-                            owner_shard: route.shard,
+                            owner_shard: route.owner_shard,
+                            route_kind: route.kind,
                             flow_route: route.flow_route,
                         };
 
@@ -830,19 +834,22 @@ impl WorkerRuntime {
                     .map(|route| self.flow_table.observe_with_route(&packet, route))
                     .unwrap_or_else(|| self.flow_table.observe(&packet));
                 if let Some(flow) = flow.as_ref() {
-                    self.stream_inventory.observe_flow(
-                        &packet,
-                        flow,
-                        Some(routed.owner_shard),
-                        &mut self.events,
-                    );
-                    if let Some(update) = self.stream_content.observe_flow(&packet, flow) {
-                        self.pattern_engine.scan_update(
+                    let owns_flow_state = routed.owner_shard == self.stats.id;
+                    if owns_flow_state {
+                        self.stream_inventory.observe_flow(
                             &packet,
-                            &self.stream_content,
-                            &update,
+                            flow,
+                            Some(routed.owner_shard),
                             &mut self.events,
                         );
+                        if let Some(update) = self.stream_content.observe_flow(&packet, flow) {
+                            self.pattern_engine.scan_update(
+                                &packet,
+                                &self.stream_content,
+                                &update,
+                                &mut self.events,
+                            );
+                        }
                     }
                     if flow.tcp.is_none()
                         && let Some(transport) = packet.transport_payload()
@@ -859,11 +866,19 @@ impl WorkerRuntime {
                     .as_ref()
                     .and_then(|flow| flow.tcp.as_ref().map(|tcp| (flow, tcp)))
                 {
-                    for chunk in &tcp.stream_chunks {
-                        self.stream_parser
-                            .observe_stream(&packet, flow, chunk, &mut self.events);
-                        for analyzer in &mut self.analyzers {
-                            analyzer.analyze_stream(&packet, flow, chunk, &mut self.events);
+                    let owns_flow_state = routed.owner_shard == self.stats.id
+                        || !matches!(routed.route_kind, ShardRouteKind::StripedFlow);
+                    if owns_flow_state {
+                        for chunk in &tcp.stream_chunks {
+                            self.stream_parser.observe_stream(
+                                &packet,
+                                flow,
+                                chunk,
+                                &mut self.events,
+                            );
+                            for analyzer in &mut self.analyzers {
+                                analyzer.analyze_stream(&packet, flow, chunk, &mut self.events);
+                            }
                         }
                     }
                 }
@@ -1049,6 +1064,7 @@ fn apply_shard_metrics(stats: &mut PipelineStats, metrics: &ShardLoadMetrics) {
     stats.busiest_shard_bytes = snapshot.busiest_shard_bytes;
     stats.shard_packet_skew_ratio_milli = snapshot.packet_skew_ratio_milli;
     stats.shard_byte_skew_ratio_milli = snapshot.byte_skew_ratio_milli;
+    stats.striped_flow_packets = snapshot.striped_flow_packets;
 }
 
 fn apply_queue_metrics(stats: &mut PipelineStats, queue: &ShardedQueueSnapshot) {
@@ -1061,6 +1077,7 @@ fn apply_queue_metrics(stats: &mut PipelineStats, queue: &ShardedQueueSnapshot) 
     stats.busiest_worker_packets = summary.busiest_worker_packets;
     stats.busiest_worker_bytes = summary.busiest_worker_bytes;
     stats.worker_fallback_routed_packets = summary.fallback_routed_packets;
+    stats.worker_striped_flow_packets = summary.striped_flow_packets;
     stats.worker_fallback_unsupported_link_packets = summary.fallback_unsupported_link_packets;
     stats.worker_fallback_non_ip_packets = summary.fallback_non_ip_packets;
     stats.worker_fallback_malformed_packets = summary.fallback_malformed_packets;
@@ -1654,6 +1671,49 @@ mod tests {
         assert_eq!(128, events.lock().unwrap().len());
     }
 
+    #[tokio::test]
+    async fn sharded_pipeline_stripes_udp_elephant_flow() {
+        let mut pipeline = ShardedPipeline::new(ShardedPipelineConfig {
+            pipeline: PipelineConfig {
+                mode: RunMode::Analyze,
+                batch_size: 256,
+                health_interval_ms: 0,
+                max_flows: 1024,
+                flow_idle_timeout_ms: 120_000,
+                max_tcp_buffered_bytes_per_flow: 64 * 1024,
+                max_tcp_out_of_order_segments_per_direction: 16,
+                stream_inventory: test_stream_inventory_config(),
+                stream_content: test_stream_content_config(),
+                stream_parser: StreamParserConfig::disabled(),
+                stream_view: test_stream_view_config(),
+                stream_slice: test_stream_slice_config(),
+            },
+            worker_count: 4,
+            worker_queue_depth: 1024,
+            event_queue_depth: 1024,
+        });
+        let payload = vec![0xa5; 1200];
+        let packets = (0..1536)
+            .map(|index| udp_packet([10, 0, 0, 1], 44444, [10, 0, 0, 2], 443, &payload, index))
+            .collect::<Vec<_>>();
+
+        let stats = pipeline
+            .run_with_source(VecPacketSource::new(packets))
+            .await
+            .unwrap();
+
+        assert_eq!(1536, stats.packets);
+        assert!(stats.striped_flow_packets > 0);
+        assert_eq!(
+            stats.striped_flow_packets,
+            stats.worker_striped_flow_packets
+        );
+        assert!(stats.busiest_worker_packets < stats.packets);
+        assert!(stats.worker_packet_skew_ratio_milli < 4000);
+        assert_eq!(1, stats.inventory_created_streams);
+        assert_eq!(1, stats.view_tracked_streams);
+    }
+
     struct CollectSink {
         events: Arc<Mutex<Vec<serde_json::Value>>>,
     }
@@ -1845,6 +1905,34 @@ mod tests {
                 20,
             )
             .tcp(source_port, destination_port, sequence, 1024);
+        let mut data = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut data, payload).unwrap();
+        RawPacket {
+            timestamp: PacketTimestamp {
+                sec: timestamp,
+                usec: 0,
+            },
+            link_layer: LinkLayer::Ethernet,
+            linktype: Linktype::ETHERNET.0,
+            data,
+        }
+    }
+
+    fn udp_packet(
+        source: [u8; 4],
+        source_port: u16,
+        destination: [u8; 4],
+        destination_port: u16,
+        payload: &[u8],
+        timestamp: u64,
+    ) -> RawPacket {
+        let builder = PacketBuilder::ethernet2([1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2])
+            .ipv4(
+                Ipv4Addr::from(source).octets(),
+                Ipv4Addr::from(destination).octets(),
+                20,
+            )
+            .udp(source_port, destination_port);
         let mut data = Vec::with_capacity(builder.size(payload.len()));
         builder.write(&mut data, payload).unwrap();
         RawPacket {

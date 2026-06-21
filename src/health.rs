@@ -21,6 +21,7 @@ pub struct PipelineQueueSnapshot {
     pub busiest_worker_packets: u64,
     pub busiest_worker_bytes: u64,
     pub fallback_routed_packets: u64,
+    pub striped_flow_packets: u64,
     pub fallback_unsupported_link_packets: u64,
     pub fallback_non_ip_packets: u64,
     pub fallback_malformed_packets: u64,
@@ -39,6 +40,14 @@ pub struct WorkerHotFlowSnapshot {
     pub endpoint_b: String,
     pub packets: u64,
     pub bytes: u64,
+    #[serde(default)]
+    pub total_packets: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub striped: bool,
+    #[serde(default)]
+    pub stripe_shards: usize,
     pub packet_share_milli: u64,
     pub byte_share_milli: u64,
 }
@@ -51,6 +60,8 @@ pub struct WorkerQueueSnapshot {
     pub routed_packets: u64,
     pub routed_bytes: u64,
     pub flow_routed_packets: u64,
+    #[serde(default)]
+    pub striped_flow_packets: u64,
     pub fallback_packets: u64,
     pub fallback_unsupported_link_packets: u64,
     pub fallback_non_ip_packets: u64,
@@ -74,6 +85,7 @@ pub struct ShardPressureSnapshot {
     pub routed_packets: u64,
     pub routed_bytes: u64,
     pub fallback_packets: u64,
+    pub striped_flow_packets: u64,
     pub fallback_ratio_milli: u64,
     pub max_worker_queue_fill_milli: u64,
     pub output_queue_fill_milli: u64,
@@ -102,6 +114,7 @@ pub enum ShardPressureWarning {
     SingleShard,
     PacketSkew,
     ByteSkew,
+    ElephantFlow,
     WorkerQueuePressure,
     OutputQueuePressure,
     FallbackRoutes,
@@ -192,6 +205,7 @@ impl PipelineHealthReporter {
             packet_malformed_packets = stats.packet_decode.packet_malformed_packets,
             packet_unsupported_link_packets = stats.packet_decode.packet_unsupported_link_packets,
             fallback_routed_packets = stats.fallback_routed_packets,
+            striped_flow_packets = stats.striped_flow_packets,
             fallback_unsupported_link_packets = stats.fallback_unsupported_link_packets,
             fallback_non_ip_packets = stats.fallback_non_ip_packets,
             fallback_malformed_packets = stats.fallback_malformed_packets,
@@ -261,6 +275,7 @@ impl PipelineHealthReporter {
             busiest_worker_packets = queue.busiest_worker_packets,
             busiest_worker_bytes = queue.busiest_worker_bytes,
             worker_fallback_routed_packets = queue.fallback_routed_packets,
+            worker_striped_flow_packets = queue.striped_flow_packets,
             worker_fallback_unsupported_link_packets = queue.fallback_unsupported_link_packets,
             worker_fallback_non_ip_packets = queue.fallback_non_ip_packets,
             worker_fallback_malformed_packets = queue.fallback_malformed_packets,
@@ -343,6 +358,11 @@ impl ShardedQueueSnapshot {
             .iter()
             .map(|worker| worker.fallback_packets)
             .sum::<u64>();
+        let striped_flow_packets = self
+            .workers
+            .iter()
+            .map(|worker| worker.striped_flow_packets)
+            .sum::<u64>();
         let fallback_unsupported_link_packets = self
             .workers
             .iter()
@@ -390,6 +410,7 @@ impl ShardedQueueSnapshot {
             busiest_worker_packets: busiest_packets,
             busiest_worker_bytes,
             fallback_routed_packets: fallback_packets,
+            striped_flow_packets,
             fallback_unsupported_link_packets,
             fallback_non_ip_packets,
             fallback_malformed_packets,
@@ -449,6 +470,9 @@ impl ShardedQueueSnapshot {
         if summary.worker_byte_skew_ratio_milli >= WATCH_BYTE_SKEW_MILLI {
             warnings.push(ShardPressureWarning::ByteSkew);
         }
+        if summary.striped_flow_packets != 0 {
+            warnings.push(ShardPressureWarning::ElephantFlow);
+        }
         if max_worker_queue_fill_milli >= WATCH_QUEUE_FILL_MILLI {
             warnings.push(ShardPressureWarning::WorkerQueuePressure);
         }
@@ -486,6 +510,7 @@ impl ShardedQueueSnapshot {
             routed_packets,
             routed_bytes,
             fallback_packets: summary.fallback_routed_packets,
+            striped_flow_packets: summary.striped_flow_packets,
             fallback_ratio_milli,
             max_worker_queue_fill_milli,
             output_queue_fill_milli,

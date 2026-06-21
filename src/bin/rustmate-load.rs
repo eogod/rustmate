@@ -140,6 +140,7 @@ enum FixtureArg {
     OutOfOrderHttp,
     HttpKeepAlive,
     MixedServices,
+    UdpElephant,
 }
 
 impl From<FixtureArg> for PerfFixtureKind {
@@ -149,6 +150,7 @@ impl From<FixtureArg> for PerfFixtureKind {
             FixtureArg::OutOfOrderHttp => Self::OutOfOrderHttp,
             FixtureArg::HttpKeepAlive => Self::HttpKeepAlive,
             FixtureArg::MixedServices => Self::MixedServices,
+            FixtureArg::UdpElephant => Self::UdpElephant,
         }
     }
 }
@@ -352,11 +354,11 @@ fn print_worker_plan(plan: &PerfWorkerPlan) {
         eprintln!("  decision: {note}");
     }
     eprintln!(
-        "candidate workers  score  state  pkt/w    bytes/w    flows/w   pkt skew  byte skew  flow skew  fallback"
+        "candidate workers  score  state  pkt/w    bytes/w    flows/w   pkt skew  byte skew  flow skew  striped  fallback"
     );
     for candidate in &plan.candidates {
         eprintln!(
-            "candidate {:>7} {:>6.2} {:>6} {:>7} {:>10} {:>8} {:>9} {:>10} {:>10} {:>9}",
+            "candidate {:>7} {:>6.2} {:>6} {:>7} {:>10} {:>8} {:>9} {:>10} {:>10} {:>8} {:>9}",
             candidate.workers,
             candidate.score,
             if candidate.eligible { "ok" } else { "skip" },
@@ -366,6 +368,7 @@ fn print_worker_plan(plan: &PerfWorkerPlan) {
             format!("{:.2}x", candidate.diagnostics.packet_skew.max_over_average),
             format!("{:.2}x", candidate.diagnostics.byte_skew.max_over_average),
             format!("{:.2}x", candidate.diagnostics.flow_skew.max_over_average),
+            format_number(candidate.diagnostics.striped_flow_packets),
             format!("{:.2}%", candidate.fallback_ratio * 100.0),
         );
         if !candidate.rejections.is_empty() {
@@ -410,5 +413,15 @@ fn format_rate(value: f64) -> String {
         format!("{:.2}k", value / 1_000.0)
     } else {
         format!("{value:.2}")
+    }
+}
+
+fn format_number(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.2}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.2}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
     }
 }

@@ -43,6 +43,7 @@ pub enum PerfFixtureKind {
     OutOfOrderHttp,
     HttpKeepAlive,
     MixedServices,
+    UdpElephant,
 }
 
 impl PerfFixtureKind {
@@ -52,6 +53,7 @@ impl PerfFixtureKind {
             Self::OutOfOrderHttp => "out_of_order_http",
             Self::HttpKeepAlive => "http_keep_alive",
             Self::MixedServices => "mixed_services",
+            Self::UdpElephant => "udp_elephant",
         }
     }
 }
@@ -169,6 +171,7 @@ impl PerfInput {
             shard_count,
             routed_packets,
             fallback_packets,
+            striped_flow_packets: route_snapshot.striped_flow_packets,
             fallback_unsupported_link_packets: route_snapshot.fallback_unsupported_link_packets,
             fallback_non_ip_packets: route_snapshot.fallback_non_ip_packets,
             fallback_malformed_packets: route_snapshot.fallback_malformed_packets,
@@ -258,6 +261,7 @@ fn evaluate_worker_candidate(
     let flows_per_worker = average_per_worker_usize(diagnostics.unique_flows, workers);
     let fallback_ratio = ratio(diagnostics.fallback_packets, packet_count as u64);
     let is_power_of_two = workers.is_power_of_two();
+    let elephant_striping_active = diagnostics.striped_flow_packets != 0;
     let mut rejections = Vec::new();
     let mut warnings = Vec::new();
 
@@ -270,9 +274,14 @@ fn evaluate_worker_candidate(
                 config.min_packets_per_worker
             ));
         }
-        if flows_per_worker < config.min_flows_per_worker {
+        if flows_per_worker < config.min_flows_per_worker && !elephant_striping_active {
             rejections.push(format!(
                 "too few routed flows per worker: {flows_per_worker} < {}",
+                config.min_flows_per_worker
+            ));
+        } else if flows_per_worker < config.min_flows_per_worker {
+            warnings.push(format!(
+                "low routed-flow budget accepted because elephant striping is active: {flows_per_worker} < {}",
                 config.min_flows_per_worker
             ));
         }
@@ -626,6 +635,8 @@ pub struct PerfRunDiagnostics {
     pub shard_count: usize,
     pub routed_packets: u64,
     pub fallback_packets: u64,
+    #[serde(default)]
+    pub striped_flow_packets: u64,
     pub fallback_unsupported_link_packets: u64,
     pub fallback_non_ip_packets: u64,
     pub fallback_malformed_packets: u64,
@@ -644,6 +655,7 @@ impl Default for PerfRunDiagnostics {
             shard_count: 1,
             routed_packets: 0,
             fallback_packets: 0,
+            striped_flow_packets: 0,
             fallback_unsupported_link_packets: 0,
             fallback_non_ip_packets: 0,
             fallback_malformed_packets: 0,
@@ -1212,6 +1224,7 @@ pub fn generate_fixture(
         PerfFixtureKind::OutOfOrderHttp => out_of_order_http_fixture(flows),
         PerfFixtureKind::HttpKeepAlive => http_keep_alive_fixture(flows, messages_per_flow),
         PerfFixtureKind::MixedServices => mixed_services_fixture(flows, messages_per_flow),
+        PerfFixtureKind::UdpElephant => udp_elephant_fixture(flows, messages_per_flow),
     }
 }
 
@@ -1341,6 +1354,24 @@ fn mixed_services_fixture(flows: usize, messages_per_flow: usize) -> Vec<RawPack
     packets
 }
 
+fn udp_elephant_fixture(flows: usize, messages_per_flow: usize) -> Vec<RawPacket> {
+    let payload = vec![0xa5; 1200];
+    let mut packets = Vec::with_capacity(flows.saturating_mul(messages_per_flow));
+    for flow in 0..flows {
+        for message in 0..messages_per_flow {
+            packets.push(udp_packet(
+                source_ip(flow),
+                source_port(flow),
+                [198, 51, 100, 44],
+                443,
+                &payload,
+                (flow * messages_per_flow + message) as u64,
+            ));
+        }
+    }
+    packets
+}
+
 fn source_ip(flow: usize) -> [u8; 4] {
     [
         10,
@@ -1435,6 +1466,23 @@ mod tests {
 
         assert_eq!(18, input.packet_count());
         assert!(input.byte_count() > 0);
+    }
+
+    #[test]
+    fn udp_elephant_fixture_exercises_striped_routing() {
+        let input = PerfInput::synthetic(PerfFixtureKind::UdpElephant, 1, 2048);
+        let diagnostics = input.diagnostics(4);
+        let striped_shards = diagnostics
+            .shards
+            .iter()
+            .filter(|shard| shard.packets != 0)
+            .count();
+
+        assert_eq!(2048, input.packet_count());
+        assert_eq!(1, diagnostics.unique_flows);
+        assert!(diagnostics.striped_flow_packets > 0);
+        assert!(striped_shards > 1);
+        assert!(diagnostics.packet_skew.max_over_average < 4.0);
     }
 
     #[test]
@@ -1542,6 +1590,47 @@ mod tests {
 
         assert!(!candidate.eligible);
         assert_eq!("too few routed flows per worker: 3 < 4", candidate.reason);
+    }
+
+    #[test]
+    fn worker_planner_accepts_low_flow_budget_for_striped_elephant() {
+        let candidate = evaluate_worker_candidate(
+            4,
+            4096,
+            4_000_000,
+            PerfRunDiagnostics {
+                unique_flows: 1,
+                striped_flow_packets: 3000,
+                packet_skew: PerfSkew {
+                    max_over_average: 1.1,
+                    ..PerfSkew::default()
+                },
+                byte_skew: PerfSkew {
+                    max_over_average: 1.1,
+                    ..PerfSkew::default()
+                },
+                flow_skew: PerfSkew {
+                    max_over_average: 1.0,
+                    ..PerfSkew::default()
+                },
+                ..PerfRunDiagnostics::default()
+            },
+            PerfWorkerPlannerConfig {
+                min_flows_per_worker: 8,
+                min_packets_per_worker: 512,
+                max_packet_skew: 2.0,
+                max_byte_skew: 2.0,
+                ..PerfWorkerPlannerConfig::default()
+            },
+        );
+
+        assert!(candidate.eligible);
+        assert!(
+            candidate
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("elephant striping is active"))
+        );
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub struct PipelineStats {
     #[serde(flatten)]
     pub packet_decode: PacketDecodeCounters,
     pub fallback_routed_packets: u64,
+    pub striped_flow_packets: u64,
     pub fallback_unsupported_link_packets: u64,
     pub fallback_non_ip_packets: u64,
     pub fallback_malformed_packets: u64,
@@ -54,6 +55,7 @@ pub struct PipelineStats {
     pub busiest_worker_packets: u64,
     pub busiest_worker_bytes: u64,
     pub worker_fallback_routed_packets: u64,
+    pub worker_striped_flow_packets: u64,
     pub worker_fallback_unsupported_link_packets: u64,
     pub worker_fallback_non_ip_packets: u64,
     pub worker_fallback_malformed_packets: u64,
