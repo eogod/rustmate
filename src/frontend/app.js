@@ -19,6 +19,7 @@ const state = {
   loadingStreams: false,
   polling: false,
   lastHealthRefresh: 0,
+  lastStats: {},
 };
 
 const el = {
@@ -126,6 +127,7 @@ function profileCountForCurrentToggles(stats) {
 
 function updateStats(healthOrDelta) {
   const stats = healthOrDelta.stats || {};
+  state.lastStats = stats;
   const queue = healthOrDelta.queue_summary || {};
   const view = healthOrDelta.view || {};
   el.status.textContent = `${healthOrDelta.run_status || "running"} / cursor ${healthOrDelta.latest_delta_cursor ?? state.deltaCursor}`;
@@ -207,6 +209,49 @@ function updateDecodeStats(stats) {
   if (unsupportedTransport) parts.push(`other ${formatNumber(unsupportedTransport)}`);
   if (bad) parts.push(`bad ${formatNumber(bad)}`);
   el.decode.textContent = parts.join(" / ");
+}
+
+function updateQueueTelemetry(delta) {
+  const stats = state.lastStats || {};
+  const queue = delta.queue_summary || {};
+  const pressure = delta.shard_pressure || {};
+  const workerQueueLen = Number(queue.max_worker_queue_len || 0);
+  const workerQueueCap = Number(queue.max_worker_queue_capacity || 0);
+  const outputQueueLen = Number(queue.output_queue_len || 0);
+  const outputQueueCap = Number(queue.output_queue_capacity || 0);
+  const busiest = pressure.busiest_shard ?? queue.busiest_worker;
+  const busiestBytes = Number(pressure.busiest_shard_bytes ?? queue.busiest_worker_bytes ?? 0);
+  const packetSkew = pressure.packet_skew_ratio_milli ?? queue.worker_packet_skew_ratio_milli ?? 0;
+  const byteSkew = pressure.byte_skew_ratio_milli ?? queue.worker_byte_skew_ratio_milli ?? 0;
+  const fallback = Number(queue.fallback_routed_packets || 0);
+  const striped = Number(queue.striped_flow_packets || 0);
+  const offloadQueueLen = Number(stats.stream_offload_queue_max_len || 0);
+  const offloadQueueCap = Number(stats.stream_offload_queue_max_capacity || 0);
+  const offloadBlocked = Number(stats.stream_offload_blocked_chunks || 0);
+  const offloadInline = Number(stats.stream_offload_inline_chunks || 0);
+  const offloadDropped = Number(stats.stream_offload_dropped_chunks || 0);
+
+  const queueParts = [
+    `${formatNumber(workerQueueLen)}/${formatNumber(workerQueueCap)}`,
+    `${formatNumber(outputQueueLen)}/${formatNumber(outputQueueCap)}`,
+  ];
+  if (offloadQueueCap > 0 || offloadBlocked > 0 || offloadInline > 0 || offloadDropped > 0) {
+    const offloadParts = [`tcp ${formatNumber(offloadQueueLen)}/${formatNumber(offloadQueueCap)}`];
+    if (offloadBlocked > 0) offloadParts.push(`block ${formatNumber(offloadBlocked)}`);
+    if (offloadInline > 0) offloadParts.push(`inline ${formatNumber(offloadInline)}`);
+    if (offloadDropped > 0) offloadParts.push(`drop ${formatNumber(offloadDropped)}`);
+    queueParts.push(offloadParts.join(" "));
+  }
+
+  el.queue.textContent = queueParts.join(" · ");
+  el.hotShard.textContent = busiest === undefined || busiest === null
+    ? "-"
+    : `${busiest} / ${formatBytes(busiestBytes)}`;
+  el.skew.textContent = `${formatMilliRatio(packetSkew)} / ${formatMilliRatio(byteSkew)}`;
+  el.fallback.textContent = striped > 0
+    ? `${formatNumber(fallback)} / striped ${formatNumber(striped)}`
+    : formatNumber(fallback);
+  updateShardDiagnostics(delta);
 }
 
 async function reloadStreams() {
@@ -508,6 +553,10 @@ async function pollDeltas() {
 function applyDelta(delta) {
   if (delta.kind === "stats" || delta.kind === "status") {
     updateStats({ stats: delta.stats, run_status: delta.run_status, latest_delta_cursor: delta.cursor });
+    return;
+  }
+  if (delta.kind === "queue") {
+    updateQueueTelemetry(delta);
     return;
   }
   if (delta.kind === "streams") {

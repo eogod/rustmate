@@ -2183,7 +2183,7 @@ mod tests {
         stream_slice::{
             StreamSliceConfig, StreamSliceCopyFormat, StreamSliceMode, StreamSliceRequest,
         },
-        stream_view::{StreamViewConfig, StreamViewQuery},
+        stream_view::{StreamViewConfig, StreamViewContentKind, StreamViewQuery},
     };
 
     use super::*;
@@ -2229,6 +2229,14 @@ mod tests {
         assert_eq!(3, stats.events);
         assert_eq!(1, stats.inventory_created_streams);
         assert_eq!(1, stats.inventory_events);
+        let rows = pipeline
+            .stream_view()
+            .query(&StreamViewQuery::default())
+            .rows;
+        assert_eq!(1, rows.len());
+        assert_eq!("http", rows[0].service.name);
+        assert_eq!(Some("parser".to_owned()), rows[0].service.source);
+        assert_eq!(StreamViewContentKind::Text, rows[0].content_kind);
         assert_eq!(3, events.len());
         let http = events
             .iter()

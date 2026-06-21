@@ -9,6 +9,9 @@ use crate::{
     flow::{Endpoint, FlowDirection, FlowKey},
     packet::TransportProtocol,
     service_profile::{ServiceProfile, ServiceProfileSet, ServiceProfileStats},
+    stream_message::{
+        StreamMessage, StreamMessageKind, StreamMessageProtocol, StreamMessageStatus,
+    },
 };
 
 const DEFAULT_QUERY_LIMIT: usize = 100;
@@ -279,6 +282,7 @@ impl StreamViewState {
                     self.observe_match(pattern_match);
                 }
             }
+            ("protocol_message", _) => self.observe_protocol_message(event),
             _ => {}
         }
     }
@@ -484,6 +488,24 @@ impl StreamViewState {
 
         entry.matches.push(pattern_match);
         self.stats.stored_matches = self.stats.stored_matches.saturating_add(1);
+    }
+
+    fn observe_protocol_message(&mut self, event: &Event) {
+        let Some(message) = StreamMessage::from_event(event) else {
+            return;
+        };
+        if message.status == StreamMessageStatus::ParseError {
+            return;
+        }
+        let Some(entry) = self.streams.get_mut(&message.stream_id) else {
+            return;
+        };
+
+        let service = service_from_message(&message, event.event_type);
+        if should_replace_service(&entry.service, &service) {
+            entry.service = service;
+        }
+        entry.content_kind = content_kind_from_message(message.protocol, entry.content_kind);
     }
 
     fn evict_oldest(&mut self) {
@@ -761,6 +783,65 @@ fn matches_profile(entry: &StreamViewEntry, profile: &ServiceProfile) -> bool {
             .any(|pattern_id| entry.pattern_ids.contains(pattern_id));
 
     service_matches || port_matches || content_matches || pattern_matches
+}
+
+fn service_from_message(message: &StreamMessage, evidence: &'static str) -> StreamViewService {
+    StreamViewService {
+        name: service_name_from_message(message.protocol).to_owned(),
+        side: service_side_from_message(message.direction, message.kind).to_owned(),
+        confidence: 100,
+        source: Some("parser".to_owned()),
+        evidence: Some(evidence.to_owned()),
+    }
+}
+
+fn service_name_from_message(protocol: StreamMessageProtocol) -> &'static str {
+    match protocol {
+        StreamMessageProtocol::Http1 => "http",
+        StreamMessageProtocol::Dns => "dns",
+        StreamMessageProtocol::WebSocket => "websocket",
+        StreamMessageProtocol::Tls => "tls",
+    }
+}
+
+fn service_side_from_message(direction: FlowDirection, kind: StreamMessageKind) -> &'static str {
+    match (direction, kind) {
+        (FlowDirection::AToB, StreamMessageKind::Request) => "b",
+        (FlowDirection::BToA, StreamMessageKind::Request) => "a",
+        (FlowDirection::AToB, StreamMessageKind::Response) => "a",
+        (FlowDirection::BToA, StreamMessageKind::Response) => "b",
+        (_, StreamMessageKind::Unknown) => "unknown",
+    }
+}
+
+fn should_replace_service(current: &StreamViewService, next: &StreamViewService) -> bool {
+    current.name == "unknown"
+        || next.confidence >= current.confidence.saturating_add(5)
+        || (current.name == "http" && next.name == "websocket")
+        || current.source.as_deref() != Some("parser")
+}
+
+fn content_kind_from_message(
+    protocol: StreamMessageProtocol,
+    current: StreamViewContentKind,
+) -> StreamViewContentKind {
+    match protocol {
+        StreamMessageProtocol::Http1 => match current {
+            StreamViewContentKind::Unknown => StreamViewContentKind::Text,
+            StreamViewContentKind::Binary => StreamViewContentKind::Mixed,
+            other => other,
+        },
+        StreamMessageProtocol::WebSocket => match current {
+            StreamViewContentKind::Unknown | StreamViewContentKind::Binary => {
+                StreamViewContentKind::Mixed
+            }
+            other => other,
+        },
+        StreamMessageProtocol::Dns | StreamMessageProtocol::Tls => match current {
+            StreamViewContentKind::Unknown => StreamViewContentKind::Binary,
+            other => other,
+        },
+    }
 }
 
 impl StreamViewStatus {
@@ -1074,6 +1155,35 @@ mod tests {
     }
 
     #[test]
+    fn protocol_messages_enrich_stream_rows() {
+        let mut view = view();
+        let mut event = stream_event(0x10, "unknown", 12345);
+        let fields = event.fields.as_object_mut().unwrap();
+        fields.insert("content_kind".to_owned(), json!("binary"));
+        fields.insert(
+            "service".to_owned(),
+            json!({"name": "unknown", "side": "unknown", "confidence": 0}),
+        );
+        view.observe_event(&event);
+
+        view.observe_event(&protocol_message_event(
+            0x10,
+            "http1",
+            "request",
+            "a_to_b",
+            "http1_request",
+        ));
+
+        let row = view.stream_row(0x10).unwrap();
+        assert_eq!("http", row.service.name);
+        assert_eq!("b", row.service.side);
+        assert_eq!(100, row.service.confidence);
+        assert_eq!(Some("parser".to_owned()), row.service.source);
+        assert_eq!(Some("http1_request".to_owned()), row.service.evidence);
+        assert_eq!(StreamViewContentKind::Mixed, row.content_kind);
+    }
+
+    #[test]
     fn evicts_oldest_stream() {
         let mut view = StreamViewState::new(StreamViewConfig {
             max_streams: 1,
@@ -1164,6 +1274,54 @@ mod tests {
                 "logical_end": pattern_name.len() as u64,
                 "match_len": pattern_name.len(),
                 "match_text": pattern_name,
+            }),
+        }
+    }
+
+    fn protocol_message_event(
+        stream_id: u64,
+        protocol: &str,
+        kind: &str,
+        direction: &str,
+        event_type: &'static str,
+    ) -> Event {
+        Event {
+            ts_sec: 1,
+            ts_usec: 2,
+            analyzer: "protocol_message",
+            event_type,
+            length: 16,
+            link_layer: "ethernet",
+            linktype: 1,
+            protocol: Some(TransportProtocol::Tcp),
+            source_addr: Some(IpAddr::from_str("10.0.0.1").unwrap()),
+            destination_addr: Some(IpAddr::from_str("10.0.0.2").unwrap()),
+            source_port: Some(1111),
+            destination_port: Some(80),
+            fields: json!({
+                "stream_id": stream_id,
+                "stream_id_hex": format!("{stream_id:016x}"),
+                "message_id": 1u64,
+                "protocol": protocol,
+                "kind": kind,
+                "status": "complete",
+                "direction": direction,
+                "ordinal": 1u64,
+                "summary": event_type,
+                "logical_start": 0u64,
+                "logical_end": 16u64,
+                "header_start": 0u64,
+                "header_end": 16u64,
+                "body_start": null,
+                "body_end": null,
+                "wire_bytes": 16u64,
+                "header_bytes": 16u64,
+                "body_bytes": 0u64,
+                "http": null,
+                "dns": null,
+                "websocket": null,
+                "tls": null,
+                "error": null,
             }),
         }
     }

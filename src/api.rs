@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -45,6 +45,7 @@ use crate::{
 const DEFAULT_DELTA_QUERY_LIMIT: usize = 1024;
 const MAX_DELTA_QUERY_LIMIT: usize = 8192;
 const MAX_DELTA_POLL_MS: u64 = 30_000;
+const LIVE_QUEUE_DELTA_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct ApiSnapshot {
     stats: PipelineStats,
@@ -137,6 +138,7 @@ struct LiveApiState {
     core: RwLock<LiveApiCore>,
     content: RwLock<LiveContentBackend>,
     deltas: Mutex<LiveDeltaLog>,
+    queue_delta: Mutex<LiveQueueDeltaState>,
     notify: tokio::sync::Notify,
     slice_config: StreamSliceConfig,
     profiles: ServiceProfileSet,
@@ -188,6 +190,7 @@ impl LiveApiHandle {
                 }),
                 content: RwLock::new(LiveContentBackend::None),
                 deltas: Mutex::new(LiveDeltaLog::new(delta_capacity)),
+                queue_delta: Mutex::new(LiveQueueDeltaState::default()),
                 notify: tokio::sync::Notify::new(),
                 slice_config,
                 profiles,
@@ -261,11 +264,23 @@ impl LiveApiHandle {
     }
 
     pub fn publish_queue(&self, queue: ShardedQueueSnapshot) {
+        let emit_delta = self.should_emit_queue_delta();
         let Ok(mut core) = self.inner.core.write() else {
             tracing::warn!("Live API core lock is poisoned");
             return;
         };
-        core.queue = Some(queue);
+        core.queue = Some(queue.clone());
+        drop(core);
+
+        if emit_delta {
+            let queue_summary = queue.summarize();
+            let shard_pressure = queue.pressure();
+            self.append_deltas(vec![LiveDeltaPayload::Queue {
+                queue,
+                queue_summary,
+                shard_pressure,
+            }]);
+        }
     }
 
     pub fn mark_completed(&self, stats: PipelineStats) {
@@ -310,6 +325,24 @@ impl LiveApiHandle {
         }
         drop(deltas);
         self.inner.notify.notify_waiters();
+    }
+
+    fn should_emit_queue_delta(&self) -> bool {
+        let Ok(mut state) = self.inner.queue_delta.lock() else {
+            tracing::warn!("Live API queue delta throttle lock is poisoned");
+            return false;
+        };
+
+        let now = Instant::now();
+        if state
+            .last_emitted
+            .is_some_and(|last| now.duration_since(last) < LIVE_QUEUE_DELTA_MIN_INTERVAL)
+        {
+            return false;
+        }
+
+        state.last_emitted = Some(now);
+        true
     }
 
     fn health(&self) -> Result<HealthResponse, ApiError> {
@@ -1214,6 +1247,11 @@ pub enum LiveDeltaPayload {
     Stats {
         stats: PipelineStats,
     },
+    Queue {
+        queue: ShardedQueueSnapshot,
+        queue_summary: PipelineQueueSnapshot,
+        shard_pressure: ShardPressureSnapshot,
+    },
     Streams {
         rows: Vec<StreamViewRow>,
     },
@@ -1241,6 +1279,11 @@ struct LiveDeltaLog {
     next_cursor: u64,
     dropped_before: u64,
     entries: VecDeque<LiveDelta>,
+}
+
+#[derive(Default)]
+struct LiveQueueDeltaState {
+    last_emitted: Option<Instant>,
 }
 
 impl LiveDeltaLog {
@@ -1966,5 +2009,50 @@ mod tests {
         );
         assert_eq!(Some(1), pressure.busiest_shard);
         assert_eq!(15, pressure.fallback_packets);
+    }
+
+    #[tokio::test]
+    async fn live_queue_publication_emits_delta() {
+        let live = LiveApiHandle::new(
+            StreamViewConfig::disabled(),
+            StreamSliceConfig::default(),
+            16,
+        );
+
+        live.publish_queue(ShardedQueueSnapshot {
+            output_queue_len: 1,
+            output_queue_capacity: 16,
+            workers: vec![WorkerQueueSnapshot {
+                id: 0,
+                len: 2,
+                capacity: 8,
+                routed_packets: 10,
+                routed_bytes: 256,
+                ..WorkerQueueSnapshot::default()
+            }],
+        });
+
+        let response = live
+            .deltas(LiveDeltaQueryParams {
+                cursor: Some(0),
+                limit: Some(8),
+                wait_ms: Some(0),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(1, response.deltas.len());
+        match &response.deltas[0].payload {
+            LiveDeltaPayload::Queue {
+                queue,
+                queue_summary,
+                shard_pressure,
+            } => {
+                assert_eq!(1, queue.output_queue_len);
+                assert_eq!(2, queue_summary.max_worker_queue_len);
+                assert_eq!(Some(0), shard_pressure.busiest_shard);
+            }
+            other => panic!("unexpected delta payload: {other:?}"),
+        }
     }
 }
