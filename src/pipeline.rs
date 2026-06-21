@@ -63,6 +63,13 @@ pub struct PipelineStats {
     pub worker_fallback_unsupported_transport_packets: u64,
     pub worker_packet_skew_ratio_milli: u64,
     pub worker_byte_skew_ratio_milli: u64,
+    pub stream_offload_workers: usize,
+    pub stream_offload_queue_max_len: usize,
+    pub stream_offload_queue_max_capacity: usize,
+    pub stream_offload_submitted_chunks: u64,
+    pub stream_offload_submitted_bytes: u64,
+    pub stream_offload_processed_chunks: u64,
+    pub stream_offload_processed_bytes: u64,
     pub source_received_packets: u64,
     pub source_dropped_packets: u64,
     pub source_interface_dropped_packets: u64,
@@ -176,6 +183,10 @@ impl PipelineStats {
         self.set_stream_content_stats(StreamContentStats::default());
         self.set_stream_parser_stats(StreamParserStats::default());
         self.set_pattern_stats(PatternEngineStats::default());
+        self.stream_offload_submitted_chunks = 0;
+        self.stream_offload_submitted_bytes = 0;
+        self.stream_offload_processed_chunks = 0;
+        self.stream_offload_processed_bytes = 0;
     }
 
     pub(crate) fn set_flow_table_stats(&mut self, flow_stats: FlowTableStats) {

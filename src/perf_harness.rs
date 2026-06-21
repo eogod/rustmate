@@ -44,6 +44,7 @@ pub enum PerfFixtureKind {
     HttpKeepAlive,
     MixedServices,
     UdpElephant,
+    TcpElephant,
 }
 
 impl PerfFixtureKind {
@@ -54,6 +55,7 @@ impl PerfFixtureKind {
             Self::HttpKeepAlive => "http_keep_alive",
             Self::MixedServices => "mixed_services",
             Self::UdpElephant => "udp_elephant",
+            Self::TcpElephant => "tcp_elephant",
         }
     }
 }
@@ -1225,6 +1227,7 @@ pub fn generate_fixture(
         PerfFixtureKind::HttpKeepAlive => http_keep_alive_fixture(flows, messages_per_flow),
         PerfFixtureKind::MixedServices => mixed_services_fixture(flows, messages_per_flow),
         PerfFixtureKind::UdpElephant => udp_elephant_fixture(flows, messages_per_flow),
+        PerfFixtureKind::TcpElephant => tcp_elephant_fixture(flows, messages_per_flow),
     }
 }
 
@@ -1372,6 +1375,32 @@ fn udp_elephant_fixture(flows: usize, messages_per_flow: usize) -> Vec<RawPacket
     packets
 }
 
+fn tcp_elephant_fixture(flows: usize, messages_per_flow: usize) -> Vec<RawPacket> {
+    let mut packets = Vec::with_capacity(flows.saturating_mul(messages_per_flow));
+    for flow in 0..flows {
+        let source = source_ip(flow);
+        let source_port = source_port(flow);
+        let mut sequence = 60_000 + (flow as u32).wrapping_mul(1_048_576);
+        for message in 0..messages_per_flow {
+            let payload = format!(
+                "GET /elephant/{flow}/{message} HTTP/1.1\r\nHost: tcp-elephant.fixture\r\nConnection: keep-alive\r\nX-Pad: {}\r\n\r\n",
+                "a".repeat(900),
+            );
+            packets.push(tcp_packet(
+                source,
+                source_port,
+                [198, 51, 100, 80],
+                80,
+                sequence,
+                payload.as_bytes(),
+                (flow * messages_per_flow + message) as u64,
+            ));
+            sequence = sequence.wrapping_add(payload.len() as u32);
+        }
+    }
+    packets
+}
+
 fn source_ip(flow: usize) -> [u8; 4] {
     [
         10,
@@ -1483,6 +1512,37 @@ mod tests {
         assert!(diagnostics.striped_flow_packets > 0);
         assert!(striped_shards > 1);
         assert!(diagnostics.packet_skew.max_over_average < 4.0);
+    }
+
+    #[test]
+    fn tcp_elephant_fixture_exercises_stream_offload() {
+        let runtime = Builder::new_current_thread().build().unwrap();
+        let input = PerfInput::synthetic(PerfFixtureKind::TcpElephant, 1, 32);
+        let config = PerfHarnessConfig {
+            runs: 1,
+            warmups: 0,
+            worker_counts: vec![4],
+            batch_size: 16,
+            max_flows: 1024,
+            stream_content_bytes: 4 * 1024 * 1024,
+            stream_content_bytes_per_stream: 2 * 1024 * 1024,
+            ..PerfHarnessConfig::default()
+        };
+
+        let report = runtime.block_on(run_perf_suite(&input, &config)).unwrap();
+        let run = report.runs.first().unwrap();
+
+        assert_eq!(32, input.packet_count());
+        assert_eq!(1, run.diagnostics.unique_flows);
+        assert_eq!(0, run.diagnostics.striped_flow_packets);
+        assert_eq!(3, run.stats.stream_offload_workers);
+        assert_eq!(32, run.stats.stream_offload_submitted_chunks);
+        assert_eq!(32, run.stats.stream_offload_processed_chunks);
+        assert_eq!(
+            run.stats.tcp_stream_bytes,
+            run.stats.stream_offload_processed_bytes
+        );
+        assert_eq!(32, run.stats.parser_stream_chunks);
     }
 
     #[test]

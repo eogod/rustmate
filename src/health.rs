@@ -284,6 +284,13 @@ impl PipelineHealthReporter {
                 queue.fallback_unsupported_transport_packets,
             worker_packet_skew_ratio = queue.worker_packet_skew_ratio(),
             worker_byte_skew_ratio = queue.worker_byte_skew_ratio(),
+            stream_offload_workers = stats.stream_offload_workers,
+            stream_offload_queue_max_len = stats.stream_offload_queue_max_len,
+            stream_offload_queue_max_capacity = stats.stream_offload_queue_max_capacity,
+            stream_offload_submitted_chunks = stats.stream_offload_submitted_chunks,
+            stream_offload_submitted_bytes = stats.stream_offload_submitted_bytes,
+            stream_offload_processed_chunks = stats.stream_offload_processed_chunks,
+            stream_offload_processed_bytes = stats.stream_offload_processed_bytes,
             "Pipeline health"
         );
 

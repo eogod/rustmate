@@ -141,6 +141,7 @@ enum FixtureArg {
     HttpKeepAlive,
     MixedServices,
     UdpElephant,
+    TcpElephant,
 }
 
 impl From<FixtureArg> for PerfFixtureKind {
@@ -151,6 +152,7 @@ impl From<FixtureArg> for PerfFixtureKind {
             FixtureArg::HttpKeepAlive => Self::HttpKeepAlive,
             FixtureArg::MixedServices => Self::MixedServices,
             FixtureArg::UdpElephant => Self::UdpElephant,
+            FixtureArg::TcpElephant => Self::TcpElephant,
         }
     }
 }
