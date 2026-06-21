@@ -1,6 +1,8 @@
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf};
 
+use crate::sharded_pipeline::StreamOffloadBackpressurePolicy;
+
 use crate::config::{
     DEFAULT_API_DELTA_CAPACITY, DEFAULT_BATCH_SIZE, DEFAULT_CAPTURE_BUFFER_SIZE,
     DEFAULT_CAPTURE_READ_TIMEOUT_MS, DEFAULT_CAPTURE_SNAPLEN, DEFAULT_EVENT_QUEUE_DEPTH,
@@ -86,6 +88,14 @@ pub struct Opts {
     /// Bounded event batch queue depth from workers to output
     #[arg(long, default_value_t = DEFAULT_EVENT_QUEUE_DEPTH)]
     pub event_queue_depth: usize,
+
+    /// Bounded TCP stream offload queue depth per offload worker; 0 reuses worker queue depth
+    #[arg(long, default_value_t = 0)]
+    pub stream_offload_queue_depth: usize,
+
+    /// TCP stream offload behavior when its queue is full: block | inline | drop
+    #[arg(long, value_enum, default_value_t = StreamOffloadBackpressurePolicy::Block)]
+    pub stream_offload_backpressure: StreamOffloadBackpressurePolicy,
 
     /// Disable stream inventory events and counters
     #[arg(long)]

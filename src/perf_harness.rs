@@ -20,7 +20,10 @@ use crate::{
     packet::{LinkLayer, PacketTimestamp, RawPacket, TransportProtocol},
     pipeline::{Pipeline, PipelineConfig, PipelineStats},
     shard::{ShardCoordinator, ShardCoordinatorConfig, flow_route_from_raw},
-    sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, resolve_worker_count},
+    sharded_pipeline::{
+        ShardedPipeline, ShardedPipelineConfig, StreamOffloadBackpressurePolicy,
+        StreamOffloadConfig, resolve_worker_count,
+    },
     stream_content::StreamContentConfig,
     stream_inventory::StreamInventoryConfig,
     stream_parser::StreamParserConfig,
@@ -708,6 +711,8 @@ pub struct PerfHarnessConfig {
     pub batch_size: usize,
     pub worker_queue_depth: usize,
     pub event_queue_depth: usize,
+    pub stream_offload_queue_depth: usize,
+    pub stream_offload_backpressure: StreamOffloadBackpressurePolicy,
     pub max_flows: usize,
     pub stream_content_bytes: usize,
     pub stream_content_bytes_per_stream: usize,
@@ -724,6 +729,8 @@ impl Default for PerfHarnessConfig {
             batch_size: 4096,
             worker_queue_depth: 8192,
             event_queue_depth: 8192,
+            stream_offload_queue_depth: 0,
+            stream_offload_backpressure: StreamOffloadBackpressurePolicy::Block,
             max_flows: DEFAULT_MAX_FLOWS,
             stream_content_bytes: DEFAULT_MAX_STREAM_CONTENT_BYTES,
             stream_content_bytes_per_stream: DEFAULT_MAX_STREAM_CONTENT_BYTES_PER_STREAM,
@@ -763,6 +770,10 @@ pub struct PerfRunMeta {
     pub batch_size: usize,
     pub worker_queue_depth: usize,
     pub event_queue_depth: usize,
+    #[serde(default)]
+    pub stream_offload_queue_depth: usize,
+    #[serde(default)]
+    pub stream_offload_backpressure: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -1077,6 +1088,10 @@ async fn run_sharded(
         worker_count: workers,
         worker_queue_depth: config.worker_queue_depth.max(1),
         event_queue_depth: config.event_queue_depth.max(1),
+        stream_offload: StreamOffloadConfig {
+            queue_depth: config.stream_offload_queue_depth,
+            backpressure_policy: config.stream_offload_backpressure,
+        },
     });
     register_sharded_analyzers(&mut pipeline);
     pipeline.register_sink(Box::<CountingSink>::default());
@@ -1113,6 +1128,8 @@ fn report_from_stats(
             batch_size: config.batch_size.max(1),
             worker_queue_depth: config.worker_queue_depth.max(1),
             event_queue_depth: config.event_queue_depth.max(1),
+            stream_offload_queue_depth: config.stream_offload_queue_depth,
+            stream_offload_backpressure: Some(config.stream_offload_backpressure.to_string()),
         },
         diagnostics: measurement.diagnostics,
         elapsed_ms: elapsed_secs * 1000.0,

@@ -8,6 +8,7 @@ use rustmate::{
         PerfFixtureKind, PerfHarnessConfig, PerfInput, PerfSuiteReport, PerfWorkerPlan,
         PerfWorkerPlannerConfig, compare_to_baseline, run_perf_suite,
     },
+    sharded_pipeline::StreamOffloadBackpressurePolicy,
 };
 use tokio::runtime::Builder;
 
@@ -60,6 +61,14 @@ struct Args {
     /// Bounded worker-to-output event queue depth.
     #[arg(long, default_value_t = 8192)]
     event_queue_depth: usize,
+
+    /// Bounded TCP stream offload queue depth per offload worker. 0 reuses worker queue depth.
+    #[arg(long, default_value_t = 0)]
+    stream_offload_queue_depth: usize,
+
+    /// TCP stream offload behavior when its queue is full.
+    #[arg(long, value_enum, default_value_t = StreamOffloadBackpressurePolicy::Block)]
+    stream_offload_backpressure: StreamOffloadBackpressurePolicy,
 
     /// Flow and stream tracking cap used during the run.
     #[arg(long, default_value_t = 1_048_576)]
@@ -221,6 +230,8 @@ fn main() -> Result<()> {
         batch_size: args.batch_size,
         worker_queue_depth: args.worker_queue_depth,
         event_queue_depth: args.event_queue_depth,
+        stream_offload_queue_depth: args.stream_offload_queue_depth,
+        stream_offload_backpressure: args.stream_offload_backpressure,
         max_flows: args.max_flows,
         stream_content_bytes: args.stream_content_bytes,
         stream_content_bytes_per_stream: args.stream_content_bytes_per_stream,

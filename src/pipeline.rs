@@ -68,6 +68,12 @@ pub struct PipelineStats {
     pub stream_offload_queue_max_capacity: usize,
     pub stream_offload_submitted_chunks: u64,
     pub stream_offload_submitted_bytes: u64,
+    pub stream_offload_blocked_chunks: u64,
+    pub stream_offload_blocked_bytes: u64,
+    pub stream_offload_inline_chunks: u64,
+    pub stream_offload_inline_bytes: u64,
+    pub stream_offload_dropped_chunks: u64,
+    pub stream_offload_dropped_bytes: u64,
     pub stream_offload_processed_chunks: u64,
     pub stream_offload_processed_bytes: u64,
     pub source_received_packets: u64,
@@ -185,6 +191,12 @@ impl PipelineStats {
         self.set_pattern_stats(PatternEngineStats::default());
         self.stream_offload_submitted_chunks = 0;
         self.stream_offload_submitted_bytes = 0;
+        self.stream_offload_blocked_chunks = 0;
+        self.stream_offload_blocked_bytes = 0;
+        self.stream_offload_inline_chunks = 0;
+        self.stream_offload_inline_bytes = 0;
+        self.stream_offload_dropped_chunks = 0;
+        self.stream_offload_dropped_bytes = 0;
         self.stream_offload_processed_chunks = 0;
         self.stream_offload_processed_bytes = 0;
     }

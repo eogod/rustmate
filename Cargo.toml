@@ -19,6 +19,7 @@ crossbeam-channel = "0.5"
 ctrlc = "3.5"
 etherparse = "0.20"
 flate2 = "1"
+lru = "0.18"
 pcap = "2.4"
 regex = "1"
 serde = { version = "1.0", features = ["derive"] }

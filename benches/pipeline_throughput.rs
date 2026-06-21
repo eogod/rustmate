@@ -11,7 +11,7 @@ use rustmate::{
     output::EventSink,
     packet::{LinkLayer, PacketTimestamp, RawPacket},
     pipeline::{Pipeline, PipelineConfig, PipelineStats},
-    sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig},
+    sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, StreamOffloadConfig},
     stream_content::StreamContentConfig,
     stream_inventory::StreamInventoryConfig,
     stream_parser::StreamParserConfig,
@@ -80,6 +80,7 @@ async fn run_sharded(packets: Arc<[RawPacket]>, batch_size: usize) -> PipelineSt
         worker_count: WORKERS,
         worker_queue_depth: QUEUE_DEPTH,
         event_queue_depth: QUEUE_DEPTH,
+        stream_offload: StreamOffloadConfig::default(),
     });
     register_sharded_analyzers(&mut pipeline);
     pipeline.register_sink(Box::<CountingSink>::default());

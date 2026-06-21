@@ -140,6 +140,9 @@ function updateStats(healthOrDelta) {
   const outputQueueCap = firstPositive(stats.output_queue_capacity, queue.output_queue_capacity);
   const offloadQueueLen = Number(stats.stream_offload_queue_max_len || 0);
   const offloadQueueCap = Number(stats.stream_offload_queue_max_capacity || 0);
+  const offloadBlocked = Number(stats.stream_offload_blocked_chunks || 0);
+  const offloadInline = Number(stats.stream_offload_inline_chunks || 0);
+  const offloadDropped = Number(stats.stream_offload_dropped_chunks || 0);
   const busiestShard = stats.busiest_shard ?? stats.busiest_worker ?? queue.busiest_worker;
   const busiestBytes = firstPositive(stats.busiest_shard_bytes, stats.busiest_worker_bytes, queue.busiest_worker_bytes);
   const packetSkew = firstPositive(
@@ -172,8 +175,12 @@ function updateStats(healthOrDelta) {
     `${formatNumber(workerQueueLen)}/${formatNumber(workerQueueCap)}`,
     `${formatNumber(outputQueueLen)}/${formatNumber(outputQueueCap)}`,
   ];
-  if (offloadQueueCap > 0) {
-    queueParts.push(`tcp ${formatNumber(offloadQueueLen)}/${formatNumber(offloadQueueCap)}`);
+  if (offloadQueueCap > 0 || offloadBlocked > 0 || offloadInline > 0 || offloadDropped > 0) {
+    const offloadParts = [`tcp ${formatNumber(offloadQueueLen)}/${formatNumber(offloadQueueCap)}`];
+    if (offloadBlocked > 0) offloadParts.push(`block ${formatNumber(offloadBlocked)}`);
+    if (offloadInline > 0) offloadParts.push(`inline ${formatNumber(offloadInline)}`);
+    if (offloadDropped > 0) offloadParts.push(`drop ${formatNumber(offloadDropped)}`);
+    queueParts.push(offloadParts.join(" "));
   }
   el.queue.textContent = queueParts.join(" · ");
   el.hotShard.textContent = busiestShard === undefined || busiestShard === null

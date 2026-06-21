@@ -20,7 +20,10 @@ use rustmate::{
     pattern::{PatternDefinition, PatternEngineConfig},
     pipeline::{Pipeline, PipelineConfig},
     service_profile::ServiceProfileSet,
-    sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, resolve_worker_count},
+    sharded_pipeline::{
+        ShardedPipeline, ShardedPipelineConfig, StreamOffloadBackpressurePolicy,
+        StreamOffloadConfig, resolve_worker_count,
+    },
     stream_content::StreamContentConfig,
     stream_inventory::StreamInventoryConfig,
     stream_parser::StreamParserConfig,
@@ -127,6 +130,8 @@ async fn main() -> anyhow::Result<()> {
                 worker_count,
                 worker_queue_depth: opts.worker_queue_depth,
                 event_queue_depth: opts.event_queue_depth,
+                stream_offload_queue_depth: opts.stream_offload_queue_depth,
+                stream_offload_backpressure: opts.stream_offload_backpressure,
                 out_path: out_path.clone(),
                 live_api,
             },
@@ -171,6 +176,8 @@ async fn main() -> anyhow::Result<()> {
                 worker_count,
                 worker_queue_depth: opts.worker_queue_depth,
                 event_queue_depth: opts.event_queue_depth,
+                stream_offload_queue_depth: opts.stream_offload_queue_depth,
+                stream_offload_backpressure: opts.stream_offload_backpressure,
                 out_path: out_path.clone(),
                 live_api,
             },
@@ -200,6 +207,8 @@ struct PipelineRunOptions {
     worker_count: usize,
     worker_queue_depth: usize,
     event_queue_depth: usize,
+    stream_offload_queue_depth: usize,
+    stream_offload_backpressure: StreamOffloadBackpressurePolicy,
     out_path: PathBuf,
     live_api: Option<LiveApiHandle>,
 }
@@ -216,6 +225,10 @@ async fn run_pipeline<T: PacketSource + 'static>(
             worker_count: options.worker_count,
             worker_queue_depth: options.worker_queue_depth,
             event_queue_depth: options.event_queue_depth,
+            stream_offload: StreamOffloadConfig {
+                queue_depth: options.stream_offload_queue_depth,
+                backpressure_policy: options.stream_offload_backpressure,
+            },
         });
         pipeline.set_pattern_config(pattern_config);
         if let Some(live_api) = options.live_api {
@@ -450,6 +463,12 @@ fn log_completed(message: &str, stats: &rustmate::pipeline::PipelineStats, out_p
         stream_offload_workers = stats.stream_offload_workers,
         stream_offload_submitted_chunks = stats.stream_offload_submitted_chunks,
         stream_offload_submitted_bytes = stats.stream_offload_submitted_bytes,
+        stream_offload_blocked_chunks = stats.stream_offload_blocked_chunks,
+        stream_offload_blocked_bytes = stats.stream_offload_blocked_bytes,
+        stream_offload_inline_chunks = stats.stream_offload_inline_chunks,
+        stream_offload_inline_bytes = stats.stream_offload_inline_bytes,
+        stream_offload_dropped_chunks = stats.stream_offload_dropped_chunks,
+        stream_offload_dropped_bytes = stats.stream_offload_dropped_bytes,
         stream_offload_processed_chunks = stats.stream_offload_processed_chunks,
         stream_offload_processed_bytes = stats.stream_offload_processed_bytes,
         pattern_matches = stats.pattern_matches,

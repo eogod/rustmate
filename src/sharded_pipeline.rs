@@ -1,11 +1,15 @@
 use std::{
+    fmt,
+    num::NonZeroUsize,
     sync::Arc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
+use clap::ValueEnum;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
+use lru::LruCache;
 use smallvec::SmallVec;
 use tokio::sync::oneshot;
 
@@ -52,6 +56,54 @@ pub struct ShardedPipelineConfig {
     pub worker_count: usize,
     pub worker_queue_depth: usize,
     pub event_queue_depth: usize,
+    pub stream_offload: StreamOffloadConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamOffloadConfig {
+    pub queue_depth: usize,
+    pub backpressure_policy: StreamOffloadBackpressurePolicy,
+}
+
+impl Default for StreamOffloadConfig {
+    fn default() -> Self {
+        Self {
+            queue_depth: 0,
+            backpressure_policy: StreamOffloadBackpressurePolicy::Block,
+        }
+    }
+}
+
+impl StreamOffloadConfig {
+    fn normalized(self, worker_queue_depth: usize) -> Self {
+        Self {
+            queue_depth: if self.queue_depth == 0 {
+                worker_queue_depth
+            } else {
+                self.queue_depth
+            }
+            .max(1),
+            backpressure_policy: self.backpressure_policy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum StreamOffloadBackpressurePolicy {
+    Block,
+    Inline,
+    Drop,
+}
+
+impl fmt::Display for StreamOffloadBackpressurePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Block => f.write_str("block"),
+            Self::Inline => f.write_str("inline"),
+            Self::Drop => f.write_str("drop"),
+        }
+    }
 }
 
 pub struct ShardedPipeline {
@@ -114,6 +166,12 @@ struct WorkerStats {
     pattern_stats: PatternEngineStats,
     stream_offload_submitted_chunks: u64,
     stream_offload_submitted_bytes: u64,
+    stream_offload_blocked_chunks: u64,
+    stream_offload_blocked_bytes: u64,
+    stream_offload_inline_chunks: u64,
+    stream_offload_inline_bytes: u64,
+    stream_offload_dropped_chunks: u64,
+    stream_offload_dropped_bytes: u64,
 }
 
 struct WorkerHandle {
@@ -162,6 +220,7 @@ struct WorkerRuntime {
     pattern_engine: PatternEngine,
     analyzers: Vec<Box<dyn Analyzer>>,
     stream_offload: Option<StreamOffloadHandle>,
+    stream_flow_placement: StreamFlowPlacementTable,
     events: Vec<Event>,
     stats: WorkerStats,
 }
@@ -179,6 +238,7 @@ struct WorkerThreadContext {
 
 struct StreamOffloadPool {
     workers: Vec<StreamOffloadWorkerHandle>,
+    config: StreamOffloadConfig,
 }
 
 struct StreamOffloadWorkerHandle {
@@ -190,6 +250,40 @@ struct StreamOffloadWorkerHandle {
 #[derive(Clone)]
 struct StreamOffloadHandle {
     senders: Arc<Vec<Sender<StreamOffloadCommand>>>,
+    config: StreamOffloadConfig,
+}
+
+enum StreamOffloadDispatch {
+    Submitted { blocked: bool },
+    Inline(StreamOffloadTask),
+    Dropped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFlowPlacement {
+    Local,
+    Offloaded,
+}
+
+struct StreamFlowPlacementTable {
+    placements: LruCache<FlowKey, StreamFlowPlacement>,
+}
+
+impl StreamFlowPlacementTable {
+    fn new(capacity: usize) -> Self {
+        let capacity = NonZeroUsize::new(capacity.max(1)).expect("capacity is at least one");
+        Self {
+            placements: LruCache::new(capacity),
+        }
+    }
+
+    fn placement(&mut self, key: &FlowKey) -> Option<StreamFlowPlacement> {
+        self.placements.get(key).copied()
+    }
+
+    fn insert(&mut self, key: FlowKey, placement: StreamFlowPlacement) {
+        self.placements.put(key, placement);
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -267,6 +361,7 @@ impl ShardedPipeline {
             worker_count: resolve_worker_count(config.worker_count),
             worker_queue_depth: config.worker_queue_depth.max(1),
             event_queue_depth: config.event_queue_depth.max(1),
+            stream_offload: config.stream_offload.normalized(config.worker_queue_depth),
             ..config
         };
         let stream_content_shards = (0..config.worker_count).map(|_| None).collect();
@@ -880,7 +975,7 @@ impl StreamOffloadPool {
 
         let mut workers = Vec::with_capacity(worker_count);
         for id in 0..worker_count {
-            let (sender, receiver) = bounded(config.worker_queue_depth.max(1));
+            let (sender, receiver) = bounded(config.stream_offload.queue_depth);
             let output_tx = output_tx.clone();
             let analyzer_factories = Arc::clone(&analyzer_factories);
             let join_handle = thread::Builder::new()
@@ -903,7 +998,10 @@ impl StreamOffloadPool {
             });
         }
 
-        Ok(Some(Self { workers }))
+        Ok(Some(Self {
+            workers,
+            config: config.stream_offload,
+        }))
     }
 
     fn handle(&self) -> StreamOffloadHandle {
@@ -914,6 +1012,7 @@ impl StreamOffloadPool {
                     .map(|worker| worker.sender.clone())
                     .collect(),
             ),
+            config: self.config,
         }
     }
 
@@ -1030,7 +1129,11 @@ impl StreamOffloadPool {
 }
 
 impl StreamOffloadHandle {
-    fn send(&self, task: StreamOffloadTask) -> Result<()> {
+    fn dispatch(
+        &self,
+        task: StreamOffloadTask,
+        preserve_affinity: bool,
+    ) -> Result<StreamOffloadDispatch> {
         let Some(sender) = self
             .senders
             .get(shard_for_flow_key(&task.flow.key, self.senders.len()))
@@ -1038,9 +1141,71 @@ impl StreamOffloadHandle {
             return Err(anyhow!("stream offload has no workers"));
         };
 
-        sender
-            .send(StreamOffloadCommand::Task(Box::new(task)))
-            .map_err(|_| anyhow!("stream offload worker stopped before accepting a TCP chunk"))
+        let policy = if preserve_affinity
+            && self.config.backpressure_policy == StreamOffloadBackpressurePolicy::Inline
+        {
+            StreamOffloadBackpressurePolicy::Block
+        } else {
+            self.config.backpressure_policy
+        };
+
+        match policy {
+            StreamOffloadBackpressurePolicy::Block => {
+                dispatch_stream_offload_blocking(sender, task)
+            }
+            StreamOffloadBackpressurePolicy::Inline => dispatch_stream_offload_inline(sender, task),
+            StreamOffloadBackpressurePolicy::Drop => Ok(dispatch_stream_offload_drop(sender, task)),
+        }
+    }
+}
+
+fn dispatch_stream_offload_blocking(
+    sender: &Sender<StreamOffloadCommand>,
+    task: StreamOffloadTask,
+) -> Result<StreamOffloadDispatch> {
+    match sender.try_send(StreamOffloadCommand::Task(Box::new(task))) {
+        Ok(()) => Ok(StreamOffloadDispatch::Submitted { blocked: false }),
+        Err(TrySendError::Full(StreamOffloadCommand::Task(task))) => {
+            sender
+                .send(StreamOffloadCommand::Task(task))
+                .map_err(|_| anyhow!("stream offload worker stopped while backpressuring"))?;
+            Ok(StreamOffloadDispatch::Submitted { blocked: true })
+        }
+        Err(TrySendError::Full(StreamOffloadCommand::Shutdown)) => Err(anyhow!(
+            "stream offload queue returned an unexpected shutdown command"
+        )),
+        Err(TrySendError::Disconnected(_)) => Err(anyhow!(
+            "stream offload worker stopped before accepting a TCP chunk"
+        )),
+    }
+}
+
+fn dispatch_stream_offload_inline(
+    sender: &Sender<StreamOffloadCommand>,
+    task: StreamOffloadTask,
+) -> Result<StreamOffloadDispatch> {
+    match sender.try_send(StreamOffloadCommand::Task(Box::new(task))) {
+        Ok(()) => Ok(StreamOffloadDispatch::Submitted { blocked: false }),
+        Err(TrySendError::Full(StreamOffloadCommand::Task(task)))
+        | Err(TrySendError::Disconnected(StreamOffloadCommand::Task(task))) => {
+            Ok(StreamOffloadDispatch::Inline(*task))
+        }
+        Err(TrySendError::Full(StreamOffloadCommand::Shutdown))
+        | Err(TrySendError::Disconnected(StreamOffloadCommand::Shutdown)) => Err(anyhow!(
+            "stream offload queue returned an unexpected shutdown command"
+        )),
+    }
+}
+
+fn dispatch_stream_offload_drop(
+    sender: &Sender<StreamOffloadCommand>,
+    task: StreamOffloadTask,
+) -> StreamOffloadDispatch {
+    match sender.try_send(StreamOffloadCommand::Task(Box::new(task))) {
+        Ok(()) => StreamOffloadDispatch::Submitted { blocked: false },
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            StreamOffloadDispatch::Dropped
+        }
     }
 }
 
@@ -1166,6 +1331,7 @@ fn run_worker(context: WorkerThreadContext) -> Result<()> {
     } = context;
 
     let mut flush_state = WorkerLiveFlushState::new(config.batch_size.clamp(1, 8192));
+    let stream_flow_placement_limit = flow_config.max_flows;
     let mut runtime = WorkerRuntime {
         mode: config.mode,
         flow_table: FlowTable::new(flow_config),
@@ -1178,6 +1344,7 @@ fn run_worker(context: WorkerThreadContext) -> Result<()> {
             .map(|factory| factory())
             .collect::<Vec<_>>(),
         stream_offload,
+        stream_flow_placement: StreamFlowPlacementTable::new(stream_flow_placement_limit),
         events: Vec::with_capacity(flush_state.event_batch_capacity),
         stats: WorkerStats {
             id,
@@ -1354,16 +1521,50 @@ impl WorkerRuntime {
         tcp: &TcpObservation<'_>,
         chunk: &StreamChunk<'_>,
     ) -> Result<()> {
+        match self.stream_flow_placement.placement(&flow.key) {
+            Some(StreamFlowPlacement::Local) => {
+                let task =
+                    StreamOffloadTask::from_stream_chunk(Arc::clone(&routed.raw), flow, tcp, chunk);
+                self.observe_stream_offload_inline(task.chunk_len() as u64);
+                task.process(
+                    &mut self.stream_parser,
+                    &mut self.analyzers,
+                    &mut self.events,
+                );
+                return Ok(());
+            }
+            Some(StreamFlowPlacement::Offloaded) | None => {}
+        }
+
         if let Some(stream_offload) = &self.stream_offload {
             let task =
                 StreamOffloadTask::from_stream_chunk(Arc::clone(&routed.raw), flow, tcp, chunk);
-            self.stats.stream_offload_submitted_chunks =
-                self.stats.stream_offload_submitted_chunks.saturating_add(1);
-            self.stats.stream_offload_submitted_bytes = self
-                .stats
-                .stream_offload_submitted_bytes
-                .saturating_add(task.chunk_len() as u64);
-            stream_offload.send(task)?;
+            let chunk_len = task.chunk_len() as u64;
+            let preserve_affinity = self.stream_flow_placement.placement(&flow.key)
+                == Some(StreamFlowPlacement::Offloaded);
+            match stream_offload.dispatch(task, preserve_affinity)? {
+                StreamOffloadDispatch::Submitted { blocked } => {
+                    self.stream_flow_placement
+                        .insert(flow.key, StreamFlowPlacement::Offloaded);
+                    self.observe_stream_offload_submitted(chunk_len);
+                    if blocked {
+                        self.observe_stream_offload_blocked(chunk_len);
+                    }
+                }
+                StreamOffloadDispatch::Inline(task) => {
+                    self.stream_flow_placement
+                        .insert(flow.key, StreamFlowPlacement::Local);
+                    self.observe_stream_offload_inline(chunk_len);
+                    task.process(
+                        &mut self.stream_parser,
+                        &mut self.analyzers,
+                        &mut self.events,
+                    );
+                }
+                StreamOffloadDispatch::Dropped => {
+                    self.observe_stream_offload_dropped(chunk_len);
+                }
+            }
             return Ok(());
         }
 
@@ -1373,6 +1574,40 @@ impl WorkerRuntime {
             analyzer.analyze_stream(packet, flow, chunk, &mut self.events);
         }
         Ok(())
+    }
+
+    fn observe_stream_offload_submitted(&mut self, bytes: u64) {
+        self.stats.stream_offload_submitted_chunks =
+            self.stats.stream_offload_submitted_chunks.saturating_add(1);
+        self.stats.stream_offload_submitted_bytes = self
+            .stats
+            .stream_offload_submitted_bytes
+            .saturating_add(bytes);
+    }
+
+    fn observe_stream_offload_blocked(&mut self, bytes: u64) {
+        self.stats.stream_offload_blocked_chunks =
+            self.stats.stream_offload_blocked_chunks.saturating_add(1);
+        self.stats.stream_offload_blocked_bytes = self
+            .stats
+            .stream_offload_blocked_bytes
+            .saturating_add(bytes);
+    }
+
+    fn observe_stream_offload_inline(&mut self, bytes: u64) {
+        self.stats.stream_offload_inline_chunks =
+            self.stats.stream_offload_inline_chunks.saturating_add(1);
+        self.stats.stream_offload_inline_bytes =
+            self.stats.stream_offload_inline_bytes.saturating_add(bytes);
+    }
+
+    fn observe_stream_offload_dropped(&mut self, bytes: u64) {
+        self.stats.stream_offload_dropped_chunks =
+            self.stats.stream_offload_dropped_chunks.saturating_add(1);
+        self.stats.stream_offload_dropped_bytes = self
+            .stats
+            .stream_offload_dropped_bytes
+            .saturating_add(bytes);
     }
 
     fn refresh_stats(&mut self) {
@@ -1727,6 +1962,24 @@ fn add_worker_stats(stats: &mut PipelineStats, worker_stats: &WorkerStats) {
     stats.stream_offload_submitted_bytes = stats
         .stream_offload_submitted_bytes
         .saturating_add(worker_stats.stream_offload_submitted_bytes);
+    stats.stream_offload_blocked_chunks = stats
+        .stream_offload_blocked_chunks
+        .saturating_add(worker_stats.stream_offload_blocked_chunks);
+    stats.stream_offload_blocked_bytes = stats
+        .stream_offload_blocked_bytes
+        .saturating_add(worker_stats.stream_offload_blocked_bytes);
+    stats.stream_offload_inline_chunks = stats
+        .stream_offload_inline_chunks
+        .saturating_add(worker_stats.stream_offload_inline_chunks);
+    stats.stream_offload_inline_bytes = stats
+        .stream_offload_inline_bytes
+        .saturating_add(worker_stats.stream_offload_inline_bytes);
+    stats.stream_offload_dropped_chunks = stats
+        .stream_offload_dropped_chunks
+        .saturating_add(worker_stats.stream_offload_dropped_chunks);
+    stats.stream_offload_dropped_bytes = stats
+        .stream_offload_dropped_bytes
+        .saturating_add(worker_stats.stream_offload_dropped_bytes);
 }
 
 fn add_stream_offload_stats(stats: &mut PipelineStats, offload_stats: &StreamOffloadWorkerStats) {
@@ -1985,6 +2238,69 @@ mod tests {
         assert_eq!("shard.local", http["fields"]["headers"]["host"]);
     }
 
+    #[test]
+    fn stream_offload_inline_policy_returns_task_when_queue_is_full() {
+        let (sender, _receiver) = bounded(1);
+        let handle = StreamOffloadHandle {
+            senders: Arc::new(vec![sender]),
+            config: StreamOffloadConfig {
+                queue_depth: 1,
+                backpressure_policy: StreamOffloadBackpressurePolicy::Inline,
+            },
+        };
+
+        assert!(matches!(
+            handle.dispatch(test_offload_task(b"first"), false).unwrap(),
+            StreamOffloadDispatch::Submitted { blocked: false }
+        ));
+        let dispatch = handle
+            .dispatch(test_offload_task(b"second"), false)
+            .unwrap();
+
+        assert!(matches!(dispatch, StreamOffloadDispatch::Inline(_)));
+    }
+
+    #[test]
+    fn stream_offload_drop_policy_drops_when_queue_is_full() {
+        let (sender, _receiver) = bounded(1);
+        let handle = StreamOffloadHandle {
+            senders: Arc::new(vec![sender]),
+            config: StreamOffloadConfig {
+                queue_depth: 1,
+                backpressure_policy: StreamOffloadBackpressurePolicy::Drop,
+            },
+        };
+
+        assert!(matches!(
+            handle.dispatch(test_offload_task(b"first"), false).unwrap(),
+            StreamOffloadDispatch::Submitted { blocked: false }
+        ));
+        let dispatch = handle
+            .dispatch(test_offload_task(b"second"), false)
+            .unwrap();
+
+        assert!(matches!(dispatch, StreamOffloadDispatch::Dropped));
+    }
+
+    #[test]
+    fn stream_flow_placement_table_evicts_oldest_key() {
+        let first = test_flow_key(1111);
+        let second = test_flow_key(2222);
+        let third = test_flow_key(3333);
+        let mut table = StreamFlowPlacementTable::new(2);
+
+        table.insert(first, StreamFlowPlacement::Offloaded);
+        table.insert(second, StreamFlowPlacement::Local);
+        table.insert(third, StreamFlowPlacement::Offloaded);
+
+        assert_eq!(None, table.placement(&first));
+        assert_eq!(Some(StreamFlowPlacement::Local), table.placement(&second));
+        assert_eq!(
+            Some(StreamFlowPlacement::Offloaded),
+            table.placement(&third)
+        );
+    }
+
     #[tokio::test]
     async fn keeps_independent_flow_state_per_shard() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -2193,6 +2509,7 @@ mod tests {
             worker_count: 4,
             worker_queue_depth: 8,
             event_queue_depth: 8,
+            stream_offload: StreamOffloadConfig::default(),
         };
 
         assert_eq!(800, flow_owner_limit(config));
@@ -2286,6 +2603,7 @@ mod tests {
             worker_count: 2,
             worker_queue_depth: 8,
             event_queue_depth: 8,
+            stream_offload: StreamOffloadConfig::default(),
         });
         pipeline.register_sink(Box::new(CollectSink {
             events: Arc::clone(&events),
@@ -2347,6 +2665,7 @@ mod tests {
             worker_count: 2,
             worker_queue_depth: 1,
             event_queue_depth: 1,
+            stream_offload: StreamOffloadConfig::default(),
         });
         pipeline.register_analyzer_factory(|| Box::new(HttpAnalyzer::new()));
         pipeline.register_sink(Box::new(CollectSink {
@@ -2401,6 +2720,7 @@ mod tests {
             worker_count: 4,
             worker_queue_depth: 1024,
             event_queue_depth: 1024,
+            stream_offload: StreamOffloadConfig::default(),
         });
         let payload = vec![0xa5; 1200];
         let packets = (0..1536)
@@ -2556,6 +2876,7 @@ mod tests {
             worker_count,
             worker_queue_depth: 8,
             event_queue_depth: 8,
+            stream_offload: StreamOffloadConfig::default(),
         })
     }
 
@@ -2626,6 +2947,58 @@ mod tests {
             linktype: Linktype::ETHERNET.0,
             data,
         }
+    }
+
+    fn test_offload_task(payload: &[u8]) -> StreamOffloadTask {
+        let raw = Arc::new(tcp_packet(
+            [10, 0, 0, 1],
+            1111,
+            [10, 0, 0, 2],
+            80,
+            100,
+            payload,
+            1,
+        ));
+        let flow_route = flow_route_from_raw(raw.as_ref()).unwrap();
+        StreamOffloadTask {
+            raw,
+            flow: OwnedFlowObservation {
+                key: flow_route.key,
+                direction: flow_route.direction,
+                packets: 1,
+                bytes: payload.len() as u64,
+                is_new: false,
+            },
+            tcp: OwnedTcpObservation {
+                sequence_number: 100,
+                next_sequence: 100 + payload.len() as u32,
+                acknowledgment_number: 0,
+                payload_len: payload.len(),
+                status: TcpSequenceStatus::InOrder,
+                buffered_segments: 0,
+                buffered_bytes: 0,
+            },
+            chunk: OwnedStreamChunk {
+                direction: flow_route.direction,
+                sequence_start: 100,
+                sequence_end: 100 + payload.len() as u32,
+                bytes: payload.to_vec(),
+                source: StreamChunkSource::CurrentSegment,
+            },
+        }
+    }
+
+    fn test_flow_key(source_port: u16) -> FlowKey {
+        let raw = tcp_packet(
+            [10, 0, 0, 1],
+            source_port,
+            [10, 0, 0, 2],
+            80,
+            100,
+            b"payload",
+            source_port as u64,
+        );
+        flow_route_from_raw(&raw).unwrap().key
     }
 
     fn udp_packet(

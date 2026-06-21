@@ -289,6 +289,12 @@ impl PipelineHealthReporter {
             stream_offload_queue_max_capacity = stats.stream_offload_queue_max_capacity,
             stream_offload_submitted_chunks = stats.stream_offload_submitted_chunks,
             stream_offload_submitted_bytes = stats.stream_offload_submitted_bytes,
+            stream_offload_blocked_chunks = stats.stream_offload_blocked_chunks,
+            stream_offload_blocked_bytes = stats.stream_offload_blocked_bytes,
+            stream_offload_inline_chunks = stats.stream_offload_inline_chunks,
+            stream_offload_inline_bytes = stats.stream_offload_inline_bytes,
+            stream_offload_dropped_chunks = stats.stream_offload_dropped_chunks,
+            stream_offload_dropped_bytes = stats.stream_offload_dropped_bytes,
             stream_offload_processed_chunks = stats.stream_offload_processed_chunks,
             stream_offload_processed_bytes = stats.stream_offload_processed_bytes,
             "Pipeline health"
