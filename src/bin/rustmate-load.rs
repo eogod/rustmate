@@ -93,6 +93,18 @@ struct Args {
     #[arg(long, default_value_t = 1_000_000)]
     adaptive_preferred_bytes_per_worker: u64,
 
+    /// Adaptive planner minimum TCP packets before accepting stream-offload skew.
+    #[arg(long, default_value_t = 256)]
+    adaptive_min_tcp_offload_packets: usize,
+
+    /// Adaptive planner minimum TCP bytes before accepting stream-offload skew.
+    #[arg(long, default_value_t = 131_072)]
+    adaptive_min_tcp_offload_bytes: u64,
+
+    /// Adaptive planner preferred TCP offload bytes per effective worker.
+    #[arg(long, default_value_t = 262_144)]
+    adaptive_preferred_tcp_offload_bytes_per_worker: u64,
+
     /// Adaptive planner maximum allowed packet skew, max/average.
     #[arg(long, default_value_t = 2.5)]
     adaptive_max_packet_skew: f64,
@@ -189,6 +201,10 @@ fn main() -> Result<()> {
         min_flows_per_worker: args.adaptive_min_flows_per_worker,
         preferred_packets_per_worker: args.adaptive_preferred_packets_per_worker,
         preferred_bytes_per_worker: args.adaptive_preferred_bytes_per_worker,
+        min_tcp_offload_packets: args.adaptive_min_tcp_offload_packets,
+        min_tcp_offload_bytes: args.adaptive_min_tcp_offload_bytes,
+        preferred_tcp_offload_bytes_per_worker: args
+            .adaptive_preferred_tcp_offload_bytes_per_worker,
         max_packet_skew: args.adaptive_max_packet_skew,
         max_byte_skew: args.adaptive_max_byte_skew,
         max_flow_skew: args.adaptive_max_flow_skew,
@@ -356,11 +372,11 @@ fn print_worker_plan(plan: &PerfWorkerPlan) {
         eprintln!("  decision: {note}");
     }
     eprintln!(
-        "candidate workers  score  state  pkt/w    bytes/w    flows/w   pkt skew  byte skew  flow skew  striped  fallback"
+        "candidate workers  score  state  pkt/w    bytes/w    flows/w   pkt skew  byte skew  flow skew  striped      tcp  off  fallback"
     );
     for candidate in &plan.candidates {
         eprintln!(
-            "candidate {:>7} {:>6.2} {:>6} {:>7} {:>10} {:>8} {:>9} {:>10} {:>10} {:>8} {:>9}",
+            "candidate {:>7} {:>6.2} {:>6} {:>7} {:>10} {:>8} {:>9} {:>10} {:>10} {:>8} {:>8} {:>4} {:>9}",
             candidate.workers,
             candidate.score,
             if candidate.eligible { "ok" } else { "skip" },
@@ -371,6 +387,8 @@ fn print_worker_plan(plan: &PerfWorkerPlan) {
             format!("{:.2}x", candidate.diagnostics.byte_skew.max_over_average),
             format!("{:.2}x", candidate.diagnostics.flow_skew.max_over_average),
             format_number(candidate.diagnostics.striped_flow_packets),
+            format_number(candidate.diagnostics.tcp_routed_packets),
+            candidate.tcp_offload_lanes,
             format!("{:.2}%", candidate.fallback_ratio * 100.0),
         );
         if !candidate.rejections.is_empty() {

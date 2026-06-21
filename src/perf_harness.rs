@@ -17,7 +17,7 @@ use crate::{
     flow::FlowKey,
     ingest::{PacketBatch, PacketSource},
     output::EventSink,
-    packet::{LinkLayer, PacketTimestamp, RawPacket},
+    packet::{LinkLayer, PacketTimestamp, RawPacket, TransportProtocol},
     pipeline::{Pipeline, PipelineConfig, PipelineStats},
     shard::{ShardCoordinator, ShardCoordinatorConfig, flow_route_from_raw},
     sharded_pipeline::{ShardedPipeline, ShardedPipelineConfig, resolve_worker_count},
@@ -132,6 +132,9 @@ impl PerfInput {
         let mut routed_packets = 0u64;
         let mut fallback_packets = 0u64;
         let mut all_flows = HashSet::new();
+        let mut tcp_routed_packets = 0u64;
+        let mut tcp_routed_bytes = 0u64;
+        let mut tcp_flows = HashSet::new();
 
         for packet in self.packets.iter() {
             let route = coordinator.route_packet(packet);
@@ -144,6 +147,11 @@ impl PerfInput {
             if let Some(flow_route) = flow_route {
                 routed_packets = routed_packets.saturating_add(1);
                 all_flows.insert(flow_route.key);
+                if flow_route.key.protocol == TransportProtocol::Tcp {
+                    tcp_routed_packets = tcp_routed_packets.saturating_add(1);
+                    tcp_routed_bytes = tcp_routed_bytes.saturating_add(packet.data.len() as u64);
+                    tcp_flows.insert(flow_route.key);
+                }
                 if let Some(accumulator) = shards.get_mut(shard) {
                     accumulator.flows.insert(flow_route.key);
                 }
@@ -181,6 +189,9 @@ impl PerfInput {
             fallback_unsupported_transport_packets: route_snapshot
                 .fallback_unsupported_transport_packets,
             unique_flows: all_flows.len(),
+            tcp_routed_packets,
+            tcp_routed_bytes,
+            tcp_unique_flows: tcp_flows.len(),
             packet_skew: skew(shards.iter().map(|shard| shard.packets)),
             byte_skew: skew(shards.iter().map(|shard| shard.bytes)),
             flow_skew: skew(shards.iter().map(|shard| shard.unique_flows as u64)),
@@ -189,7 +200,7 @@ impl PerfInput {
     }
 
     pub fn plan_workers(&self, config: PerfWorkerPlannerConfig) -> PerfWorkerPlan {
-        const PLANNER_VERSION: u32 = 2;
+        const PLANNER_VERSION: u32 = 3;
         let available_workers = resolve_worker_count(0);
         let max_workers = if config.max_workers == 0 {
             available_workers
@@ -264,6 +275,12 @@ fn evaluate_worker_candidate(
     let fallback_ratio = ratio(diagnostics.fallback_packets, packet_count as u64);
     let is_power_of_two = workers.is_power_of_two();
     let elephant_striping_active = diagnostics.striped_flow_packets != 0;
+    let tcp_offload_active = workers > 1 && tcp_offload_candidate(&diagnostics, config);
+    let tcp_offload_lanes = if tcp_offload_active {
+        tcp_offload_lanes(workers, &diagnostics)
+    } else {
+        0
+    };
     let mut rejections = Vec::new();
     let mut warnings = Vec::new();
 
@@ -276,34 +293,63 @@ fn evaluate_worker_candidate(
                 config.min_packets_per_worker
             ));
         }
-        if flows_per_worker < config.min_flows_per_worker && !elephant_striping_active {
+        if flows_per_worker < config.min_flows_per_worker
+            && !elephant_striping_active
+            && !tcp_offload_active
+        {
             rejections.push(format!(
                 "too few routed flows per worker: {flows_per_worker} < {}",
                 config.min_flows_per_worker
             ));
-        } else if flows_per_worker < config.min_flows_per_worker {
+        } else if flows_per_worker < config.min_flows_per_worker && elephant_striping_active {
             warnings.push(format!(
                 "low routed-flow budget accepted because elephant striping is active: {flows_per_worker} < {}",
                 config.min_flows_per_worker
             ));
+        } else if flows_per_worker < config.min_flows_per_worker {
+            warnings.push(format!(
+                "low routed-flow budget accepted because TCP stream offload is active: {flows_per_worker} < {}",
+                config.min_flows_per_worker
+            ));
         }
         if diagnostics.packet_skew.max_over_average > config.max_packet_skew {
-            rejections.push(format!(
-                "packet skew too high: {:.2}x > {:.2}x",
-                diagnostics.packet_skew.max_over_average, config.max_packet_skew
-            ));
+            if tcp_offload_active {
+                warnings.push(format!(
+                    "packet skew accepted because TCP stream offload is active: {:.2}x > {:.2}x",
+                    diagnostics.packet_skew.max_over_average, config.max_packet_skew
+                ));
+            } else {
+                rejections.push(format!(
+                    "packet skew too high: {:.2}x > {:.2}x",
+                    diagnostics.packet_skew.max_over_average, config.max_packet_skew
+                ));
+            }
         }
         if diagnostics.byte_skew.max_over_average > config.max_byte_skew {
-            rejections.push(format!(
-                "byte skew too high: {:.2}x > {:.2}x",
-                diagnostics.byte_skew.max_over_average, config.max_byte_skew
-            ));
+            if tcp_offload_active {
+                warnings.push(format!(
+                    "byte skew accepted because TCP stream offload is active: {:.2}x > {:.2}x",
+                    diagnostics.byte_skew.max_over_average, config.max_byte_skew
+                ));
+            } else {
+                rejections.push(format!(
+                    "byte skew too high: {:.2}x > {:.2}x",
+                    diagnostics.byte_skew.max_over_average, config.max_byte_skew
+                ));
+            }
         }
         if diagnostics.flow_skew.max_over_average > config.max_flow_skew {
-            rejections.push(format!(
-                "flow skew too high: {:.2}x > {:.2}x",
-                diagnostics.flow_skew.max_over_average, config.max_flow_skew
-            ));
+            if tcp_offload_active {
+                warnings.push(format!(
+                    "flow skew accepted because TCP stream offload is active: {:.2}x > {:.2}x",
+                    diagnostics.flow_skew.max_over_average, config.max_flow_skew
+                ));
+            } else {
+                rejections.push(format!(
+                    "flow skew too high: {:.2}x > {:.2}x",
+                    diagnostics.flow_skew.max_over_average, config.max_flow_skew
+                ));
+            }
         }
         if fallback_ratio > config.max_fallback_ratio {
             rejections.push(format!(
@@ -337,31 +383,40 @@ fn evaluate_worker_candidate(
                 fallback_ratio * 100.0
             ));
         }
+        if tcp_offload_active {
+            warnings.push(format!(
+                "TCP stream offload candidate: {} TCP packets, {} bytes, {} lanes",
+                diagnostics.tcp_routed_packets, diagnostics.tcp_routed_bytes, tcp_offload_lanes
+            ));
+        }
     }
 
     let eligible = rejections.is_empty();
     let score = if eligible && workers == 1 {
         0.50
     } else if eligible {
-        worker_candidate_score(
+        worker_candidate_score(WorkerScoreInput {
             workers,
             packets_per_worker,
             bytes_per_worker,
             fallback_ratio,
             is_power_of_two,
-            &diagnostics,
+            diagnostics: &diagnostics,
             config,
-        )
+            tcp_offload_active,
+            tcp_offload_lanes,
+        })
     } else {
         0.0
     };
     let reason = if eligible {
         format!(
-            "score {:.2}: {packets_per_worker} packets/worker, {bytes_per_worker} bytes/worker, {flows_per_worker} flows/worker, packet skew {:.2}x, byte skew {:.2}x, flow skew {:.2}x{}",
+            "score {:.2}: {packets_per_worker} packets/worker, {bytes_per_worker} bytes/worker, {flows_per_worker} flows/worker, packet skew {:.2}x, byte skew {:.2}x, flow skew {:.2}x{}{}",
             score,
             diagnostics.packet_skew.max_over_average,
             diagnostics.byte_skew.max_over_average,
             diagnostics.flow_skew.max_over_average,
+            tcp_offload_reason_suffix(tcp_offload_active, tcp_offload_lanes),
             warning_suffix(&warnings)
         )
     } else {
@@ -378,6 +433,8 @@ fn evaluate_worker_candidate(
         flows_per_worker,
         fallback_ratio,
         is_power_of_two,
+        tcp_offload_active,
+        tcp_offload_lanes,
         warnings,
         rejections,
         diagnostics,
@@ -469,15 +526,31 @@ fn worker_plan_decision_notes(
     notes
 }
 
-fn worker_candidate_score(
+struct WorkerScoreInput<'a> {
     workers: usize,
     packets_per_worker: usize,
     bytes_per_worker: u64,
     fallback_ratio: f64,
     is_power_of_two: bool,
-    diagnostics: &PerfRunDiagnostics,
+    diagnostics: &'a PerfRunDiagnostics,
     config: PerfWorkerPlannerConfig,
-) -> f64 {
+    tcp_offload_active: bool,
+    tcp_offload_lanes: usize,
+}
+
+fn worker_candidate_score(input: WorkerScoreInput<'_>) -> f64 {
+    let WorkerScoreInput {
+        workers,
+        packets_per_worker,
+        bytes_per_worker,
+        fallback_ratio,
+        is_power_of_two,
+        diagnostics,
+        config,
+        tcp_offload_active,
+        tcp_offload_lanes,
+    } = input;
+
     let packet_budget = saturation(
         packets_per_worker as f64,
         config.preferred_packets_per_worker,
@@ -498,13 +571,74 @@ fn worker_candidate_score(
         1.0
     };
 
-    workers as f64
+    let route_score = workers as f64
         * work_budget
         * packet_balance
         * byte_balance
         * flow_balance
         * fallback_factor
+        * topology_factor;
+
+    if !tcp_offload_active || tcp_offload_lanes == 0 {
+        return route_score;
+    }
+
+    route_score.max(tcp_offload_score(
+        workers,
+        tcp_offload_lanes,
+        diagnostics,
+        config,
+        fallback_factor,
+        topology_factor,
+    ))
+}
+
+fn tcp_offload_score(
+    workers: usize,
+    tcp_offload_lanes: usize,
+    diagnostics: &PerfRunDiagnostics,
+    config: PerfWorkerPlannerConfig,
+    fallback_factor: f64,
+    topology_factor: f64,
+) -> f64 {
+    let effective_workers = tcp_offload_lanes.saturating_add(1).min(workers).max(1);
+    let bytes_per_effective_worker = diagnostics.tcp_routed_bytes / effective_workers.max(1) as u64;
+    let packets_per_effective_worker =
+        diagnostics.tcp_routed_packets as f64 / effective_workers.max(1) as f64;
+    let byte_budget = saturation(
+        bytes_per_effective_worker as f64,
+        config.preferred_tcp_offload_bytes_per_worker,
+    )
+    .clamp(0.20, 1.0);
+    let packet_budget = saturation(
+        packets_per_effective_worker,
+        config.min_tcp_offload_packets.max(1),
+    )
+    .clamp(0.20, 1.0);
+    let work_budget = (byte_budget * 0.70 + packet_budget * 0.30).clamp(0.20, 1.0);
+    let lane_utilization = effective_workers as f64 / workers.max(1) as f64;
+
+    effective_workers as f64
+        * work_budget
+        * lane_utilization.powf(0.05)
+        * fallback_factor
         * topology_factor
+}
+
+fn tcp_offload_candidate(
+    diagnostics: &PerfRunDiagnostics,
+    config: PerfWorkerPlannerConfig,
+) -> bool {
+    diagnostics.tcp_unique_flows != 0
+        && (diagnostics.tcp_routed_packets >= config.min_tcp_offload_packets as u64
+            || diagnostics.tcp_routed_bytes >= config.min_tcp_offload_bytes)
+}
+
+fn tcp_offload_lanes(workers: usize, diagnostics: &PerfRunDiagnostics) -> usize {
+    diagnostics
+        .tcp_unique_flows
+        .min(workers.saturating_sub(1))
+        .max(1)
 }
 
 fn saturation<T>(value: f64, preferred: T) -> f64
@@ -547,6 +681,14 @@ fn warning_suffix(warnings: &[String]) -> String {
         String::new()
     } else {
         format!("; warnings: {}", warnings.join("; "))
+    }
+}
+
+fn tcp_offload_reason_suffix(active: bool, lanes: usize) -> String {
+    if active {
+        format!(", TCP offload lanes {lanes}")
+    } else {
+        String::new()
     }
 }
 
@@ -645,6 +787,12 @@ pub struct PerfRunDiagnostics {
     pub fallback_fragmented_packets: u64,
     pub fallback_unsupported_transport_packets: u64,
     pub unique_flows: usize,
+    #[serde(default)]
+    pub tcp_routed_packets: u64,
+    #[serde(default)]
+    pub tcp_routed_bytes: u64,
+    #[serde(default)]
+    pub tcp_unique_flows: usize,
     pub packet_skew: PerfSkew,
     pub byte_skew: PerfSkew,
     pub flow_skew: PerfSkew,
@@ -664,6 +812,9 @@ impl Default for PerfRunDiagnostics {
             fallback_fragmented_packets: 0,
             fallback_unsupported_transport_packets: 0,
             unique_flows: 0,
+            tcp_routed_packets: 0,
+            tcp_routed_bytes: 0,
+            tcp_unique_flows: 0,
             packet_skew: PerfSkew::default(),
             byte_skew: PerfSkew::default(),
             flow_skew: PerfSkew::default(),
@@ -736,6 +887,9 @@ pub struct PerfWorkerPlannerConfig {
     pub min_flows_per_worker: usize,
     pub preferred_packets_per_worker: usize,
     pub preferred_bytes_per_worker: u64,
+    pub min_tcp_offload_packets: usize,
+    pub min_tcp_offload_bytes: u64,
+    pub preferred_tcp_offload_bytes_per_worker: u64,
     pub max_packet_skew: f64,
     pub max_byte_skew: f64,
     pub max_flow_skew: f64,
@@ -751,6 +905,9 @@ impl Default for PerfWorkerPlannerConfig {
             min_flows_per_worker: 8,
             preferred_packets_per_worker: 16_384,
             preferred_bytes_per_worker: 1_000_000,
+            min_tcp_offload_packets: 256,
+            min_tcp_offload_bytes: 128 * 1024,
+            preferred_tcp_offload_bytes_per_worker: 256 * 1024,
             max_packet_skew: 2.5,
             max_byte_skew: 3.0,
             max_flow_skew: 4.0,
@@ -799,6 +956,10 @@ pub struct PerfWorkerCandidate {
     pub flows_per_worker: usize,
     pub fallback_ratio: f64,
     pub is_power_of_two: bool,
+    #[serde(default)]
+    pub tcp_offload_active: bool,
+    #[serde(default)]
+    pub tcp_offload_lanes: usize,
     pub warnings: Vec<String>,
     pub rejections: Vec<String>,
     pub diagnostics: PerfRunDiagnostics,
@@ -1690,6 +1851,70 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("elephant striping is active"))
+        );
+    }
+
+    #[test]
+    fn worker_planner_accepts_skew_for_tcp_stream_offload() {
+        let candidate = evaluate_worker_candidate(
+            2,
+            512,
+            512_000,
+            PerfRunDiagnostics {
+                unique_flows: 1,
+                tcp_routed_packets: 512,
+                tcp_routed_bytes: 512_000,
+                tcp_unique_flows: 1,
+                packet_skew: PerfSkew {
+                    max_over_average: 2.0,
+                    ..PerfSkew::default()
+                },
+                byte_skew: PerfSkew {
+                    max_over_average: 2.0,
+                    ..PerfSkew::default()
+                },
+                flow_skew: PerfSkew {
+                    max_over_average: 2.0,
+                    ..PerfSkew::default()
+                },
+                ..PerfRunDiagnostics::default()
+            },
+            PerfWorkerPlannerConfig {
+                min_flows_per_worker: 8,
+                min_packets_per_worker: 256,
+                max_packet_skew: 1.5,
+                max_byte_skew: 1.5,
+                max_flow_skew: 1.5,
+                ..PerfWorkerPlannerConfig::default()
+            },
+        );
+
+        assert!(candidate.eligible);
+        assert!(candidate.tcp_offload_active);
+        assert_eq!(1, candidate.tcp_offload_lanes);
+        assert!(candidate.score > 0.50);
+        assert!(
+            candidate
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("TCP stream offload is active"))
+        );
+    }
+
+    #[test]
+    fn worker_planner_selects_multiworker_for_tcp_elephant() {
+        let input = PerfInput::synthetic(PerfFixtureKind::TcpElephant, 1, 512);
+        let plan = input.plan_workers(PerfWorkerPlannerConfig {
+            max_workers: 4,
+            ..PerfWorkerPlannerConfig::default()
+        });
+
+        assert!(plan.selected_workers > 1);
+        assert!(
+            plan.candidates
+                .iter()
+                .filter(|candidate| candidate.workers > 1)
+                .any(|candidate| candidate.tcp_offload_active)
         );
     }
 
