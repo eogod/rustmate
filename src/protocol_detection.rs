@@ -76,9 +76,10 @@ impl ProtocolDetection {
         if self.service == "unknown" {
             return next;
         }
-        if self.service == next.service {
+        if self.service == next.service || services_are_compatible(self.service, next.service) {
+            let service = preferred_service(self.service, next.service);
             return Self {
-                service: self.service,
+                service,
                 side: merge_side(self.side, next.side),
                 confidence: self
                     .confidence
@@ -136,7 +137,7 @@ pub fn detect_payload(
         bytes,
         source_side,
         destination_side,
-        port_detection.side,
+        port_detection,
     )
     .map(|payload| port_detection.merge(payload))
 }
@@ -146,17 +147,27 @@ fn payload_rule(
     bytes: &[u8],
     source_side: ProtocolServiceSide,
     destination_side: ProtocolServiceSide,
-    port_side: ProtocolServiceSide,
+    port_detection: ProtocolDetection,
 ) -> Option<ProtocolDetection> {
     if let Some(service) = detect_http(bytes, source_side, destination_side) {
         return Some(service);
     }
     if is_tls_record(bytes) {
+        let service = if port_detection.service == "https" {
+            "https"
+        } else {
+            "tls"
+        };
+        let evidence = if service == "https" {
+            "https_tls_record"
+        } else {
+            "tls_record"
+        };
         return Some(payload_detection(
-            "tls",
-            prefer_known_side(port_side, destination_side),
+            service,
+            prefer_known_side(port_detection.side, destination_side),
             98,
-            "tls_record",
+            evidence,
         ));
     }
     if bytes.starts_with(b"SSH-") {
@@ -165,7 +176,7 @@ fn payload_rule(
     if is_redis(bytes) {
         return Some(payload_detection(
             "redis",
-            prefer_known_side(port_side, destination_side),
+            prefer_known_side(port_detection.side, destination_side),
             96,
             "redis_resp",
         ));
@@ -189,7 +200,7 @@ fn payload_rule(
     if is_mongodb(bytes) {
         return Some(payload_detection(
             "mongodb",
-            prefer_known_side(port_side, destination_side),
+            prefer_known_side(port_detection.side, destination_side),
             90,
             "mongodb_wire",
         ));
@@ -197,7 +208,7 @@ fn payload_rule(
     if is_memcached_ascii(bytes) {
         return Some(payload_detection(
             "memcached",
-            prefer_known_side(port_side, destination_side),
+            prefer_known_side(port_detection.side, destination_side),
             90,
             "memcached_ascii",
         ));
@@ -213,7 +224,7 @@ fn payload_rule(
     if matches!(transport, TransportProtocol::Udp) && is_quic_long_header(bytes) {
         return Some(payload_detection(
             "quic",
-            prefer_known_side(port_side, destination_side),
+            prefer_known_side(port_detection.side, destination_side),
             91,
             "quic_long_header",
         ));
@@ -224,7 +235,7 @@ fn payload_rule(
     if is_smtp(bytes) {
         return Some(payload_detection(
             "smtp",
-            prefer_known_side(port_side, source_side),
+            prefer_known_side(port_detection.side, source_side),
             88,
             "smtp_text",
         ));
@@ -232,7 +243,7 @@ fn payload_rule(
     if is_ftp(bytes) {
         return Some(payload_detection(
             "ftp",
-            prefer_known_side(port_side, source_side),
+            prefer_known_side(port_detection.side, source_side),
             88,
             "ftp_text",
         ));
@@ -302,7 +313,7 @@ fn known_service(protocol: TransportProtocol, port: u16) -> Option<(&'static str
         (TransportProtocol::Tcp, 80 | 8080 | 8000 | 8008 | 8081 | 8888) => Some(("http", 90)),
         (TransportProtocol::Tcp, 110 | 995) => Some(("pop3", 85)),
         (TransportProtocol::Tcp, 143 | 993) => Some(("imap", 85)),
-        (TransportProtocol::Tcp, 443 | 8443) => Some(("tls", 90)),
+        (TransportProtocol::Tcp, 443 | 8443) => Some(("https", 92)),
         (TransportProtocol::Udp, 443 | 8443) => Some(("quic", 80)),
         (TransportProtocol::Tcp, 465 | 587 | 25) => Some(("smtp", 85)),
         (TransportProtocol::Udp, 1900) => Some(("ssdp", 85)),
@@ -534,6 +545,18 @@ fn merge_source(
     }
 }
 
+fn services_are_compatible(left: &str, right: &str) -> bool {
+    matches!((left, right), ("https", "tls") | ("tls", "https"))
+}
+
+fn preferred_service(left: &'static str, right: &'static str) -> &'static str {
+    if left == "https" || right == "https" {
+        "https"
+    } else {
+        left
+    }
+}
+
 fn trim_ascii(bytes: &[u8]) -> &[u8] {
     let mut start = 0;
     let mut end = bytes.len();
@@ -601,8 +624,24 @@ mod tests {
     }
 
     #[test]
-    fn combines_port_and_tls_payload_evidence() {
+    fn combines_https_port_and_tls_payload_evidence() {
         let key = route(50_000, 443).key;
+        let detection = detect_payload(
+            key,
+            FlowDirection::AToB,
+            &[0x16, 0x03, 0x01, 0x00, 0x2a, 1, 0, 0],
+        )
+        .unwrap();
+
+        assert_eq!("https", detection.service);
+        assert_eq!(ProtocolServiceSide::B, detection.side);
+        assert_eq!(ProtocolDetectionSource::PortAndPayload, detection.source);
+        assert_eq!("https_tls_record", detection.evidence);
+    }
+
+    #[test]
+    fn detects_generic_tls_on_nonstandard_port() {
+        let key = route(50_000, 31_337).key;
         let detection = detect_payload(
             key,
             FlowDirection::AToB,
@@ -612,7 +651,8 @@ mod tests {
 
         assert_eq!("tls", detection.service);
         assert_eq!(ProtocolServiceSide::B, detection.side);
-        assert_eq!(ProtocolDetectionSource::PortAndPayload, detection.source);
+        assert_eq!(ProtocolDetectionSource::Payload, detection.source);
+        assert_eq!("tls_record", detection.evidence);
     }
 
     #[test]

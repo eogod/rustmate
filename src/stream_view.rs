@@ -501,7 +501,7 @@ impl StreamViewState {
             return;
         };
 
-        let service = service_from_message(&message, event.event_type);
+        let service = service_from_message(&message, event);
         if should_replace_service(&entry.service, &service) {
             entry.service = service;
         }
@@ -785,27 +785,50 @@ fn matches_profile(entry: &StreamViewEntry, profile: &ServiceProfile) -> bool {
     service_matches || port_matches || content_matches || pattern_matches
 }
 
-fn service_from_message(message: &StreamMessage, evidence: &'static str) -> StreamViewService {
+fn service_from_message(message: &StreamMessage, event: &Event) -> StreamViewService {
     StreamViewService {
-        name: service_name_from_message(message.protocol).to_owned(),
-        side: service_side_from_message(message.direction, message.kind).to_owned(),
+        name: service_name_from_message(message, event).to_owned(),
+        side: service_side_from_message(message, event).to_owned(),
         confidence: 100,
         source: Some("parser".to_owned()),
-        evidence: Some(evidence.to_owned()),
+        evidence: Some(service_evidence_from_message(message, event).to_owned()),
     }
 }
 
-fn service_name_from_message(protocol: StreamMessageProtocol) -> &'static str {
-    match protocol {
+fn service_name_from_message(message: &StreamMessage, event: &Event) -> &'static str {
+    match message.protocol {
         StreamMessageProtocol::Http1 => "http",
         StreamMessageProtocol::Dns => "dns",
         StreamMessageProtocol::WebSocket => "websocket",
+        StreamMessageProtocol::Tls if tls_message_is_https(message, event) => "https",
         StreamMessageProtocol::Tls => "tls",
     }
 }
 
-fn service_side_from_message(direction: FlowDirection, kind: StreamMessageKind) -> &'static str {
-    match (direction, kind) {
+fn service_side_from_message(message: &StreamMessage, event: &Event) -> &'static str {
+    if message.protocol == StreamMessageProtocol::Tls {
+        if let Some(side) = service_port_side(event, message.direction, &[443, 8443]) {
+            return side;
+        }
+        if message
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.handshake_type.as_deref())
+            == Some("client_hello")
+        {
+            return destination_side_name(message.direction);
+        }
+        if message
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.handshake_type.as_deref())
+            .is_some()
+        {
+            return source_side_name(message.direction);
+        }
+    }
+
+    match (message.direction, message.kind) {
         (FlowDirection::AToB, StreamMessageKind::Request) => "b",
         (FlowDirection::BToA, StreamMessageKind::Request) => "a",
         (FlowDirection::AToB, StreamMessageKind::Response) => "a",
@@ -815,10 +838,80 @@ fn service_side_from_message(direction: FlowDirection, kind: StreamMessageKind) 
 }
 
 fn should_replace_service(current: &StreamViewService, next: &StreamViewService) -> bool {
+    if current.name == "https" && next.name == "tls" {
+        return false;
+    }
     current.name == "unknown"
         || next.confidence >= current.confidence.saturating_add(5)
         || (current.name == "http" && next.name == "websocket")
+        || (current.name == "tls" && next.name == "https")
         || current.source.as_deref() != Some("parser")
+}
+
+fn tls_message_is_https(message: &StreamMessage, event: &Event) -> bool {
+    message.protocol == StreamMessageProtocol::Tls
+        && (message
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.alpn.iter().any(|protocol| alpn_is_http(protocol)))
+            || event
+                .source_port
+                .is_some_and(|port| matches!(port, 443 | 8443))
+            || event
+                .destination_port
+                .is_some_and(|port| matches!(port, 443 | 8443)))
+}
+
+fn service_evidence_from_message(message: &StreamMessage, event: &Event) -> &'static str {
+    if message.protocol == StreamMessageProtocol::Tls {
+        if message
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.alpn.iter().any(|protocol| alpn_is_http(protocol)))
+        {
+            return "tls_alpn_http";
+        }
+        if tls_message_is_https(message, event) {
+            return "https_port";
+        }
+    }
+    event.event_type
+}
+
+fn alpn_is_http(protocol: &str) -> bool {
+    matches!(protocol, "h2" | "http/1.1" | "http/1.0" | "http/1.1-draft")
+        || protocol.starts_with("h3")
+}
+
+fn service_port_side(
+    event: &Event,
+    direction: FlowDirection,
+    ports: &[u16],
+) -> Option<&'static str> {
+    if event.source_port.is_some_and(|port| ports.contains(&port)) {
+        return Some(source_side_name(direction));
+    }
+    if event
+        .destination_port
+        .is_some_and(|port| ports.contains(&port))
+    {
+        return Some(destination_side_name(direction));
+    }
+    None
+}
+
+fn source_side_name(direction: FlowDirection) -> &'static str {
+    match direction {
+        FlowDirection::AToB => "a",
+        FlowDirection::BToA => "b",
+    }
+}
+
+fn destination_side_name(direction: FlowDirection) -> &'static str {
+    match direction {
+        FlowDirection::AToB => "b",
+        FlowDirection::BToA => "a",
+    }
 }
 
 fn content_kind_from_message(
@@ -1184,6 +1277,82 @@ mod tests {
     }
 
     #[test]
+    fn tls_messages_on_https_ports_enrich_stream_rows_as_https() {
+        let mut view = view();
+        let mut event = stream_event(0x10, "tls", 443);
+        event
+            .fields
+            .as_object_mut()
+            .unwrap()
+            .insert("content_kind".to_owned(), json!("binary"));
+        view.observe_event(&event);
+
+        view.observe_event(&tls_protocol_message_event(
+            0x10,
+            1111,
+            443,
+            &[],
+            Some("client_hello"),
+        ));
+
+        let row = view.stream_row(0x10).unwrap();
+        assert_eq!("https", row.service.name);
+        assert_eq!("b", row.service.side);
+        assert_eq!(Some("https_port".to_owned()), row.service.evidence);
+        assert_eq!(StreamViewContentKind::Binary, row.content_kind);
+    }
+
+    #[test]
+    fn tls_alpn_http_enriches_nonstandard_stream_rows_as_https() {
+        let mut view = view();
+        let mut event = stream_event(0x10, "tls", 31_337);
+        event
+            .fields
+            .as_object_mut()
+            .unwrap()
+            .insert("content_kind".to_owned(), json!("binary"));
+        view.observe_event(&event);
+
+        view.observe_event(&tls_protocol_message_event(
+            0x10,
+            1111,
+            31_337,
+            &["h2", "http/1.1"],
+            Some("client_hello"),
+        ));
+
+        let row = view.stream_row(0x10).unwrap();
+        assert_eq!("https", row.service.name);
+        assert_eq!("b", row.service.side);
+        assert_eq!(Some("tls_alpn_http".to_owned()), row.service.evidence);
+    }
+
+    #[test]
+    fn generic_tls_messages_without_http_evidence_remain_tls() {
+        let mut view = view();
+        let mut event = stream_event(0x10, "tls", 31_337);
+        event
+            .fields
+            .as_object_mut()
+            .unwrap()
+            .insert("content_kind".to_owned(), json!("binary"));
+        view.observe_event(&event);
+
+        view.observe_event(&tls_protocol_message_event(
+            0x10,
+            1111,
+            31_337,
+            &[],
+            Some("client_hello"),
+        ));
+
+        let row = view.stream_row(0x10).unwrap();
+        assert_eq!("tls", row.service.name);
+        assert_eq!("b", row.service.side);
+        assert_eq!(Some("tls_record".to_owned()), row.service.evidence);
+    }
+
+    #[test]
     fn evicts_oldest_stream() {
         let mut view = StreamViewState::new(StreamViewConfig {
             max_streams: 1,
@@ -1321,6 +1490,65 @@ mod tests {
                 "dns": null,
                 "websocket": null,
                 "tls": null,
+                "error": null,
+            }),
+        }
+    }
+
+    fn tls_protocol_message_event(
+        stream_id: u64,
+        source_port: u16,
+        destination_port: u16,
+        alpn: &[&str],
+        handshake_type: Option<&str>,
+    ) -> Event {
+        Event {
+            ts_sec: 1,
+            ts_usec: 3,
+            analyzer: "protocol_message",
+            event_type: "tls_record",
+            length: 64,
+            link_layer: "ethernet",
+            linktype: 1,
+            protocol: Some(TransportProtocol::Tcp),
+            source_addr: Some(IpAddr::from_str("10.0.0.1").unwrap()),
+            destination_addr: Some(IpAddr::from_str("10.0.0.2").unwrap()),
+            source_port: Some(source_port),
+            destination_port: Some(destination_port),
+            fields: json!({
+                "stream_id": stream_id,
+                "stream_id_hex": format!("{stream_id:016x}"),
+                "message_id": 2u64,
+                "protocol": "tls",
+                "kind": "unknown",
+                "status": "complete",
+                "direction": "a_to_b",
+                "ordinal": 1u64,
+                "summary": "TLS handshake",
+                "logical_start": 0u64,
+                "logical_end": 64u64,
+                "header_start": 0u64,
+                "header_end": 5u64,
+                "body_start": 5u64,
+                "body_end": 64u64,
+                "wire_bytes": 64u64,
+                "header_bytes": 5u64,
+                "body_bytes": 59u64,
+                "http": null,
+                "dns": null,
+                "websocket": null,
+                "tls": {
+                    "content_type": "handshake",
+                    "record_version": "TLS 1.2",
+                    "record_len": 59,
+                    "handshake_type": handshake_type,
+                    "handshake_version": "TLS 1.3",
+                    "sni": "example.com",
+                    "alpn": alpn,
+                    "cipher_suite": null,
+                    "cipher_suites": 2,
+                    "extensions": 3,
+                },
                 "error": null,
             }),
         }

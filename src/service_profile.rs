@@ -76,14 +76,31 @@ impl ServiceProfileSet {
                 hide_rules: vec![StreamHideRule::Service("http".to_owned())],
             },
             ServiceProfile {
+                id: "https".to_owned(),
+                name: "HTTPS".to_owned(),
+                description: "HTTP over TLS on HTTPS ports or HTTP ALPN".to_owned(),
+                priority: 97,
+                enabled: true,
+                protocol: Some(TransportProtocol::Tcp),
+                services: vec!["https".to_owned()],
+                ports: vec![443, 8443],
+                content_kind: None,
+                pattern_ids: Vec::new(),
+                default_direction: Some(FlowDirection::AToB),
+                default_mode: Some(StreamSliceMode::Hex),
+                default_transform: None,
+                default_transforms: Vec::new(),
+                hide_rules: vec![StreamHideRule::Service("https".to_owned())],
+            },
+            ServiceProfile {
                 id: "tls".to_owned(),
                 name: "TLS".to_owned(),
-                description: "TLS and HTTPS-like encrypted streams".to_owned(),
+                description: "Generic TLS streams without HTTP evidence".to_owned(),
                 priority: 95,
                 enabled: true,
                 protocol: Some(TransportProtocol::Tcp),
                 services: vec!["tls".to_owned()],
-                ports: vec![443, 8443],
+                ports: Vec::new(),
                 content_kind: None,
                 pattern_ids: Vec::new(),
                 default_direction: Some(FlowDirection::AToB),
@@ -491,5 +508,17 @@ mod tests {
             profile.default_transform_plan().unwrap().steps
         );
         assert_eq!(1, profile.hide_rules.len());
+    }
+
+    #[test]
+    fn builtin_profiles_include_first_class_https() {
+        let profiles = ServiceProfileSet::builtin();
+        let https = profiles.get("https").unwrap();
+        let tls = profiles.get("tls").unwrap();
+
+        assert_eq!(vec!["https".to_owned()], https.services);
+        assert_eq!(vec![443, 8443], https.ports);
+        assert!(https.priority > tls.priority);
+        assert!(tls.ports.is_empty());
     }
 }

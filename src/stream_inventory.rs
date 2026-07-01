@@ -768,6 +768,26 @@ mod tests {
     }
 
     #[test]
+    fn detects_https_from_port_and_tls_payload() {
+        let mut inventory = inventory(config());
+        let mut flow_table = flow_table();
+        let mut events = Vec::new();
+
+        feed(
+            &mut inventory,
+            &mut flow_table,
+            &tcp_packet(1, 49_000, 443, b"\x16\x03\x01\x00\x2a\x01\x00\x00"),
+            &mut events,
+        );
+
+        assert_eq!("https", events[0].fields["service"]["name"]);
+        assert_eq!("b", events[0].fields["service"]["side"]);
+        assert_eq!("port_and_payload", events[0].fields["service"]["source"]);
+        assert_eq!("https_tls_record", events[0].fields["service"]["evidence"]);
+        assert_eq!("binary", events[0].fields["content_kind"]);
+    }
+
+    #[test]
     fn detects_websocket_upgrade_above_http_port_guess() {
         let mut inventory = inventory(config());
         let mut flow_table = flow_table();
